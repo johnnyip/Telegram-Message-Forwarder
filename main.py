@@ -24,7 +24,7 @@ async def handle_message(client, message):
     # Check if the message is from a chat in your list
     target_chat = os.getenv("CHAT_TARGET")
     chat_ids = os.getenv("CHAT_IDS")    
-    
+
     if chat_ids is not None:
         # Convert the string of IDs to a list of integers
         chat_ids = [int(id) for id in chat_ids.split(',')]
@@ -39,7 +39,7 @@ async def handle_message(client, message):
         # Create the file path
         file_path_prefix = f"{message.chat.title}_{media_datetime}"
         # Check the type of the message and download if it's a type we're interested in
-        if message.audio:
+        if message.audio: 
             file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}.mp3")
             print(f"Downloaded file to {file_path}")
             # Send the downloaded media to another user or group
