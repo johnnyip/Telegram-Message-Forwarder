@@ -38,7 +38,8 @@ async def handle_message(client, message):
         # media_datetime = message.date.strftime('%Y-%m-%d_%H-%M-%S'
         
         # Create the file path
-        file_path_prefix = f"{message.chat.title}_{message.date}_{message.from_user.username}"
+        # file_path_prefix = f"{message.chat.title}_{message.date}_{message.from_user.username}"
+        file_path_prefix = f"{message.id}_{message.from_user.username}"
         file_path_prefix = file_path_prefix.replace(" ", "_")
 
         # Check the type of the message and download if it's a type we're interested in
