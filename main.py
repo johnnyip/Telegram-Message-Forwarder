@@ -33,7 +33,7 @@ async def handle_message(client, message):
         chat_ids = []
 
     if message.chat.id in chat_ids:
-        print(message)
+        # print(message)
         # Format the date and time
         # media_datetime = message.date.strftime('%Y-%m-%d_%H-%M-%S'
         
