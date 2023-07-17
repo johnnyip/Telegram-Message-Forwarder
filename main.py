@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Client(
-    "sessoions/my_account",
+    "my_account",
     api_id=os.getenv("API_ID"),
     api_hash=os.getenv("API_HASH")
 )
