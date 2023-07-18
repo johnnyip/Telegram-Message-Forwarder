@@ -32,7 +32,7 @@ async def handle_message(client, message):
         # If there's no environment variable, use an empty list
         chat_ids = []
 
-    if message.chat.id in chat_ids:
+    if message.chat.id in chat_ids and message.from_user.username != "airwicka":
         # print(message)
         # Format the date and time
         # media_datetime = message.date.strftime('%Y-%m-%d_%H-%M-%S'
