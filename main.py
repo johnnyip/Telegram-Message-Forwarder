@@ -34,7 +34,7 @@ async def handle_message(client, message):
 
     # Get target_chat id array
     if target_chat is not None:
-        target_chat = [int(id) for id in target_chat.split(',')]
+        target_chat = [int(id) if id.isdigit() else id for id in target_chat.split(',')]
     else:
         target_chat = []
 
