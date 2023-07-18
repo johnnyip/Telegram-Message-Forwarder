@@ -25,12 +25,18 @@ async def handle_message(client, message):
     target_chat = os.getenv("CHAT_TARGET")
     chat_ids = os.getenv("CHAT_IDS")    
 
+    # Get chat id array
     if chat_ids is not None:
         # Convert the string of IDs to a list of integers
         chat_ids = [int(id) for id in chat_ids.split(',')]
     else:
-        # If there's no environment variable, use an empty list
         chat_ids = []
+
+    # Get target_chat id array
+    if target_chat is not None:
+        target_chat = [int(id) for id in target_chat.split(',')]
+    else:
+        target_chat = []
 
     if message.chat.id in chat_ids:
         # print(message)
@@ -47,25 +53,30 @@ async def handle_message(client, message):
             file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}.mp3")
             print(f"Downloaded file to {file_path}")
             # Send the downloaded media to another user or group
-            await client.send_audio(chat_id=target_chat, audio=file_path)
+            for chat in target_chat:
+                await client.send_audio(chat_id=chat, audio=file_path)
         elif message.photo:
             file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}.jpg")
             print(f"Downloaded file to {file_path}")
-            await client.send_photo(chat_id=target_chat, photo=file_path)
+            for chat in target_chat:
+                await client.send_photo(chat_id=chat, photo=file_path)
         elif message.video:
             file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}.mp4")
             print(f"Downloaded file to {file_path}")
-            await client.send_video(chat_id=target_chat, video=file_path)
+            for chat in target_chat:
+                await client.send_video(chat_id=chat, video=file_path)
         elif message.document:
             # Get file extension based on the MIME type, if the filename is not set
             ext = mimetypes.guess_extension(message.document.mime_type) if message.document.file_name is None else ''
             file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}{ext}")
             print(f"Downloaded file to {file_path}")
-            await client.send_document(chat_id=target_chat, document=file_path)
+            for chat in target_chat:
+                await client.send_document(chat_id=chat, document=file_path)
         elif message.animation:
             file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}.gif")
             print(f"Downloaded file to {file_path}")
-            await client.send_animation(chat_id=target_chat, animation=file_path)
+            for chat in target_chat:
+                await client.send_animation(chat_id=chat, animation=file_path)
 
 
     else:
