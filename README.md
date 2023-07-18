@@ -9,7 +9,7 @@ services:
     image: johnnyip/telegram-message-forwarder:latest
     environment:
       - CHAT_IDS=-10018065..., -100192221...
-      - CHAT_TARGET=username
+      - CHAT_TARGET=username1, username2...
       - API_ID=
       - API_HASH=
     volumes:
