@@ -45,7 +45,7 @@ async def handle_message(client, message):
         
         # Create the file path
         # file_path_prefix = f"{message.chat.title}_{message.date}_{message.from_user.username}"
-        file_path_prefix = f"{message.chat.id}/{message.id}_{message.from_user.username}"
+        file_path_prefix = f"/app/downloads/{message.chat.id}/{message.id}_{message.from_user.username}"
         file_path_prefix = file_path_prefix.replace(" ", "_")
         # print(message)
 
