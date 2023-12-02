@@ -45,7 +45,7 @@ async def handle_message(client, message):
         
         # Create the file path
         # file_path_prefix = f"{message.chat.title}_{message.date}_{message.from_user.username}"
-        file_path_prefix = f"{message.id}_{message.from_user.username}"
+        file_path_prefix = f"{message.chat.id}/{message.id}_{message.from_user.username}"
         file_path_prefix = file_path_prefix.replace(" ", "_")
         # print(message)
 
@@ -69,7 +69,7 @@ async def handle_message(client, message):
                 await client.send_video(chat_id=chat, video=file_path)
         elif message.document:
             # Get file extension based on the MIME type, if the filename is not set
-            file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}{message.document.file_name}")
+            file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}_{message.document.file_name}")
             print(f"Downloaded document file to {file_path}")
             for chat in target_chat:
                 await client.send_document(chat_id=chat, document=file_path)
