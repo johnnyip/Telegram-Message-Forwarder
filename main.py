@@ -27,13 +27,12 @@ async def handle_message(client, message):
     chat_ids = [int(id) for id in os.getenv("CHAT_IDS").split(',')] if os.getenv("CHAT_IDS") is not None else []
     ignore_username = os.getenv("CHAT_IGNORE_USERNAME").split(",") if os.getenv("CHAT_IGNORE_USERNAME") else []
     delay_seconds = int(os.getenv("DELAY_SECONDS", 5))
+    # print(message)
 
-
-    if message.chat.id in chat_ids and message.from_user.username not in ignore_username:
+    if message.chat.id in chat_ids and (message.from_user is not None and message.from_user.username not in ignore_username):
         # Create the file path
         file_path_prefix = f"/app/downloads/{message.chat.id}/"
         file_path_prefix = file_path_prefix.replace(" ", "_")
-        # print(message)
 
 
         # Check the type of the message and download if it's a type we're interested in
