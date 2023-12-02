@@ -38,7 +38,7 @@ async def handle_message(client, message):
     else:
         target_chat = []
 
-    if message.chat.id in chat_ids and message.from_user.username != "airwicka":
+    if message.chat.id in chat_ids:
         # print(message)
         # Format the date and time
         # media_datetime = message.date.strftime('%Y-%m-%d_%H-%M-%S'
@@ -47,6 +47,8 @@ async def handle_message(client, message):
         # file_path_prefix = f"{message.chat.title}_{message.date}_{message.from_user.username}"
         file_path_prefix = f"{message.id}_{message.from_user.username}"
         file_path_prefix = file_path_prefix.replace(" ", "_")
+        print(message)
+
 
         # Check the type of the message and download if it's a type we're interested in
         if message.audio: 
@@ -81,7 +83,6 @@ async def handle_message(client, message):
 
     else:
         print(f"Message from chat {message.chat.id} ignored")
-        print(message)
 
 
 app.run()
