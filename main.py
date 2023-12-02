@@ -25,7 +25,7 @@ async def handle_message(client, message):
     # Check if the message is from a chat in your list
     target_chat = os.getenv("CHAT_TARGET")
     chat_ids = os.getenv("CHAT_IDS")    
-    delay_seconds = os.getenv("DELAY_SECONDS")
+    delay_seconds = int(os.getenv("DELAY_SECONDS"))
 
     # Get chat id array
     if chat_ids is not None:
@@ -42,14 +42,14 @@ async def handle_message(client, message):
 
     if message.chat.id in chat_ids:
         # Create the file path
-        file_path_prefix = f"/app/downloads/{message.chat.id}/{message.id}_{message.from_user.username}"
+        file_path_prefix = f"/app/downloads/{message.chat.id}/"
         file_path_prefix = file_path_prefix.replace(" ", "_")
         # print(message)
 
 
         # Check the type of the message and download if it's a type we're interested in
         if message.audio: 
-            file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}.mp3")
+            file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}/{message.id}_{message.from_user.username}.mp3")
             print(f"[{datetime.now()}]Downloaded audio file to {file_path}")
             # Send the downloaded media to another user or group
             for chat in target_chat:
@@ -58,7 +58,7 @@ async def handle_message(client, message):
                 print(f"[{datetime.now()}]File sent to chat: {chat}")
 
         elif message.photo:
-            file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}.jpg")
+            file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}/{message.id}_{message.from_user.username}.jpg")
             print(f"[{datetime.now()}]Downloaded photo file to {file_path}")
             for chat in target_chat:
                 time.sleep(delay_seconds)
@@ -66,7 +66,7 @@ async def handle_message(client, message):
                 print(f"[{datetime.now()}]File sent to chat: {chat}")
 
         elif message.video:
-            file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}.mp4")
+            file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}/{message.id}_{message.from_user.username}.mp4")
             print(f"[{datetime.now()}]Downloaded video file to {file_path}")
             for chat in target_chat:
                 time.sleep(delay_seconds)
@@ -75,7 +75,7 @@ async def handle_message(client, message):
 
         elif message.document:
             # Get file extension based on the MIME type, if the filename is not set
-            file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}_{message.document.file_name}")
+            file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}/{message.id}_{message.from_user.username}_{message.document.file_name}")
             print(f"[{datetime.now()}]Downloaded document file to {file_path}")
             for chat in target_chat:
                 time.sleep(delay_seconds)
@@ -83,7 +83,7 @@ async def handle_message(client, message):
                 print(f"[{datetime.now()}]File sent to chat: {chat}")
 
         elif message.animation:
-            file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}.gif")
+            file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}/{message.id}_{message.from_user.username}.gif")
             print(f"[{datetime.now()}]Downloaded animation file to {file_path}")
             for chat in target_chat:
                 time.sleep(delay_seconds)
