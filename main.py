@@ -23,24 +23,13 @@ media_types = ["audio", "photo", "video", "document", "voice", "video_note", "an
 @app.on_message()
 async def handle_message(client, message):
     # Check if the message is from a chat in your list
-    target_chat = os.getenv("CHAT_TARGET")
-    chat_ids = os.getenv("CHAT_IDS")    
-    delay_seconds = int(os.getenv("DELAY_SECONDS"))
+    target_chat = [int(id) if id.isdigit() else id for id in os.getenv("CHAT_TARGET").split(',')] if os.getenv("CHAT_TARGET") is not None else []
+    chat_ids = [int(id) for id in os.getenv("CHAT_IDS").split(',')] if os.getenv("CHAT_IDS") is not None else []
+    ignore_username = os.getenv("CHAT_IGNORE_USERNAME").split(",") if os.getenv("CHAT_IGNORE_USERNAME") else []
+    delay_seconds = int(os.getenv("DELAY_SECONDS", 5))
 
-    # Get chat id array
-    if chat_ids is not None:
-        # Convert the string of IDs to a list of integers
-        chat_ids = [int(id) for id in chat_ids.split(',')]
-    else:
-        chat_ids = []
 
-    # Get target_chat id array
-    if target_chat is not None:
-        target_chat = [int(id) if id.isdigit() else id for id in target_chat.split(',')]
-    else:
-        target_chat = []
-
-    if message.chat.id in chat_ids:
+    if message.chat.id in chat_ids and message.from_user.username not in ignore_username:
         # Create the file path
         file_path_prefix = f"/app/downloads/{message.chat.id}/"
         file_path_prefix = file_path_prefix.replace(" ", "_")
