@@ -81,6 +81,7 @@ async def handle_message(client, message):
 
     else:
         print(f"Message from chat {message.chat.id} ignored")
+        print(message)
 
 
 app.run()
