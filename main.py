@@ -55,16 +55,31 @@ async def handle_message(client, message):
                 # Send the downloaded media to another user or group
                 for chat in target_chat:
                     time.sleep(delay_seconds)
-                    await client.send_audio(chat_id=chat, audio=file_path)
+                    print(f"[{datetime.now()}]Forwarding audio to chat: {chat}")
+                    if (message.chat.has_protected_content == False):
+                        await client.forward_messages(chat_id=chat)
+                    else:
+                        await client.send_audio(chat_id=chat, audio=file_path)
                     print(f"[{datetime.now()}]File sent to chat: {chat}")
 
+
+
+
             elif message.photo:
+                
                 file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}/{message.id}_{message.from_user.username}.jpg")
                 print(f"[{datetime.now()}]Downloaded photo file to {file_path}")
                 for chat in target_chat:
                     time.sleep(delay_seconds)
-                    await client.send_photo(chat_id=chat, photo=file_path)
+                    print(f"[{datetime.now()}]Forwarding photo to chat: {chat}")
+                    if (message.chat.has_protected_content == False):
+                        await client.forward_messages(chat_id=chat)
+                    else:
+                        await client.send_photo(chat_id=chat, photo=file_path)
                     print(f"[{datetime.now()}]File sent to chat: {chat}")
+
+
+
 
             elif message.video:
                 file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}/{message.id}_{message.from_user.username}.mp4")
@@ -74,14 +89,26 @@ async def handle_message(client, message):
                     await client.send_video(chat_id=chat, video=file_path)
                     print(f"[{datetime.now()}]File sent to chat: {chat}")
 
+
+
+
             elif message.document:
-                # Get file extension based on the MIME type, if the filename is not set
-                file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}/{message.id}_{message.from_user.username}_{message.document.file_name}")
-                print(f"[{datetime.now()}]Downloaded document file to {file_path}")
-                for chat in target_chat:
-                    time.sleep(delay_seconds)
-                    await client.send_document(chat_id=chat, document=file_path)
-                    print(f"[{datetime.now()}]File sent to chat: {chat}")
+                if (message.chat.has_protected_content == False):
+                    for chat in target_chat:
+                        time.sleep(delay_seconds)
+                        print(f"[{datetime.now()}]Forwarding document to chat: {chat}")
+                        await client.forward_messages(chat_id=chat,from_chat_id=message.chat.id,message_ids=message.id)
+
+                else:
+                    file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}/{message.id}_{message.from_user.username}_{message.document.file_name}")
+                    print(f"[{datetime.now()}]Downloaded document file to {file_path}")
+                    for chat in target_chat:
+                        time.sleep(delay_seconds)
+                        await client.send_document(chat_id=chat, document=file_path)
+                        print(f"[{datetime.now()}]File sent to chat: {chat}")
+
+
+
 
             elif message.animation:
                 file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}/{message.id}_{message.from_user.username}.gif")
@@ -90,6 +117,9 @@ async def handle_message(client, message):
                     time.sleep(delay_seconds)
                     await client.send_animation(chat_id=chat, animation=file_path)
                     print(f"[{datetime.now()}]File sent to chat: {chat}")
+
+
+
 
             else:
                 print(f"[{datetime.now()}]Text message from user {message.from_user.username} chat {message.chat.id} ignored: {message.text}")
@@ -100,3 +130,7 @@ async def handle_message(client, message):
 
 
 app.run()
+
+
+
+#python main.py
