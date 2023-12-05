@@ -55,11 +55,7 @@ async def handle_message(client, message):
                 # Send the downloaded media to another user or group
                 for chat in target_chat:
                     time.sleep(delay_seconds)
-                    print(f"[{datetime.now()}]Forwarding audio to chat: {chat}")
-                    if (message.chat.has_protected_content == False):
-                        await client.forward_messages(chat_id=chat)
-                    else:
-                        await client.send_audio(chat_id=chat, audio=file_path)
+                    await client.send_audio(chat_id=chat, audio=file_path)
                     print(f"[{datetime.now()}]File sent to chat: {chat}")
 
 
@@ -71,11 +67,7 @@ async def handle_message(client, message):
                 print(f"[{datetime.now()}]Downloaded photo file to {file_path}")
                 for chat in target_chat:
                     time.sleep(delay_seconds)
-                    print(f"[{datetime.now()}]Forwarding photo to chat: {chat}")
-                    if (message.chat.has_protected_content == False):
-                        await client.forward_messages(chat_id=chat)
-                    else:
-                        await client.send_photo(chat_id=chat, photo=file_path)
+                    await client.send_photo(chat_id=chat, photo=file_path)
                     print(f"[{datetime.now()}]File sent to chat: {chat}")
 
 
