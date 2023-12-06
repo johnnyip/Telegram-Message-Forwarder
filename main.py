@@ -74,14 +74,19 @@ async def handle_message(client, message):
 
 
             elif message.video:
-                file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}/{message.id}_{message.from_user.username}.mp4")
-                print(f"[{datetime.now()}]Downloaded video file to {file_path}")
-                for chat in target_chat:
-                    time.sleep(delay_seconds)
-                    await client.send_video(chat_id=chat, video=file_path)
-                    print(f"[{datetime.now()}]File sent to chat: {chat}")
+                if (message.chat.has_protected_content == False):
+                    for chat in target_chat:
+                        time.sleep(delay_seconds)
+                        print(f"[{datetime.now()}]Forwarding video to chat: {chat}")
+                        await client.forward_messages(chat_id=chat,from_chat_id=message.chat.id,message_ids=message.id)
 
-
+                else:
+                    file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}/{message.id}_{message.from_user.username}.mp4")
+                    print(f"[{datetime.now()}]Downloaded video file to {file_path}")
+                    for chat in target_chat:
+                        time.sleep(delay_seconds)
+                        await client.send_video(chat_id=chat, video=file_path)
+                        print(f"[{datetime.now()}]File sent to chat: {chat}")
 
 
             elif message.document:
