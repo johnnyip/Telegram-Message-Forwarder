@@ -62,13 +62,19 @@ async def handle_message(client, message):
 
 
             elif message.photo:
-                
-                file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}/{message.id}_{message.from_user.username}.jpg")
-                print(f"[{datetime.now()}]Downloaded photo file to {file_path}")
-                for chat in target_chat:
-                    time.sleep(delay_seconds)
-                    await client.send_photo(chat_id=chat, photo=file_path)
-                    print(f"[{datetime.now()}]File sent to chat: {chat}")
+                if (message.chat.has_protected_content == False):
+                    for chat in target_chat:
+                        time.sleep(delay_seconds)
+                        print(f"[{datetime.now()}]Forwarding photo to chat: {chat}")
+                        await client.forward_messages(chat_id=chat,from_chat_id=message.chat.id,message_ids=message.id)
+
+                else:
+                    file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}/{message.id}_{message.from_user.username}.jpg")
+                    print(f"[{datetime.now()}]Downloaded photo file to {file_path}")
+                    for chat in target_chat:
+                        time.sleep(delay_seconds)
+                        await client.send_photo(chat_id=chat, photo=file_path)
+                        print(f"[{datetime.now()}]File sent to chat: {chat}")
 
 
 
