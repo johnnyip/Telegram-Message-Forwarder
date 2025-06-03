@@ -18,7 +18,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 再複製程式碼
-COPY telegram_forwarder.py .
+COPY main.py .
 
 # 建立資料夾作 下載 / session 儲存
 RUN mkdir -p /app/downloads \
