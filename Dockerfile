@@ -27,4 +27,4 @@ RUN mkdir -p /app/downloads \
 USER ${USER}
 
 # 預設執行
-CMD ["python", "-u", "telegram_forwarder.py"]
+CMD ["python", "-u", "main.py"]
