@@ -1,139 +1,184 @@
-from pyrogram import Client
-from datetime import datetime
-from os.path import splitext
-import asyncio
 import os
-import time
+import asyncio
+from pathlib import Path
+from datetime import datetime
 import mimetypes
-from dotenv import load_dotenv
+import json
 
-# Load the environment variables from .env file
+from dotenv import load_dotenv
+from telethon import TelegramClient, events, errors
+
+"""telegram_forwarder_revamped.py (Telethon v5.1)
+=================================================
+修正「重覆訊息」& IGNORE_USERS
+--------------------------------
+1. **Text 訊息只發一次**：
+   • 純文字：直接 `send_message`〈[群組] @user + 原文〉，不再 forward。
+   • 有媒體：仍先送 header，再 forward/copy/下載。
+2. **IGNORE_USERS** 用法：`.env` → `IGNORE_USERS=spam_bot,foo123`（無 @，逗號分隔，不分大小寫）。
+   • 他們的訊息會被 *log*，但完全不轉發／下載。
+"""
+
+# ── env & init ──────────────────────────────────────────────────────────────
+
 load_dotenv()
 
-app = Client(
-    "my_account",
-    api_id=os.getenv("API_ID"),
-    api_hash=os.getenv("API_HASH")
-)
-
-# list of chat IDs you are interested in
-media_types = ["audio", "photo", "video", "document", "voice", "video_note", "animation"]
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+SESSION_NAME = os.getenv("SESSION_NAME", "my_account")
 
 
-@app.on_message()
-async def handle_message(client, message):
-    # Check if the message is from a chat in your list
-    target_chat = [int(id) if id.isdigit() else id for id in os.getenv("CHAT_TARGET").split(',')] if os.getenv("CHAT_TARGET") is not None else []
-    chat_ids = [int(id) for id in os.getenv("CHAT_IDS").split(',')] if os.getenv("CHAT_IDS") is not None else []
-    ignore_username = [username.strip() for username in os.getenv("CHAT_IGNORE_USERNAME").split(",")] if os.getenv("CHAT_IGNORE_USERNAME") else []
-    delay_seconds = int(os.getenv("DELAY_SECONDS", 5))
-    # print(target_chat)
-    # print(chat_ids)
-    # print(ignore_username)
-    # print(message)
-    # print(message.from_user)
+def _parse_id_list(env_name):
+    return [
+        int(x) if x.lstrip("-").isdigit() else x
+        for x in (y.strip() for y in os.getenv(env_name, "").split(","))
+        if x
+    ]
 
-    # print(f"1: {message.chat.id in chat_ids}")
-    # print(f"2: {message.from_user is not None}")
-    # print(f"3: {message.from_user.username not in ignore_username}")
+TARGET_CHATS = _parse_id_list("TARGET_CHAT")
+SOURCE_CHATS = set(_parse_id_list("SOURCE_CHATS"))
 
-    if message.chat.id in chat_ids:
+DOWNLOAD_MODE = os.getenv("DOWNLOAD_MODE", "auto").lower()
+DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "5"))
+DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads")).expanduser()
+IGNORE_USERS = {u.strip().lower() for u in os.getenv("IGNORE_USERS", "").split(",") if u.strip()}
 
-        if (message.from_user is not None and message.from_user.username in ignore_username):
-            print(f"[{datetime.now()}]Message from ignored user {message.from_user.username} chat {message.chat.id}: {message.text}")
-        
-        else:
-            # Create the file path
-            file_path_prefix = f"/app/downloads/{message.chat.id}/"
-            file_path_prefix = file_path_prefix.replace(" ", "_")
+client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+
+# ── helper funcs ────────────────────────────────────────────────────────────
+
+async def throttle():
+    if DELAY_SECONDS:
+        await asyncio.sleep(DELAY_SECONDS)
 
 
-            # Check the type of the message and download if it's a type we're interested in
-            if message.audio: 
-                file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}/{message.id}_{message.from_user.username}.mp3")
-                print(f"[{datetime.now()}]Downloaded audio file to {file_path}")
-                # Send the downloaded media to another user or group
-                for chat in target_chat:
-                    time.sleep(delay_seconds)
-                    await client.send_audio(chat_id=chat, audio=file_path)
-                    print(f"[{datetime.now()}]File sent to chat: {chat}")
+def tstamp() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
 
+def log(obj: dict):
+    print(json.dumps(obj, ensure_ascii=False))
 
 
-            elif message.photo:
-                if (message.chat.has_protected_content == False):
-                    for chat in target_chat:
-                        time.sleep(delay_seconds)
-                        print(f"[{datetime.now()}]Forwarding photo to chat: {chat}")
-                        await client.forward_messages(chat_id=chat,from_chat_id=message.chat.id,message_ids=message.id)
-
-                else:
-                    file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}/{message.id}_{message.from_user.username}.jpg")
-                    print(f"[{datetime.now()}]Downloaded photo file to {file_path}")
-                    for chat in target_chat:
-                        time.sleep(delay_seconds)
-                        await client.send_photo(chat_id=chat, photo=file_path)
-                        print(f"[{datetime.now()}]File sent to chat: {chat}")
+def build_filename(msg):
+    sender = (
+        msg.sender.username if getattr(msg.sender, "username", None) else "unknown"
+    )
+    ext = ""
+    if msg.document and msg.file and msg.file.name:
+        ext = Path(msg.file.name).suffix
+    elif msg.file and msg.file.mime_type:
+        ext = mimetypes.guess_extension(msg.file.mime_type) or ""
+    return f"{msg.id}_{sender}{ext}"
 
 
+async def run_api(coro):
+    try:
+        return await coro
+    except errors.FloodWaitError as e:
+        await asyncio.sleep(e.seconds + 1)
+        return await coro
 
 
-            elif message.video:
-                if (message.chat.has_protected_content == False):
-                    for chat in target_chat:
-                        time.sleep(delay_seconds)
-                        print(f"[{datetime.now()}]Forwarding video to chat: {chat}")
-                        await client.forward_messages(chat_id=chat,from_chat_id=message.chat.id,message_ids=message.id)
-
-                else:
-                    file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}/{message.id}_{message.from_user.username}.mp4")
-                    print(f"[{datetime.now()}]Downloaded video file to {file_path}")
-                    for chat in target_chat:
-                        time.sleep(delay_seconds)
-                        await client.send_video(chat_id=chat, video=file_path)
-                        print(f"[{datetime.now()}]File sent to chat: {chat}")
+def media_type(m):
+    if m.media is None:
+        return "text"
+    return (
+        "photo" if m.photo else
+        "video" if m.video else
+        "document" if m.document else
+        "audio" if m.audio else
+        "voice" if m.voice else
+        "animation" if m.animation else
+        "other"
+    )
 
 
-            elif message.document:
-                if (message.chat.has_protected_content == False):
-                    for chat in target_chat:
-                        time.sleep(delay_seconds)
-                        print(f"[{datetime.now()}]Forwarding document to chat: {chat}")
-                        await client.forward_messages(chat_id=chat,from_chat_id=message.chat.id,message_ids=message.id)
-
-                else:
-                    file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}/{message.id}_{message.from_user.username}_{message.document.file_name}")
-                    print(f"[{datetime.now()}]Downloaded document file to {file_path}")
-                    for chat in target_chat:
-                        time.sleep(delay_seconds)
-                        await client.send_document(chat_id=chat, document=file_path)
-                        print(f"[{datetime.now()}]File sent to chat: {chat}")
+def header(event, msg):
+    chat_title = getattr(event.chat, "title", str(event.chat_id))
+    username = (
+        f"@{msg.sender.username}"
+        if getattr(msg.sender, "username", None) else "user"
+    )
+    return f"[{chat_title}] {username}"
 
 
+# ── main handler ────────────────────────────────────────────────────────────
 
+@client.on(events.NewMessage(incoming=True))
+async def handle(event: events.NewMessage.Event):
+    msg = event.message
 
-            elif message.animation:
-                file_path = await client.download_media(message=message, file_name=f"{file_path_prefix}/{message.id}_{message.from_user.username}.gif")
-                print(f"[{datetime.now()}]Downloaded animation file to {file_path}")
-                for chat in target_chat:
-                    time.sleep(delay_seconds)
-                    await client.send_animation(chat_id=chat, animation=file_path)
-                    print(f"[{datetime.now()}]File sent to chat: {chat}")
+    # SOURCE filter
+    if SOURCE_CHATS and event.chat_id not in SOURCE_CHATS:
+        return
 
+    # Log incoming
+    log({"ts": tstamp(), "type": "in", "chat": event.chat_id, "msg": msg.id, "media": media_type(msg), "preview": (msg.text or msg.message or "")[:60]})
 
+    # Ignore users
+    if msg.sender and msg.sender.username and msg.sender.username.lower() in IGNORE_USERS:
+        log({"ts": tstamp(), "type": "info", "note": "ignored", "user": msg.sender.username})
+        return
 
+    hdr = header(event, msg)
 
-            else:
-                print(f"[{datetime.now()}]Text message from user {message.from_user.username} chat {message.chat.id} ignored: {message.text}")
+    # =========== TEXT ONLY (no media) ======================================
+    if msg.media is None:
+        combined = f"{hdr}\n{msg.text or msg.message or '[empty]'}"
+        for tgt in TARGET_CHATS:
+            await throttle()
+            await run_api(client.send_message(tgt, combined))
+            log({"ts": tstamp(), "type": "out", "op": "send_text", "dst": tgt})
+        return  # done, no duplication
 
+    # =========== MEDIA =====================================================
+    # Try forward/copy first (header separate)
+    sent_ok = False
+    if DOWNLOAD_MODE != "always":
+        try:
+            for tgt in TARGET_CHATS:
+                await throttle()
+                await run_api(client.send_message(tgt, hdr))
+                await run_api(client.forward_messages(tgt, msg, msg.peer_id))
+                log({"ts": tstamp(), "type": "out", "op": "forward", "dst": tgt, "msg": msg.id})
+            return
+        except errors.ChatForwardsRestrictedError:
+            sent_ok = False
+        except errors.RPCError as e:
+            log({"ts": tstamp(), "type": "err", "op": "forward", "err": e.__class__.__name__, "msg": e.message})
 
-    else:
-        print(f"[{datetime.now()}]Message from chat {message.chat.id} ignored: {message.text}")
+    if not sent_ok and DOWNLOAD_MODE != "always" and hasattr(client, "copy_messages"):
+        try:
+            for tgt in TARGET_CHATS:
+                await throttle()
+                await run_api(client.send_message(tgt, hdr))
+                await run_api(client.copy_messages(tgt, msg.peer_id, [msg.id]))
+                log({"ts": tstamp(), "type": "out", "op": "copy", "dst": tgt, "msg": msg.id})
+            return
+        except errors.RPCError as e:
+            log({"ts": tstamp(), "type": "err", "op": "copy", "err": e.__class__.__name__, "msg": e.message})
 
+    # fallback download + reupload
+    if DOWNLOAD_MODE != "never":
+        dl_dir = DOWNLOAD_DIR / str(event.chat_id)
+        dl_dir.mkdir(parents=True, exist_ok=True)
+        fpath = await msg.download_media(dl_dir / build_filename(msg))
+        log({"ts": tstamp(), "type": "save", "file": str(fpath)})
 
-app.run()
+        caption = f"{hdr}\n{msg.text or msg.message or ''}"
+        for tgt in TARGET_CHATS:
+            await throttle()
+            await run_api(client.send_file(tgt, fpath, caption=caption.strip()))
+            log({"ts": tstamp(), "type": "out", "op": "send_file", "dst": tgt})
 
+# ── run ─────────────────────────────────────────────────────────────────────
 
+async def main():
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    print("✔ Telegram forwarder (Telethon) running — Ctrl+C to stop…")
+    async with client:
+        await client.run_until_disconnected()
 
-#python main.py
+if __name__ == "__main__":
+    asyncio.run(main())
