@@ -8,15 +8,12 @@ import json
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, errors
 
-"""telegram_forwarder_revamped.py (Telethon v5.1)
+"""telegram_forwarder_revamped.py (Telethon v5.3)
 =================================================
-修正「重覆訊息」& IGNORE_USERS
---------------------------------
-1. **Text 訊息只發一次**：
-   • 純文字：直接 `send_message`〈[群組] @user + 原文〉，不再 forward。
-   • 有媒體：仍先送 header，再 forward/copy/下載。
-2. **IGNORE_USERS** 用法：`.env` → `IGNORE_USERS=spam_bot,foo123`（無 @，逗號分隔，不分大小寫）。
-   • 他們的訊息會被 *log*，但完全不轉發／下載。
+更新
+----
+• **Daily log rotation** ─ 每日寫入 `<DOWNLOAD_DIR>/log/YYYY-MM-DD.log`。
+• 其餘功能同 v5.2 一致。
 """
 
 # ── env & init ──────────────────────────────────────────────────────────────
@@ -43,6 +40,11 @@ DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "5"))
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads")).expanduser()
 IGNORE_USERS = {u.strip().lower() for u in os.getenv("IGNORE_USERS", "").split(",") if u.strip()}
 
+# ── prepare log path ───────────────────────────────────────────────────────
+
+LOG_DIR = DOWNLOAD_DIR / "log"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 # ── helper funcs ────────────────────────────────────────────────────────────
@@ -57,7 +59,14 @@ def tstamp() -> str:
 
 
 def log(obj: dict):
-    print(json.dumps(obj, ensure_ascii=False))
+    line = json.dumps(obj, ensure_ascii=False)
+    print(line)  # stdout
+    try:
+        today_file = LOG_DIR / f"{datetime.now().strftime('%Y-%m-%d')}.log"
+        with today_file.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception as e:
+        print(f"[LOG_ERR] {e}")
 
 
 def build_filename(msg):
@@ -97,8 +106,7 @@ def media_type(m):
 def header(event, msg):
     chat_title = getattr(event.chat, "title", str(event.chat_id))
     username = (
-        f"@{msg.sender.username}"
-        if getattr(msg.sender, "username", None) else "user"
+        f"@{msg.sender.username}" if getattr(msg.sender, "username", None) else "user"
     )
     return f"[{chat_title}] {username}"
 
@@ -109,32 +117,27 @@ def header(event, msg):
 async def handle(event: events.NewMessage.Event):
     msg = event.message
 
-    # SOURCE filter
     if SOURCE_CHATS and event.chat_id not in SOURCE_CHATS:
         return
 
-    # Log incoming
     log({"ts": tstamp(), "type": "in", "chat": event.chat_id, "msg": msg.id, "media": media_type(msg), "preview": (msg.text or msg.message or "")[:60]})
 
-    # Ignore users
     if msg.sender and msg.sender.username and msg.sender.username.lower() in IGNORE_USERS:
         log({"ts": tstamp(), "type": "info", "note": "ignored", "user": msg.sender.username})
         return
 
     hdr = header(event, msg)
 
-    # =========== TEXT ONLY (no media) ======================================
+    # ── TEXT ONLY ──────────────────────────────────────────────────────────
     if msg.media is None:
         combined = f"{hdr}\n{msg.text or msg.message or '[empty]'}"
         for tgt in TARGET_CHATS:
             await throttle()
             await run_api(client.send_message(tgt, combined))
             log({"ts": tstamp(), "type": "out", "op": "send_text", "dst": tgt})
-        return  # done, no duplication
+        return
 
-    # =========== MEDIA =====================================================
-    # Try forward/copy first (header separate)
-    sent_ok = False
+    # ── MEDIA: forward/copy then fallback ─────────────────────────────────
     if DOWNLOAD_MODE != "always":
         try:
             for tgt in TARGET_CHATS:
@@ -144,11 +147,11 @@ async def handle(event: events.NewMessage.Event):
                 log({"ts": tstamp(), "type": "out", "op": "forward", "dst": tgt, "msg": msg.id})
             return
         except errors.ChatForwardsRestrictedError:
-            sent_ok = False
+            pass
         except errors.RPCError as e:
             log({"ts": tstamp(), "type": "err", "op": "forward", "err": e.__class__.__name__, "msg": e.message})
 
-    if not sent_ok and DOWNLOAD_MODE != "always" and hasattr(client, "copy_messages"):
+    if DOWNLOAD_MODE != "always" and hasattr(client, "copy_messages"):
         try:
             for tgt in TARGET_CHATS:
                 await throttle()
@@ -159,7 +162,6 @@ async def handle(event: events.NewMessage.Event):
         except errors.RPCError as e:
             log({"ts": tstamp(), "type": "err", "op": "copy", "err": e.__class__.__name__, "msg": e.message})
 
-    # fallback download + reupload
     if DOWNLOAD_MODE != "never":
         dl_dir = DOWNLOAD_DIR / str(event.chat_id)
         dl_dir.mkdir(parents=True, exist_ok=True)
@@ -176,6 +178,7 @@ async def handle(event: events.NewMessage.Event):
 
 async def main():
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     print("✔ Telegram forwarder (Telethon) running — Ctrl+C to stop…")
     async with client:
         await client.run_until_disconnected()
