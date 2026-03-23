@@ -5,10 +5,12 @@ from datetime import datetime
 import mimetypes
 import json
 import uuid
+import time
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, errors, types
+from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 
 
 load_dotenv()
@@ -21,12 +23,16 @@ DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads")).expanduser()
 LOG_DIR = DOWNLOAD_DIR / "log"
 SPOOL_DIR = DOWNLOAD_DIR / "_spool"
 
-DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "5"))                  # text delay
-MEDIA_DELAY_SECONDS = int(os.getenv("MEDIA_DELAY_SECONDS", "0"))      # media send_file delay
-WORKER_CONCURRENCY = max(1, int(os.getenv("WORKER_CONCURRENCY", "1")))
-QUEUE_MAXSIZE = max(0, int(os.getenv("QUEUE_MAXSIZE", "1000")))
+DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "5"))
+MEDIA_DELAY_SECONDS = int(os.getenv("MEDIA_DELAY_SECONDS", "0"))
 DOWNLOAD_CONCURRENCY = max(1, int(os.getenv("DOWNLOAD_CONCURRENCY", "3")))
 DELETE_AFTER_SEND = os.getenv("DELETE_AFTER_SEND", "true").strip().lower() in {"1", "true", "yes", "y"}
+
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+KAFKA_TEXT_TOPIC = os.getenv("KAFKA_TEXT_TOPIC", "tg-forward-text")
+KAFKA_MEDIA_TOPIC = os.getenv("KAFKA_MEDIA_TOPIC", "tg-forward-media")
+KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP", "tg-forwarder")
+
 LARGE_MEDIA_FORWARD_THRESHOLD_MB = int(os.getenv("LARGE_MEDIA_FORWARD_THRESHOLD_MB", "30"))
 LARGE_MEDIA_FORWARD_THRESHOLD_BYTES = LARGE_MEDIA_FORWARD_THRESHOLD_MB * 1024 * 1024
 
@@ -40,6 +46,11 @@ IGNORE_IDS = {
     for x in os.getenv("IGNORE_IDS", "").split(",")
     if x.strip() and x.strip().lstrip("-").isdigit()
 }
+FORWARDABLE_SOURCE_CHATS = {
+    int(x.strip())
+    for x in os.getenv("FORWARDABLE_SOURCE_CHATS", "").split(",")
+    if x.strip() and x.strip().lstrip("-").isdigit()
+}
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 SPOOL_DIR.mkdir(parents=True, exist_ok=True)
@@ -47,18 +58,21 @@ SPOOL_DIR.mkdir(parents=True, exist_ok=True)
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 client.parse_mode = "md"
 
-event_queue: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE if QUEUE_MAXSIZE > 0 else 0)
 download_semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
-
-# chat_id -> True/False，記錄 source chat 是否可 direct forward
-FORWARD_CAP_CACHE: Dict[int, bool] = {}
-
-# 防止 create_task 被 GC
 BACKGROUND_TASKS = set()
+STOP_EVENT = asyncio.Event()
+
+producer: Optional[AIOKafkaProducer] = None
+text_consumer: Optional[AIOKafkaConsumer] = None
+media_consumer: Optional[AIOKafkaConsumer] = None
 
 
 def tstamp() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def now_ts() -> float:
+    return time.time()
 
 
 def log(obj: dict):
@@ -184,12 +198,9 @@ def load_routes() -> List[Dict[str, Any]]:
     if not routes_json:
         raise RuntimeError("ROUTES_JSON is required")
 
-    try:
-        raw_routes = json.loads(routes_json)
-        if not isinstance(raw_routes, list):
-            raise ValueError("ROUTES_JSON must be a JSON array")
-    except Exception as e:
-        raise RuntimeError(f"Invalid ROUTES_JSON: {e}") from e
+    raw_routes = json.loads(routes_json)
+    if not isinstance(raw_routes, list):
+        raise RuntimeError("ROUTES_JSON must be a JSON array")
 
     routes: List[Dict[str, Any]] = []
     for idx, raw in enumerate(raw_routes, start=1):
@@ -209,7 +220,6 @@ def load_routes() -> List[Dict[str, Any]]:
             "sources": set(sources),
             "targets": targets,
         })
-
     return routes
 
 
@@ -251,14 +261,12 @@ async def resolve_sender_info_from_message(msg, chat_id_hint=None) -> dict:
         chat_type = "unknown"
 
     info = {
-        "chat_obj": chat,
         "chat_id": chat_id,
         "chat_title": chat_title,
         "chat_username": chat_username,
         "chat_type": chat_type,
         "raw_chat_class": chat.__class__.__name__ if chat is not None else None,
 
-        "sender_obj": sender,
         "sender_id": getattr(sender, "id", None) or getattr(msg, "sender_id", None),
         "sender_type": "unknown",
         "sender_username": None,
@@ -270,8 +278,8 @@ async def resolve_sender_info_from_message(msg, chat_id_hint=None) -> dict:
         "raw_sender_class": sender.__class__.__name__ if sender is not None else None,
 
         "msg_id": msg.id,
-        "msg_date": getattr(msg, "date", None),
-        "edit_date": getattr(msg, "edit_date", None),
+        "msg_date": str(getattr(msg, "date", None)),
+        "edit_date": str(getattr(msg, "edit_date", None)),
         "grouped_id": getattr(msg, "grouped_id", None),
         "reply_to_msg_id": getattr(getattr(msg, "reply_to", None), "reply_to_msg_id", None),
     }
@@ -409,26 +417,25 @@ def should_ignore(info: dict) -> bool:
     return False
 
 
-def should_try_direct_forward_for_large_media(info: dict, msg) -> bool:
-    if msg.media is None:
-        return False
+def route_names(routes: List[Dict[str, Any]]) -> List[str]:
+    return [r["name"] for r in routes]
 
-    size = get_media_size(msg)
-    if size is None:
-        return False
 
-    if size <= LARGE_MEDIA_FORWARD_THRESHOLD_BYTES:
-        return False
+def json_bytes(obj: dict) -> bytes:
+    return json.dumps(obj, ensure_ascii=False).encode("utf-8")
 
-    chat_id = info.get("chat_id")
-    can_forward = FORWARD_CAP_CACHE.get(chat_id)
 
-    # 已知不可 forward -> 唔試
-    if can_forward is False:
-        return False
+def due_ts_for_text() -> float:
+    return now_ts() + DELAY_SECONDS
 
-    # 已知可 forward，或者未知，都先試 direct forward
-    return True
+
+def due_ts_for_media() -> float:
+    return now_ts() + MEDIA_DELAY_SECONDS
+
+
+async def kafka_send(topic: str, payload: dict):
+    assert producer is not None
+    await producer.send_and_wait(topic, json_bytes(payload))
 
 
 async def snapshot_media_message(msg, info: dict, source_kind: str) -> Optional[dict]:
@@ -468,11 +475,8 @@ async def snapshot_media_message(msg, info: dict, source_kind: str) -> Optional[
         return None
 
     fpath = Path(fpath)
-
     snapshot = {
         "path": str(fpath),
-        "original_name": getattr(getattr(msg, "file", None), "name", None),
-        "mime_type": getattr(getattr(msg, "file", None), "mime_type", None),
         "media_type": media_type(msg),
         "media_size": get_media_size(msg),
         "caption_text": (msg.text or msg.message or "").strip(),
@@ -492,59 +496,93 @@ async def snapshot_media_message(msg, info: dict, source_kind: str) -> Optional[
         "media_size": snapshot["media_size"],
         "file": str(fpath),
     })
-
     return snapshot
 
 
-async def enqueue_text_payload(msg, info: dict, routes: List[Dict[str, Any]], source_kind: str):
-    payload = {
-        "queue_type": "text",
+async def publish_text_job(msg, info: dict, routes: List[Dict[str, Any]], source_kind: str):
+    job = {
+        "job_type": "text",
         "source_kind": source_kind,
-        "routes": [r["name"] for r in routes],
+        "route_names": route_names(routes),
         "info": info,
         "text": msg.text or msg.message or "[empty]",
+        "due_at": due_ts_for_text(),
+        "created_at": tstamp(),
     }
-    await event_queue.put(payload)
+    await kafka_send(KAFKA_TEXT_TOPIC, job)
+
+    log({
+        "ts": tstamp(),
+        "type": "kafka_produce",
+        "topic": KAFKA_TEXT_TOPIC,
+        "job_type": "text",
+        "chat_id": info["chat_id"],
+        "msg_id": info["msg_id"],
+        "source_kind": source_kind,
+    })
 
 
-async def enqueue_media_payload(msg, info: dict, routes: List[Dict[str, Any]], source_kind: str):
-    if should_try_direct_forward_for_large_media(info, msg):
-        payload = {
-            "queue_type": "media_forward",
+def should_direct_forward_large_media(info: dict, msg) -> bool:
+    size = get_media_size(msg)
+    if size is None or size <= LARGE_MEDIA_FORWARD_THRESHOLD_BYTES:
+        return False
+    return info.get("chat_id") in FORWARDABLE_SOURCE_CHATS
+
+
+async def publish_media_job(msg, info: dict, routes: List[Dict[str, Any]], source_kind: str):
+    if should_direct_forward_large_media(info, msg):
+        job = {
+            "job_type": "media_forward",
             "source_kind": source_kind,
-            "routes": [r["name"] for r in routes],
+            "route_names": route_names(routes),
             "info": info,
-            "msg": msg,
+            "chat_id": info["chat_id"],
+            "msg_id": info["msg_id"],
             "caption_text": (msg.text or msg.message or "").strip(),
             "media_type": media_type(msg),
             "media_size": get_media_size(msg),
+            "due_at": due_ts_for_media(),
+            "created_at": tstamp(),
         }
+        await kafka_send(KAFKA_MEDIA_TOPIC, job)
+
         log({
             "ts": tstamp(),
-            "type": "queue_media_forward",
-            "source_kind": source_kind,
+            "type": "kafka_produce",
+            "topic": KAFKA_MEDIA_TOPIC,
+            "job_type": "media_forward",
             "chat_id": info["chat_id"],
-            "chat_title": info["chat_title"],
             "msg_id": info["msg_id"],
-            "media_type": media_type(msg),
+            "source_kind": source_kind,
             "media_size": get_media_size(msg),
-            "reason": f"size_gt_{LARGE_MEDIA_FORWARD_THRESHOLD_MB}MB",
         })
-        await event_queue.put(payload)
         return
 
     snapshot = await snapshot_media_message(msg, info, source_kind)
     if not snapshot:
         return
 
-    payload = {
-        "queue_type": "media_file",
+    job = {
+        "job_type": "media_file",
         "source_kind": source_kind,
-        "routes": [r["name"] for r in routes],
+        "route_names": route_names(routes),
         "info": info,
         "snapshot": snapshot,
+        "due_at": due_ts_for_media(),
+        "created_at": tstamp(),
     }
-    await event_queue.put(payload)
+    await kafka_send(KAFKA_MEDIA_TOPIC, job)
+
+    log({
+        "ts": tstamp(),
+        "type": "kafka_produce",
+        "topic": KAFKA_MEDIA_TOPIC,
+        "job_type": "media_file",
+        "chat_id": info["chat_id"],
+        "msg_id": info["msg_id"],
+        "source_kind": source_kind,
+        "file": snapshot["path"],
+    })
 
 
 async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, info: dict, source_kind: str):
@@ -560,7 +598,6 @@ async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, in
         "source_kind": source_kind,
     }
     try:
-        await throttle(DELAY_SECONDS)
         await run_api(client.send_message(tgt, combined), op="send_text", extra=extra)
         log({
             "ts": tstamp(),
@@ -587,7 +624,6 @@ async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, capt
         "source_kind": source_kind,
     }
     try:
-        await throttle(MEDIA_DELAY_SECONDS)
         await run_api(client.send_file(tgt, fpath, caption=caption), op="send_file", extra=extra)
         log({
             "ts": tstamp(),
@@ -600,59 +636,79 @@ async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, capt
         pass
 
 
-async def try_forward_large_media_to_target(route: Dict[str, Any], tgt: Any, hdr: str, msg, info: dict, source_kind: str) -> bool:
-    extra = {
-        "route": route["name"],
-        "dst": tgt,
-        "src_msg": info["msg_id"],
-        "chat_id": info["chat_id"],
-        "chat_title": info["chat_title"],
-        "sender_id": info["sender_id"],
-        "sender_username": info["sender_username"],
-        "sender_display": info["sender_display"],
-        "source_kind": source_kind,
-        "media_size": get_media_size(msg),
-        "media_type": media_type(msg),
-    }
-    await throttle(MEDIA_DELAY_SECONDS)
-    await run_api(client.send_message(tgt, hdr), op="send_header_before_forward_large", extra=extra)
-    await run_api(client.forward_messages(tgt, msg, msg.peer_id), op="forward_large_media", extra=extra)
-    log({
-        "ts": tstamp(),
-        "type": "out",
-        "op": "forward_large_media",
-        "status": "ok",
-        **extra,
-    })
-    return True
+async def fetch_message_by_id(chat_id: int, msg_id: int):
+    try:
+        return await client.get_messages(chat_id, ids=msg_id)
+    except Exception as e:
+        log({
+            "ts": tstamp(),
+            "type": "err",
+            "op": "get_messages",
+            "chat_id": chat_id,
+            "msg_id": msg_id,
+            "err": e.__class__.__name__,
+            "msg": str(e),
+        })
+        return None
 
 
-async def fallback_snapshot_and_send(msg, info: dict, routes: List[Dict[str, Any]], source_kind: str):
-    snapshot = await snapshot_media_message(msg, info, source_kind)
-    if not snapshot:
+async def process_text_job(job: dict):
+    info = job["info"]
+    if should_ignore(info):
+        log({"ts": tstamp(), "type": "info", "note": "ignored_text_job", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
         return
 
-    hdr = build_header_from_info(info, is_edit=(source_kind == "edited"))
-    caption_body = snapshot.get("caption_text", "").strip()
-    caption = f"{hdr}\n{caption_body}".strip()
-    fpath = Path(snapshot["path"])
+    is_edit = job["source_kind"] == "edited"
+    hdr = build_header_from_info(info, is_edit=is_edit)
+    body = job["text"]
+    combined = f"{hdr}\n{body}"
 
+    routes = [ROUTE_MAP[name] for name in job["route_names"] if name in ROUTE_MAP]
     for route in routes:
         for tgt in route["targets"]:
-            await send_file_to_target(route, tgt, fpath, caption, info, source_kind)
+            await send_text_to_target(route, tgt, combined, info, job["source_kind"])
+
+
+async def process_media_file_job(job: dict):
+    info = job["info"]
+    if should_ignore(info):
+        log({"ts": tstamp(), "type": "info", "note": "ignored_media_file_job", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
+        return
+
+    snapshot = job["snapshot"]
+    fpath = Path(snapshot["path"])
+    if not fpath.exists():
+        log({
+            "ts": tstamp(),
+            "type": "err",
+            "op": "media_file_missing",
+            "chat_id": info["chat_id"],
+            "msg_id": info["msg_id"],
+            "file": str(fpath),
+        })
+        return
+
+    is_edit = job["source_kind"] == "edited"
+    hdr = build_header_from_info(info, is_edit=is_edit)
+    caption_body = snapshot.get("caption_text", "").strip()
+    caption = f"{hdr}\n{caption_body}".strip()
+
+    routes = [ROUTE_MAP[name] for name in job["route_names"] if name in ROUTE_MAP]
+    for route in routes:
+        for tgt in route["targets"]:
+            await send_file_to_target(route, tgt, fpath, caption, info, job["source_kind"])
 
     if DELETE_AFTER_SEND:
         try:
-            if fpath.exists():
-                fpath.unlink(missing_ok=True)
-                log({
-                    "ts": tstamp(),
-                    "type": "cleanup",
-                    "op": "delete_temp_file",
-                    "file": str(fpath),
-                    "src_msg": info["msg_id"],
-                    "source_kind": source_kind,
-                })
+            fpath.unlink(missing_ok=True)
+            log({
+                "ts": tstamp(),
+                "type": "cleanup",
+                "op": "delete_temp_file",
+                "file": str(fpath),
+                "src_msg": info["msg_id"],
+                "source_kind": job["source_kind"],
+            })
         except Exception as e:
             log({
                 "ts": tstamp(),
@@ -660,149 +716,147 @@ async def fallback_snapshot_and_send(msg, info: dict, routes: List[Dict[str, Any
                 "op": "delete_temp_file",
                 "file": str(fpath),
                 "src_msg": info["msg_id"],
-                "source_kind": source_kind,
+                "source_kind": job["source_kind"],
                 "err": e.__class__.__name__,
                 "msg": str(e),
             })
 
 
-async def process_payload(payload: dict):
-    info = payload["info"]
-
+async def process_media_forward_job(job: dict):
+    info = job["info"]
     if should_ignore(info):
+        log({"ts": tstamp(), "type": "info", "note": "ignored_media_forward_job", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
+        return
+
+    msg = await fetch_message_by_id(job["chat_id"], job["msg_id"])
+    if not msg:
         log({
             "ts": tstamp(),
-            "type": "info",
-            "note": "ignored",
-            "source_kind": payload["source_kind"],
-            "chat_id": info["chat_id"],
-            "chat_title": info["chat_title"],
-            "chat_username": info["chat_username"],
-            "sender_id": info["sender_id"],
-            "sender_username": info["sender_username"],
-            "sender_display": info["sender_display"],
-            "sender_type": info["sender_type"],
+            "type": "err",
+            "op": "media_forward_fetch_failed",
+            "chat_id": job["chat_id"],
+            "msg_id": job["msg_id"],
         })
         return
 
-    is_edit = payload["source_kind"] == "edited"
+    is_edit = job["source_kind"] == "edited"
     hdr = build_header_from_info(info, is_edit=is_edit)
 
-    routes = [ROUTE_MAP[name] for name in payload["routes"] if name in ROUTE_MAP]
-    if not routes:
-        return
+    routes = [ROUTE_MAP[name] for name in job["route_names"] if name in ROUTE_MAP]
 
-    if payload["queue_type"] == "text":
-        body = payload["text"]
-        combined = f"{hdr}\n{body}"
+    try:
         for route in routes:
             for tgt in route["targets"]:
-                await send_text_to_target(route, tgt, combined, info, payload["source_kind"])
-        return
+                extra = {
+                    "route": route["name"],
+                    "dst": tgt,
+                    "src_msg": info["msg_id"],
+                    "chat_id": info["chat_id"],
+                    "chat_title": info["chat_title"],
+                    "sender_id": info["sender_id"],
+                    "sender_username": info["sender_username"],
+                    "sender_display": info["sender_display"],
+                    "source_kind": job["source_kind"],
+                    "media_size": job.get("media_size"),
+                    "media_type": job.get("media_type"),
+                }
+                await run_api(client.send_message(tgt, hdr), op="send_header_before_forward_large", extra=extra)
+                await run_api(client.forward_messages(tgt, msg, msg.peer_id), op="forward_large_media", extra=extra)
 
-    if payload["queue_type"] == "media_file":
-        snapshot = payload["snapshot"]
-        fpath = Path(snapshot["path"])
-        caption_body = snapshot.get("caption_text", "").strip()
-        caption = f"{hdr}\n{caption_body}".strip()
+                log({
+                    "ts": tstamp(),
+                    "type": "out",
+                    "op": "forward_large_media",
+                    "status": "ok",
+                    **extra,
+                })
+    except errors.ChatForwardsRestrictedError:
+        # config 寫錯 / 群限制變咗，fallback 成 download + send
+        log({
+            "ts": tstamp(),
+            "type": "warn",
+            "op": "forward_large_media",
+            "note": "chat_forwards_restricted_fallback_to_download",
+            "chat_id": info["chat_id"],
+            "msg_id": info["msg_id"],
+        })
 
-        for route in routes:
-            for tgt in route["targets"]:
-                await send_file_to_target(route, tgt, fpath, caption, info, payload["source_kind"])
+        snapshot = await snapshot_media_message(msg, info, job["source_kind"])
+        if not snapshot:
+            return
 
-        if DELETE_AFTER_SEND:
+        fallback_job = {
+            "job_type": "media_file",
+            "source_kind": job["source_kind"],
+            "route_names": job["route_names"],
+            "info": info,
+            "snapshot": snapshot,
+        }
+        await process_media_file_job(fallback_job)
+
+
+async def sleep_until_due(job: dict):
+    due_at = float(job.get("due_at", now_ts()))
+    delay = due_at - now_ts()
+    if delay > 0:
+        await asyncio.sleep(delay)
+
+
+async def text_consumer_loop():
+    assert text_consumer is not None
+    await text_consumer.start()
+    try:
+        async for record in text_consumer:
             try:
-                if fpath.exists():
-                    fpath.unlink(missing_ok=True)
-                    log({
-                        "ts": tstamp(),
-                        "type": "cleanup",
-                        "op": "delete_temp_file",
-                        "file": str(fpath),
-                        "src_msg": info["msg_id"],
-                        "source_kind": payload["source_kind"],
-                    })
+                job = json.loads(record.value.decode("utf-8"))
+                await sleep_until_due(job)
+                await process_text_job(job)
+                await text_consumer.commit()
             except Exception as e:
                 log({
                     "ts": tstamp(),
-                    "type": "warn",
-                    "op": "delete_temp_file",
-                    "file": str(fpath),
-                    "src_msg": info["msg_id"],
-                    "source_kind": payload["source_kind"],
+                    "type": "err",
+                    "op": "text_consumer_loop",
                     "err": e.__class__.__name__,
                     "msg": str(e),
                 })
-        return
-
-    if payload["queue_type"] == "media_forward":
-        msg = payload["msg"]
-        chat_id = info["chat_id"]
-
-        try:
-            for route in routes:
-                for tgt in route["targets"]:
-                    await try_forward_large_media_to_target(route, tgt, hdr, msg, info, payload["source_kind"])
-
-            FORWARD_CAP_CACHE[chat_id] = True
-            return
-
-        except errors.ChatForwardsRestrictedError:
-            FORWARD_CAP_CACHE[chat_id] = False
-            log({
-                "ts": tstamp(),
-                "type": "warn",
-                "op": "forward_large_media",
-                "note": "chat_forwards_restricted_fallback_to_download",
-                "chat_id": info["chat_id"],
-                "chat_title": info["chat_title"],
-                "src_msg": info["msg_id"],
-                "source_kind": payload["source_kind"],
-            })
-            await fallback_snapshot_and_send(msg, info, routes, payload["source_kind"])
-            return
-
-        except errors.RPCError as e:
-            # 其他 RPC error 唔直接判死 source chat，不過仍然 fallback
-            log({
-                "ts": tstamp(),
-                "type": "warn",
-                "op": "forward_large_media",
-                "note": "rpc_error_fallback_to_download",
-                "err": e.__class__.__name__,
-                "msg": getattr(e, "message", str(e)),
-                "chat_id": info["chat_id"],
-                "chat_title": info["chat_title"],
-                "src_msg": info["msg_id"],
-                "source_kind": payload["source_kind"],
-            })
-            await fallback_snapshot_and_send(msg, info, routes, payload["source_kind"])
-            return
+    finally:
+        await text_consumer.stop()
 
 
-async def worker(worker_id: int):
-    log({
-        "ts": tstamp(),
-        "type": "info",
-        "note": "worker_started",
-        "worker_id": worker_id,
-    })
+async def media_consumer_loop():
+    assert media_consumer is not None
+    await media_consumer.start()
+    try:
+        async for record in media_consumer:
+            try:
+                job = json.loads(record.value.decode("utf-8"))
+                await sleep_until_due(job)
 
-    while True:
-        payload = await event_queue.get()
-        try:
-            await process_payload(payload)
-        except Exception as e:
-            log({
-                "ts": tstamp(),
-                "type": "err",
-                "op": "worker_process_payload",
-                "worker_id": worker_id,
-                "err": e.__class__.__name__,
-                "msg": str(e),
-            })
-        finally:
-            event_queue.task_done()
+                job_type = job.get("job_type")
+                if job_type == "media_file":
+                    await process_media_file_job(job)
+                elif job_type == "media_forward":
+                    await process_media_forward_job(job)
+                else:
+                    log({
+                        "ts": tstamp(),
+                        "type": "err",
+                        "op": "media_consumer_unknown_job_type",
+                        "job_type": job_type,
+                    })
+
+                await media_consumer.commit()
+            except Exception as e:
+                log({
+                    "ts": tstamp(),
+                    "type": "err",
+                    "op": "media_consumer_loop",
+                    "err": e.__class__.__name__,
+                    "msg": str(e),
+                })
+    finally:
+        await media_consumer.stop()
 
 
 async def handle_incoming_message(msg, source_kind: str):
@@ -816,28 +870,23 @@ async def handle_incoming_message(msg, source_kind: str):
         "ts": tstamp(),
         "type": "in" if source_kind == "new" else "edit",
         "matched_routes": [r["name"] for r in routes],
-
         "chat_id": info["chat_id"],
         "chat_title": info["chat_title"],
         "chat_username": info["chat_username"],
         "chat_type": info["chat_type"],
         "raw_chat_class": info["raw_chat_class"],
-
         "msg": info["msg_id"],
         "media": media_type(msg),
         "media_size": get_media_size(msg),
         "preview": (msg.text or msg.message or "")[:160],
-
         "sender_type": info["sender_type"],
         "sender_id": info["sender_id"],
         "sender_username": info["sender_username"],
         "sender_display": info["sender_display"],
         "sender_first_name": info["sender_first_name"],
         "sender_last_name": info["sender_last_name"],
-
         "post_author": info["post_author"],
         "raw_sender_class": info["raw_sender_class"],
-
         "msg_date": info["msg_date"],
         "edit_date": info["edit_date"],
         "grouped_id": info["grouped_id"],
@@ -845,10 +894,9 @@ async def handle_incoming_message(msg, source_kind: str):
     })
 
     if msg.media is None:
-        await enqueue_text_payload(msg, info, routes, source_kind)
+        await publish_text_job(msg, info, routes, source_kind)
     else:
-        # media capture/queue 交俾背景 task，避免 event handler 因大 file 阻塞
-        spawn_bg(enqueue_media_payload(msg, info, routes, source_kind))
+        spawn_bg(publish_media_job(msg, info, routes, source_kind))
 
 
 @client.on(events.NewMessage(incoming=True))
@@ -883,6 +931,38 @@ async def on_message_edited(event: events.MessageEdited.Event):
         })
 
 
+async def startup_kafka():
+    global producer, text_consumer, media_consumer
+
+    producer = AIOKafkaProducer(
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+    )
+    await producer.start()
+
+    text_consumer = AIOKafkaConsumer(
+        KAFKA_TEXT_TOPIC,
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        group_id=f"{KAFKA_CONSUMER_GROUP}-text",
+        enable_auto_commit=False,
+        auto_offset_reset="earliest",
+    )
+
+    media_consumer = AIOKafkaConsumer(
+        KAFKA_MEDIA_TOPIC,
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        group_id=f"{KAFKA_CONSUMER_GROUP}-media",
+        enable_auto_commit=False,
+        auto_offset_reset="earliest",
+    )
+
+
+async def shutdown_kafka():
+    global producer
+    if producer is not None:
+        await producer.stop()
+        producer = None
+
+
 def print_route_summary():
     summary = []
     for route in ROUTES:
@@ -893,11 +973,15 @@ def print_route_summary():
         })
     print(json.dumps({
         "startup": "ok",
-        "worker_concurrency": WORKER_CONCURRENCY,
-        "download_concurrency": DOWNLOAD_CONCURRENCY,
+        "kafka_bootstrap_servers": KAFKA_BOOTSTRAP_SERVERS,
+        "kafka_text_topic": KAFKA_TEXT_TOPIC,
+        "kafka_media_topic": KAFKA_MEDIA_TOPIC,
+        "kafka_consumer_group": KAFKA_CONSUMER_GROUP,
         "text_delay_seconds": DELAY_SECONDS,
         "media_delay_seconds": MEDIA_DELAY_SECONDS,
+        "download_concurrency": DOWNLOAD_CONCURRENCY,
         "large_media_forward_threshold_mb": LARGE_MEDIA_FORWARD_THRESHOLD_MB,
+        "forwardable_source_chats": sorted(list(FORWARDABLE_SOURCE_CHATS)),
         "delete_after_send": DELETE_AFTER_SEND,
         "ignore_users": sorted(list(IGNORE_USERS)),
         "ignore_ids": sorted(list(IGNORE_IDS)),
@@ -911,21 +995,28 @@ async def main():
     SPOOL_DIR.mkdir(parents=True, exist_ok=True)
 
     print_route_summary()
-    print("✔ Telegram forwarder running — Ctrl+C to stop…")
+    print("✔ Telegram forwarder + Kafka running — Ctrl+C to stop…")
 
-    workers = [asyncio.create_task(worker(i + 1)) for i in range(WORKER_CONCURRENCY)]
+    await startup_kafka()
 
-    async with client:
-        try:
+    consumer_tasks = [
+        asyncio.create_task(text_consumer_loop()),
+        asyncio.create_task(media_consumer_loop()),
+    ]
+
+    try:
+        async with client:
             await client.run_until_disconnected()
-        finally:
-            for w in workers:
-                w.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
+    finally:
+        for t in consumer_tasks:
+            t.cancel()
+        await asyncio.gather(*consumer_tasks, return_exceptions=True)
 
-            for t in list(BACKGROUND_TASKS):
-                t.cancel()
-            await asyncio.gather(*BACKGROUND_TASKS, return_exceptions=True)
+        for t in list(BACKGROUND_TASKS):
+            t.cancel()
+        await asyncio.gather(*BACKGROUND_TASKS, return_exceptions=True)
+
+        await shutdown_kafka()
 
 
 if __name__ == "__main__":
