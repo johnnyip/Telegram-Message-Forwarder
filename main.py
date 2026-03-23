@@ -97,7 +97,7 @@ def media_type(m):
 
 
 def build_filename(msg, sender_display="unknown"):
-    # 注意：filename 用原始 sender_display，唔用 markdown/code format
+    # filename 用原始 sender_display，唔用 markdown/code format
     safe_sender = sanitize_filename_part(sender_display)
     ext = ""
 
@@ -189,11 +189,7 @@ ROUTES = load_routes()
 
 
 def find_matching_routes(chat_id: Any) -> List[Dict[str, Any]]:
-    matched = []
-    for route in ROUTES:
-        if chat_id in route["sources"]:
-            matched.append(route)
-    return matched
+    return [route for route in ROUTES if chat_id in route["sources"]]
 
 
 async def resolve_sender_info(event: events.NewMessage.Event) -> dict:
@@ -317,6 +313,33 @@ def md_code(value: Any) -> str:
     return f"`{s}`"
 
 
+def escape_md_link_text(text: Any) -> str:
+    s = str(text)
+    # md parse mode 下，link text 主要 escape 這些較穩
+    for ch in ["\\", "[", "]", "(", ")"]:
+        s = s.replace(ch, f"\\{ch}")
+    return s
+
+
+def build_chat_message_url(info: dict) -> Optional[str]:
+    chat_username = info.get("chat_username")
+    chat_id = info.get("chat_id")
+    msg_id = info.get("msg_id")
+
+    if not msg_id:
+        return None
+
+    if chat_username:
+        return f"https://t.me/{chat_username}/{msg_id}"
+
+    if isinstance(chat_id, int):
+        s = str(chat_id)
+        if s.startswith("-100"):
+            return f"https://t.me/c/{s[4:]}/{msg_id}"
+
+    return None
+
+
 def format_copyable_identity_lines(info: dict) -> str:
     lines = []
 
@@ -346,7 +369,14 @@ def format_copyable_identity_lines(info: dict) -> str:
 
 
 def build_header_from_info(info: dict) -> str:
-    group_line = f"[{safe_str(info.get('chat_title'))}]"
+    chat_title = safe_str(info.get("chat_title"))
+    url = build_chat_message_url(info)
+
+    if url:
+        group_line = f"[{escape_md_link_text(chat_title)}]({url})"
+    else:
+        group_line = f"[{escape_md_link_text(chat_title)}]"
+
     identity_lines = format_copyable_identity_lines(info)
 
     if identity_lines:
@@ -533,7 +563,6 @@ async def process_route(route: Dict[str, Any], event: events.NewMessage.Event, i
         dl_dir = DOWNLOAD_DIR / route["name"] / str(event.chat_id)
         dl_dir.mkdir(parents=True, exist_ok=True)
 
-        # filename 用原始 display，唔受 markdown header 影響
         file_name = build_filename(msg, info.get("sender_display", "unknown"))
         save_path = dl_dir / file_name
 
