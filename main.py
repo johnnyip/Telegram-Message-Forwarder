@@ -4,6 +4,7 @@ from pathlib import Path
 from datetime import datetime
 import mimetypes
 import json
+import uuid
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -18,12 +19,13 @@ SESSION_NAME = os.getenv("SESSION_NAME", "my_account")
 
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads")).expanduser()
 LOG_DIR = DOWNLOAD_DIR / "log"
+SPOOL_DIR = DOWNLOAD_DIR / "_spool"
 
-DOWNLOAD_MODE = os.getenv("DOWNLOAD_MODE", "auto").lower()   # auto / always / never
-DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "5"))
+DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "5"))              # text delay
+MEDIA_DELAY_SECONDS = int(os.getenv("MEDIA_DELAY_SECONDS", "0"))  # media delay
 WORKER_CONCURRENCY = max(1, int(os.getenv("WORKER_CONCURRENCY", "1")))
 QUEUE_MAXSIZE = max(0, int(os.getenv("QUEUE_MAXSIZE", "1000")))
-DELETE_AFTER_SEND = os.getenv("DELETE_AFTER_SEND", "false").strip().lower() in {"1", "true", "yes", "y"}
+DELETE_AFTER_SEND = os.getenv("DELETE_AFTER_SEND", "true").strip().lower() in {"1", "true", "yes", "y"}
 
 IGNORE_USERS = {
     u.strip().lower().lstrip("@")
@@ -37,6 +39,7 @@ IGNORE_IDS = {
 }
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+SPOOL_DIR.mkdir(parents=True, exist_ok=True)
 
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 client.parse_mode = "md"
@@ -66,7 +69,7 @@ def safe_str(value) -> str:
 def sanitize_filename_part(value: str) -> str:
     if not value:
         return "unknown"
-    cleaned = "".join(c for c in value if c.isalnum() or c in ("@", "_", "-", ".", " ", "(", ")"))
+    cleaned = "".join(c for c in str(value) if c.isalnum() or c in ("@", "_", "-", ".", " ", "(", ")"))
     cleaned = cleaned.strip().replace(" ", "_")
     return cleaned[:100] or "unknown"
 
@@ -88,16 +91,16 @@ def media_type(m):
     return (
         "photo" if m.photo else
         "video" if m.video else
-        "document" if m.document else
-        "audio" if m.audio else
+        "video_note" if getattr(m, "video_note", None) else
         "voice" if m.voice else
+        "audio" if m.audio else
         "animation" if m.animation else
+        "document" if m.document else
         "other"
     )
 
 
-def build_filename(msg, sender_display="unknown"):
-    # filename 用原始 sender_display，唔用 markdown/code format
+def build_filename_from_message(msg, sender_display="unknown"):
     safe_sender = sanitize_filename_part(sender_display)
     ext = ""
 
@@ -109,9 +112,19 @@ def build_filename(msg, sender_display="unknown"):
     return f"{msg.id}_{safe_sender}{ext}"
 
 
-async def throttle():
-    if DELAY_SECONDS > 0:
-        await asyncio.sleep(DELAY_SECONDS)
+def build_filename_from_snapshot(msg_id: Any, sender_display="unknown", original_name: Optional[str] = None, mime_type: Optional[str] = None):
+    safe_sender = sanitize_filename_part(sender_display)
+    ext = ""
+    if original_name:
+        ext = Path(original_name).suffix
+    elif mime_type:
+        ext = mimetypes.guess_extension(mime_type) or ""
+    return f"{msg_id}_{safe_sender}{ext}"
+
+
+async def throttle(seconds: int):
+    if seconds > 0:
+        await asyncio.sleep(seconds)
 
 
 async def run_api(coro, op: str, extra: Optional[dict] = None):
@@ -192,42 +205,26 @@ def find_matching_routes(chat_id: Any) -> List[Dict[str, Any]]:
     return [route for route in ROUTES if chat_id in route["sources"]]
 
 
-async def resolve_sender_info(event: events.NewMessage.Event) -> dict:
-    msg = event.message
+async def resolve_sender_info_from_message(event_message, chat_id_hint=None) -> dict:
+    msg = event_message
 
-    chat = event.chat
-    if chat is None:
+    chat = None
+    sender = None
+
+    if hasattr(msg, "get_chat"):
         try:
-            chat = await event.get_chat()
-        except Exception as e:
-            log({
-                "ts": tstamp(),
-                "type": "warn",
-                "op": "get_chat",
-                "err": e.__class__.__name__,
-                "msg": str(e),
-                "chat_id": event.chat_id,
-                "msg_id": msg.id,
-            })
+            chat = await msg.get_chat()
+        except Exception:
             chat = None
 
-    sender = msg.sender
-    if sender is None:
+    if hasattr(msg, "get_sender"):
         try:
-            sender = await event.get_sender()
-        except Exception as e:
-            log({
-                "ts": tstamp(),
-                "type": "warn",
-                "op": "get_sender",
-                "err": e.__class__.__name__,
-                "msg": str(e),
-                "chat_id": event.chat_id,
-                "msg_id": msg.id,
-            })
+            sender = await msg.get_sender()
+        except Exception:
             sender = None
 
-    chat_title = getattr(chat, "title", None) or str(event.chat_id)
+    chat_id = chat_id_hint if chat_id_hint is not None else getattr(msg, "chat_id", None)
+    chat_title = getattr(chat, "title", None) or str(chat_id)
     chat_username = getattr(chat, "username", None)
 
     if isinstance(chat, types.Channel):
@@ -241,7 +238,7 @@ async def resolve_sender_info(event: events.NewMessage.Event) -> dict:
 
     info = {
         "chat_obj": chat,
-        "chat_id": event.chat_id,
+        "chat_id": chat_id,
         "chat_title": chat_title,
         "chat_username": chat_username,
         "chat_type": chat_type,
@@ -315,7 +312,6 @@ def md_code(value: Any) -> str:
 
 def escape_md_link_text(text: Any) -> str:
     s = str(text)
-    # md parse mode 下，link text 主要 escape 這些較穩
     for ch in ["\\", "[", "]", "(", ")"]:
         s = s.replace(ch, f"\\{ch}")
     return s
@@ -358,7 +354,6 @@ def format_copyable_identity_lines(info: dict) -> str:
     if sender_display:
         lines.append(md_code(sender_display))
 
-    # 如果 sender_display 已經等於 @username，就唔重複再出 username
     if sender_username and normalized_display != normalized_username_display:
         lines.append(md_code(sender_username))
 
@@ -368,7 +363,7 @@ def format_copyable_identity_lines(info: dict) -> str:
     return "\n".join(lines)
 
 
-def build_header_from_info(info: dict) -> str:
+def build_header_from_info(info: dict, is_edit=False) -> str:
     chat_title = safe_str(info.get("chat_title"))
     url = build_chat_message_url(info)
 
@@ -378,6 +373,11 @@ def build_header_from_info(info: dict) -> str:
         group_line = f"[{escape_md_link_text(chat_title)}]"
 
     identity_lines = format_copyable_identity_lines(info)
+
+    if is_edit:
+        if identity_lines:
+            return f"{group_line}\n`[EDITED]`\n{identity_lines}"
+        return f"{group_line}\n`[EDITED]`"
 
     if identity_lines:
         return f"{group_line}\n{identity_lines}"
@@ -397,7 +397,103 @@ def should_ignore(info: dict) -> bool:
     return False
 
 
-async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, info: dict):
+async def snapshot_media_message(msg, info: dict, source_kind: str) -> Optional[dict]:
+    """
+    收到 media 即刻落地快照，避免之後被 edit/replace。
+    """
+    sender_display = info.get("sender_display", "unknown")
+    file_name = build_filename_from_message(msg, sender_display)
+
+    chat_id = info.get("chat_id")
+    msg_id = info.get("msg_id")
+    unique = uuid.uuid4().hex[:8]
+
+    spool_dir = SPOOL_DIR / source_kind / str(chat_id)
+    spool_dir.mkdir(parents=True, exist_ok=True)
+
+    save_path = spool_dir / f"{msg_id}_{unique}_{file_name}"
+
+    extra = {
+        "chat_id": chat_id,
+        "chat_title": info.get("chat_title"),
+        "msg_id": msg_id,
+        "source_kind": source_kind,
+        "save_path": str(save_path),
+        "media_type": media_type(msg),
+    }
+
+    fpath = await run_api(msg.download_media(save_path), op="snapshot_download_media", extra=extra)
+    if not fpath:
+        log({
+            "ts": tstamp(),
+            "type": "err",
+            "op": "snapshot_download_media",
+            "msg": "download returned empty path",
+            **extra,
+        })
+        return None
+
+    fpath = Path(fpath)
+
+    snapshot = {
+        "path": str(fpath),
+        "original_name": getattr(getattr(msg, "file", None), "name", None),
+        "mime_type": getattr(getattr(msg, "file", None), "mime_type", None),
+        "media_type": media_type(msg),
+        "caption_text": (msg.text or msg.message or "").strip(),
+    }
+
+    log({
+        "ts": tstamp(),
+        "type": "snapshot",
+        "source_kind": source_kind,
+        "chat_id": chat_id,
+        "chat_title": info.get("chat_title"),
+        "msg_id": msg_id,
+        "sender_id": info.get("sender_id"),
+        "sender_username": info.get("sender_username"),
+        "sender_display": info.get("sender_display"),
+        "media_type": snapshot["media_type"],
+        "file": str(fpath),
+    })
+
+    return snapshot
+
+
+async def enqueue_text_payload(msg, info: dict, routes: List[Dict[str, Any]], source_kind: str):
+    payload = {
+        "queue_type": "text",
+        "source_kind": source_kind,   # new / edited
+        "routes": [r["name"] for r in routes],
+        "info": info,
+        "text": msg.text or msg.message or "[empty]",
+    }
+    await event_queue.put(payload)
+
+
+async def enqueue_media_payload(msg, info: dict, routes: List[Dict[str, Any]], source_kind: str):
+    snapshot = await snapshot_media_message(msg, info, source_kind)
+    if not snapshot:
+        return
+
+    payload = {
+        "queue_type": "media",
+        "source_kind": source_kind,   # new / edited
+        "routes": [r["name"] for r in routes],
+        "info": info,
+        "snapshot": snapshot,
+    }
+    await event_queue.put(payload)
+
+
+def route_name_map() -> Dict[str, Dict[str, Any]]:
+    return {r["name"]: r for r in ROUTES}
+
+
+ROUTE_MAP = route_name_map()
+
+
+async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, info: dict, source_kind: str):
     extra = {
         "route": route["name"],
         "dst": tgt,
@@ -407,9 +503,10 @@ async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, in
         "sender_id": info["sender_id"],
         "sender_username": info["sender_username"],
         "sender_display": info["sender_display"],
+        "source_kind": source_kind,
     }
     try:
-        await throttle()
+        await throttle(DELAY_SECONDS)
         await run_api(client.send_message(tgt, combined), op="send_text", extra=extra)
         log({
             "ts": tstamp(),
@@ -422,70 +519,7 @@ async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, in
         pass
 
 
-async def send_header_and_forward(route: Dict[str, Any], tgt: Any, hdr: str, msg, info: dict) -> bool:
-    extra = {
-        "route": route["name"],
-        "dst": tgt,
-        "src_msg": info["msg_id"],
-        "chat_id": info["chat_id"],
-        "chat_title": info["chat_title"],
-        "sender_id": info["sender_id"],
-        "sender_username": info["sender_username"],
-        "sender_display": info["sender_display"],
-    }
-    try:
-        await throttle()
-        await run_api(client.send_message(tgt, hdr), op="send_header_before_forward", extra=extra)
-        await run_api(client.forward_messages(tgt, msg, msg.peer_id), op="forward", extra=extra)
-        log({
-            "ts": tstamp(),
-            "type": "out",
-            "op": "forward",
-            "status": "ok",
-            **extra,
-        })
-        return True
-    except errors.ChatForwardsRestrictedError:
-        log({
-            "ts": tstamp(),
-            "type": "warn",
-            "op": "forward",
-            "note": "chat_forwards_restricted",
-            **extra,
-        })
-        return False
-    except Exception:
-        return False
-
-
-async def send_header_and_copy(route: Dict[str, Any], tgt: Any, hdr: str, msg, info: dict) -> bool:
-    extra = {
-        "route": route["name"],
-        "dst": tgt,
-        "src_msg": info["msg_id"],
-        "chat_id": info["chat_id"],
-        "chat_title": info["chat_title"],
-        "sender_id": info["sender_id"],
-        "sender_username": info["sender_username"],
-        "sender_display": info["sender_display"],
-    }
-    try:
-        await throttle()
-        await run_api(client.send_message(tgt, hdr), op="send_header_before_copy", extra=extra)
-        await run_api(client.copy_messages(tgt, msg.peer_id, [msg.id]), op="copy", extra=extra)
-        log({
-            "ts": tstamp(),
-            "type": "out",
-            "op": "copy",
-            "status": "ok",
-            **extra,
-        })
-        return True
-    except Exception:
-        return False
-
-
-async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, caption: str, info: dict):
+async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, caption: str, info: dict, source_kind: str):
     extra = {
         "route": route["name"],
         "dst": tgt,
@@ -496,9 +530,10 @@ async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, capt
         "sender_username": info["sender_username"],
         "sender_display": info["sender_display"],
         "file": str(fpath),
+        "source_kind": source_kind,
     }
     try:
-        await throttle()
+        await throttle(MEDIA_DELAY_SECONDS)
         await run_api(client.send_file(tgt, fpath, caption=caption), op="send_file", extra=extra)
         log({
             "ts": tstamp(),
@@ -511,15 +546,15 @@ async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, capt
         pass
 
 
-async def process_route(route: Dict[str, Any], event: events.NewMessage.Event, info: dict):
-    msg = event.message
+async def process_payload(payload: dict):
+    info = payload["info"]
 
     if should_ignore(info):
         log({
             "ts": tstamp(),
             "type": "info",
             "note": "ignored",
-            "route": route["name"],
+            "source_kind": payload["source_kind"],
             "chat_id": info["chat_id"],
             "chat_title": info["chat_title"],
             "chat_username": info["chat_username"],
@@ -530,120 +565,92 @@ async def process_route(route: Dict[str, Any], event: events.NewMessage.Event, i
         })
         return
 
-    hdr = build_header_from_info(info)
+    is_edit = payload["source_kind"] == "edited"
+    hdr = build_header_from_info(info, is_edit=is_edit)
 
-    if msg.media is None:
-        body = msg.text or msg.message or "[empty]"
-        combined = f"{hdr}\n{body}"
-        for tgt in route["targets"]:
-            await send_text_to_target(route, tgt, combined, info)
-        return
-
-    if DOWNLOAD_MODE != "always":
-        forward_success_count = 0
-        for tgt in route["targets"]:
-            ok = await send_header_and_forward(route, tgt, hdr, msg, info)
-            if ok:
-                forward_success_count += 1
-
-        if forward_success_count == len(route["targets"]) and route["targets"]:
-            return
-
-    if DOWNLOAD_MODE != "always":
-        copy_success_count = 0
-        for tgt in route["targets"]:
-            ok = await send_header_and_copy(route, tgt, hdr, msg, info)
-            if ok:
-                copy_success_count += 1
-
-        if copy_success_count == len(route["targets"]) and route["targets"]:
-            return
-
-    if DOWNLOAD_MODE != "never":
-        dl_dir = DOWNLOAD_DIR / route["name"] / str(event.chat_id)
-        dl_dir.mkdir(parents=True, exist_ok=True)
-
-        file_name = build_filename(msg, info.get("sender_display", "unknown"))
-        save_path = dl_dir / file_name
-
-        extra = {
-            "route": route["name"],
-            "chat_id": info["chat_id"],
-            "chat_title": info["chat_title"],
-            "src_msg": info["msg_id"],
-            "save_path": str(save_path),
-        }
-
-        try:
-            fpath = await run_api(msg.download_media(save_path), op="download_media", extra=extra)
-            if not fpath:
-                log({
-                    "ts": tstamp(),
-                    "type": "err",
-                    "op": "download_media",
-                    "msg": "download returned empty path",
-                    **extra,
-                })
-                return
-
-            fpath = Path(fpath)
-            log({
-                "ts": tstamp(),
-                "type": "save",
-                "route": route["name"],
-                "src_msg": info["msg_id"],
-                "chat_id": info["chat_id"],
-                "chat_title": info["chat_title"],
-                "sender_id": info["sender_id"],
-                "sender_username": info["sender_username"],
-                "sender_display": info["sender_display"],
-                "file": str(fpath),
-            })
-
-            caption_body = (msg.text or msg.message or "").strip()
-            caption = f"{hdr}\n{caption_body}".strip()
-
-            for tgt in route["targets"]:
-                await send_file_to_target(route, tgt, fpath, caption, info)
-
-        finally:
-            if DELETE_AFTER_SEND:
-                try:
-                    if save_path.exists():
-                        save_path.unlink(missing_ok=True)
-                        log({
-                            "ts": tstamp(),
-                            "type": "cleanup",
-                            "op": "delete_temp_file",
-                            "route": route["name"],
-                            "file": str(save_path),
-                            "src_msg": info["msg_id"],
-                        })
-                except Exception as e:
-                    log({
-                        "ts": tstamp(),
-                        "type": "warn",
-                        "op": "delete_temp_file",
-                        "route": route["name"],
-                        "file": str(save_path),
-                        "src_msg": info["msg_id"],
-                        "err": e.__class__.__name__,
-                        "msg": str(e),
-                    })
-
-
-async def process_event(event: events.NewMessage.Event):
-    msg = event.message
-    routes = find_matching_routes(event.chat_id)
-
+    routes = [ROUTE_MAP[name] for name in payload["routes"] if name in ROUTE_MAP]
     if not routes:
         return
 
-    info = await resolve_sender_info(event)
+    if payload["queue_type"] == "text":
+        body = payload["text"]
+        combined = f"{hdr}\n{body}"
+        for route in routes:
+            for tgt in route["targets"]:
+                await send_text_to_target(route, tgt, combined, info, payload["source_kind"])
+        return
+
+    if payload["queue_type"] == "media":
+        snapshot = payload["snapshot"]
+        fpath = Path(snapshot["path"])
+        caption_body = snapshot.get("caption_text", "").strip()
+        caption = f"{hdr}\n{caption_body}".strip()
+
+        for route in routes:
+            for tgt in route["targets"]:
+                await send_file_to_target(route, tgt, fpath, caption, info, payload["source_kind"])
+
+        if DELETE_AFTER_SEND:
+            try:
+                if fpath.exists():
+                    fpath.unlink(missing_ok=True)
+                    log({
+                        "ts": tstamp(),
+                        "type": "cleanup",
+                        "op": "delete_temp_file",
+                        "file": str(fpath),
+                        "src_msg": info["msg_id"],
+                        "source_kind": payload["source_kind"],
+                    })
+            except Exception as e:
+                log({
+                    "ts": tstamp(),
+                    "type": "warn",
+                    "op": "delete_temp_file",
+                    "file": str(fpath),
+                    "src_msg": info["msg_id"],
+                    "source_kind": payload["source_kind"],
+                    "err": e.__class__.__name__,
+                    "msg": str(e),
+                })
+        return
+
+
+async def worker(worker_id: int):
+    log({
+        "ts": tstamp(),
+        "type": "info",
+        "note": "worker_started",
+        "worker_id": worker_id,
+    })
+
+    while True:
+        payload = await event_queue.get()
+        try:
+            await process_payload(payload)
+        except Exception as e:
+            log({
+                "ts": tstamp(),
+                "type": "err",
+                "op": "worker_process_payload",
+                "worker_id": worker_id,
+                "err": e.__class__.__name__,
+                "msg": str(e),
+            })
+        finally:
+            event_queue.task_done()
+
+
+async def handle_incoming_message(msg, source_kind: str):
+    routes = find_matching_routes(msg.chat_id)
+    if not routes:
+        return
+
+    info = await resolve_sender_info_from_message(msg, chat_id_hint=msg.chat_id)
 
     log({
         "ts": tstamp(),
-        "type": "in",
+        "type": "in" if source_kind == "new" else "edit",
         "matched_routes": [r["name"] for r in routes],
 
         "chat_id": info["chat_id"],
@@ -652,7 +659,7 @@ async def process_event(event: events.NewMessage.Event):
         "chat_type": info["chat_type"],
         "raw_chat_class": info["raw_chat_class"],
 
-        "msg": msg.id,
+        "msg": info["msg_id"],
         "media": media_type(msg),
         "preview": (msg.text or msg.message or "")[:160],
 
@@ -672,63 +679,39 @@ async def process_event(event: events.NewMessage.Event):
         "reply_to_msg_id": info["reply_to_msg_id"],
     })
 
-    for route in routes:
-        try:
-            await process_route(route, event, info)
-        except Exception as e:
-            log({
-                "ts": tstamp(),
-                "type": "err",
-                "op": "process_route",
-                "route": route["name"],
-                "chat_id": info["chat_id"],
-                "chat_title": info["chat_title"],
-                "src_msg": info["msg_id"],
-                "err": e.__class__.__name__,
-                "msg": str(e),
-            })
-
-
-async def worker(worker_id: int):
-    log({
-        "ts": tstamp(),
-        "type": "info",
-        "note": "worker_started",
-        "worker_id": worker_id,
-    })
-
-    while True:
-        event = await event_queue.get()
-        try:
-            await process_event(event)
-        except Exception as e:
-            log({
-                "ts": tstamp(),
-                "type": "err",
-                "op": "worker_process_event",
-                "worker_id": worker_id,
-                "err": e.__class__.__name__,
-                "msg": str(e),
-            })
-        finally:
-            event_queue.task_done()
+    if msg.media is None:
+        await enqueue_text_payload(msg, info, routes, source_kind)
+    else:
+        await enqueue_media_payload(msg, info, routes, source_kind)
 
 
 @client.on(events.NewMessage(incoming=True))
-async def handle(event: events.NewMessage.Event):
-    routes = find_matching_routes(event.chat_id)
-    if not routes:
-        return
-
+async def on_new_message(event: events.NewMessage.Event):
     try:
-        await event_queue.put(event)
+        await handle_incoming_message(event.message, source_kind="new")
     except Exception as e:
         log({
             "ts": tstamp(),
             "type": "err",
-            "op": "queue_put",
-            "chat_id": event.chat_id,
-            "msg_id": event.message.id,
+            "op": "on_new_message",
+            "chat_id": getattr(event, "chat_id", None),
+            "msg_id": getattr(event.message, "id", None),
+            "err": e.__class__.__name__,
+            "msg": str(e),
+        })
+
+
+@client.on(events.MessageEdited(incoming=True))
+async def on_message_edited(event: events.MessageEdited.Event):
+    try:
+        await handle_incoming_message(event.message, source_kind="edited")
+    except Exception as e:
+        log({
+            "ts": tstamp(),
+            "type": "err",
+            "op": "on_message_edited",
+            "chat_id": getattr(event, "chat_id", None),
+            "msg_id": getattr(event.message, "id", None),
             "err": e.__class__.__name__,
             "msg": str(e),
         })
@@ -745,8 +728,8 @@ def print_route_summary():
     print(json.dumps({
         "startup": "ok",
         "worker_concurrency": WORKER_CONCURRENCY,
-        "download_mode": DOWNLOAD_MODE,
-        "delay_seconds": DELAY_SECONDS,
+        "text_delay_seconds": DELAY_SECONDS,
+        "media_delay_seconds": MEDIA_DELAY_SECONDS,
         "delete_after_send": DELETE_AFTER_SEND,
         "ignore_users": sorted(list(IGNORE_USERS)),
         "ignore_ids": sorted(list(IGNORE_IDS)),
@@ -757,6 +740,7 @@ def print_route_summary():
 async def main():
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    SPOOL_DIR.mkdir(parents=True, exist_ok=True)
 
     print_route_summary()
     print("✔ Telegram forwarder running — Ctrl+C to stop…")
