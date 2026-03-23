@@ -4,26 +4,11 @@ from pathlib import Path
 from datetime import datetime
 import mimetypes
 import json
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, errors, types
 
-
-# telegram_forwarder.py
-# ------------------------------------------------------------
-# 功能：
-# - 監聽 SOURCE_CHATS 訊息
-# - 將文字 / 媒體轉發去 TARGET_CHATS
-# - 每日 log rotation
-# - sender resolve 做穩定化處理：
-#   1) 優先 get_sender/get_chat
-#   2) user -> username/full name/id
-#   3) chat/channel sender -> username/title/id
-#   4) post_author / sender_id fallback
-# ------------------------------------------------------------
-
-
-# ── env & init ───────────────────────────────────────────────
 
 load_dotenv()
 
@@ -31,48 +16,30 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_NAME = os.getenv("SESSION_NAME", "my_account")
 
-
-def _parse_id_list(env_name):
-    return [
-        int(x) if x.lstrip("-").isdigit() else x
-        for x in (y.strip() for y in os.getenv(env_name, "").split(","))
-        if x
-    ]
-
-
-def _parse_int_set(env_name):
-    return {
-        int(x.strip())
-        for x in os.getenv(env_name, "").split(",")
-        if x.strip() and x.strip().lstrip("-").isdigit()
-    }
-
-
-TARGET_CHATS = _parse_id_list("TARGET_CHAT")
-SOURCE_CHATS = set(_parse_id_list("SOURCE_CHATS"))
+DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads")).expanduser()
+LOG_DIR = DOWNLOAD_DIR / "log"
 
 DOWNLOAD_MODE = os.getenv("DOWNLOAD_MODE", "auto").lower()   # auto / always / never
 DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "5"))
-DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads")).expanduser()
+WORKER_CONCURRENCY = max(1, int(os.getenv("WORKER_CONCURRENCY", "1")))
+QUEUE_MAXSIZE = max(0, int(os.getenv("QUEUE_MAXSIZE", "1000")))
+DELETE_AFTER_SEND = os.getenv("DELETE_AFTER_SEND", "false").strip().lower() in {"1", "true", "yes", "y"}
 
 IGNORE_USERS = {
-    u.strip().lower()
+    u.strip().lower().lstrip("@")
     for u in os.getenv("IGNORE_USERS", "").split(",")
     if u.strip()
 }
-IGNORE_IDS = _parse_int_set("IGNORE_IDS")
+IGNORE_IDS = {
+    int(x.strip())
+    for x in os.getenv("IGNORE_IDS", "").split(",")
+    if x.strip() and x.strip().lstrip("-").isdigit()
+}
 
-LOG_DIR = DOWNLOAD_DIR / "log"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-
-
-# ── helper funcs ─────────────────────────────────────────────
-
-async def throttle():
-    if DELAY_SECONDS > 0:
-        await asyncio.sleep(DELAY_SECONDS)
+event_queue: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE if QUEUE_MAXSIZE > 0 else 0)
 
 
 def tstamp() -> str:
@@ -90,18 +57,27 @@ def log(obj: dict):
         print(f"[LOG_ERR] {e}")
 
 
-async def run_api(coro):
-    try:
-        return await coro
-    except errors.FloodWaitError as e:
-        log({
-            "ts": tstamp(),
-            "type": "warn",
-            "op": "flood_wait",
-            "seconds": e.seconds,
-        })
-        await asyncio.sleep(e.seconds + 1)
-        return await coro
+def safe_str(value) -> str:
+    return "null" if value is None or value == "" else str(value)
+
+
+def sanitize_filename_part(value: str) -> str:
+    if not value:
+        return "unknown"
+    cleaned = "".join(c for c in value if c.isalnum() or c in ("@", "_", "-", ".", " ", "(", ")"))
+    cleaned = cleaned.strip().replace(" ", "_")
+    return cleaned[:100] or "unknown"
+
+
+def parse_int_or_str(value: Any):
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        v = value.strip()
+        if v.lstrip("-").isdigit():
+            return int(v)
+        return v
+    return value
 
 
 def media_type(m):
@@ -118,14 +94,6 @@ def media_type(m):
     )
 
 
-def sanitize_filename_part(value: str) -> str:
-    if not value:
-        return "unknown"
-    cleaned = "".join(c for c in value if c.isalnum() or c in ("@", "_", "-", ".", " "))
-    cleaned = cleaned.strip().replace(" ", "_")
-    return cleaned[:80] or "unknown"
-
-
 def build_filename(msg, sender_display="unknown"):
     safe_sender = sanitize_filename_part(sender_display)
     ext = ""
@@ -138,14 +106,94 @@ def build_filename(msg, sender_display="unknown"):
     return f"{msg.id}_{safe_sender}{ext}"
 
 
+async def throttle():
+    if DELAY_SECONDS > 0:
+        await asyncio.sleep(DELAY_SECONDS)
+
+
+async def run_api(coro, op: str, extra: Optional[dict] = None):
+    extra = extra or {}
+    try:
+        return await coro
+    except errors.FloodWaitError as e:
+        log({
+            "ts": tstamp(),
+            "type": "warn",
+            "op": op,
+            "err": "FloodWaitError",
+            "seconds": e.seconds,
+            **extra,
+        })
+        await asyncio.sleep(e.seconds + 1)
+        return await coro
+    except errors.RPCError as e:
+        log({
+            "ts": tstamp(),
+            "type": "err",
+            "op": op,
+            "err": e.__class__.__name__,
+            "msg": getattr(e, "message", str(e)),
+            **extra,
+        })
+        raise
+    except Exception as e:
+        log({
+            "ts": tstamp(),
+            "type": "err",
+            "op": op,
+            "err": e.__class__.__name__,
+            "msg": str(e),
+            **extra,
+        })
+        raise
+
+
+def load_routes() -> List[Dict[str, Any]]:
+    routes_json = os.getenv("ROUTES_JSON", "").strip()
+    if not routes_json:
+        raise RuntimeError("ROUTES_JSON is required")
+
+    try:
+        raw_routes = json.loads(routes_json)
+        if not isinstance(raw_routes, list):
+            raise ValueError("ROUTES_JSON must be a JSON array")
+    except Exception as e:
+        raise RuntimeError(f"Invalid ROUTES_JSON: {e}") from e
+
+    routes: List[Dict[str, Any]] = []
+    for idx, raw in enumerate(raw_routes, start=1):
+        if not isinstance(raw, dict):
+            raise RuntimeError(f"Route #{idx} must be an object")
+
+        sources = [parse_int_or_str(x) for x in raw.get("sources", [])]
+        targets = [parse_int_or_str(x) for x in raw.get("targets", [])]
+
+        if not sources:
+            raise RuntimeError(f"Route #{idx} has no sources")
+        if not targets:
+            raise RuntimeError(f"Route #{idx} has no targets")
+
+        routes.append({
+            "name": raw.get("name", f"route_{idx}"),
+            "sources": set(sources),
+            "targets": targets,
+        })
+
+    return routes
+
+
+ROUTES = load_routes()
+
+
+def find_matching_routes(chat_id: Any) -> List[Dict[str, Any]]:
+    matched = []
+    for route in ROUTES:
+        if chat_id in route["sources"]:
+            matched.append(route)
+    return matched
+
+
 async def resolve_sender_info(event: events.NewMessage.Event) -> dict:
-    """
-    盡量穩定地 resolve sender/chat。
-    注意：
-    - sender 未必係 User，可能係 Chat/Channel
-    - sender 有機會冇 username
-    - 某些情況只得 sender_id / post_author
-    """
     msg = event.message
 
     chat = event.chat
@@ -159,6 +207,8 @@ async def resolve_sender_info(event: events.NewMessage.Event) -> dict:
                 "op": "get_chat",
                 "err": e.__class__.__name__,
                 "msg": str(e),
+                "chat_id": event.chat_id,
+                "msg_id": msg.id,
             })
             chat = None
 
@@ -173,31 +223,54 @@ async def resolve_sender_info(event: events.NewMessage.Event) -> dict:
                 "op": "get_sender",
                 "err": e.__class__.__name__,
                 "msg": str(e),
+                "chat_id": event.chat_id,
+                "msg_id": msg.id,
             })
             sender = None
 
     chat_title = getattr(chat, "title", None) or str(event.chat_id)
+    chat_username = getattr(chat, "username", None)
+
+    if isinstance(chat, types.Channel):
+        chat_type = "channel" if getattr(chat, "broadcast", False) else "supergroup"
+    elif isinstance(chat, types.Chat):
+        chat_type = "group"
+    elif isinstance(chat, types.User):
+        chat_type = "private"
+    else:
+        chat_type = "unknown"
 
     info = {
         "chat_obj": chat,
         "chat_id": event.chat_id,
         "chat_title": chat_title,
+        "chat_username": chat_username,
+        "chat_type": chat_type,
+        "raw_chat_class": chat.__class__.__name__ if chat is not None else None,
 
         "sender_obj": sender,
         "sender_id": getattr(sender, "id", None) or getattr(msg, "sender_id", None),
         "sender_type": "unknown",
-
         "sender_username": None,
         "sender_display": "user",
+        "sender_first_name": None,
+        "sender_last_name": None,
 
         "post_author": getattr(msg, "post_author", None),
         "raw_sender_class": sender.__class__.__name__ if sender is not None else None,
+
+        "msg_id": msg.id,
+        "msg_date": getattr(msg, "date", None),
+        "edit_date": getattr(msg, "edit_date", None),
+        "grouped_id": getattr(msg, "grouped_id", None),
+        "reply_to_msg_id": getattr(getattr(msg, "reply_to", None), "reply_to_msg_id", None),
     }
 
-    # Case 1: 普通 user
     if isinstance(sender, types.User):
         info["sender_type"] = "user"
         info["sender_username"] = sender.username
+        info["sender_first_name"] = sender.first_name
+        info["sender_last_name"] = sender.last_name
 
         if sender.username:
             info["sender_display"] = f"@{sender.username}"
@@ -206,53 +279,53 @@ async def resolve_sender_info(event: events.NewMessage.Event) -> dict:
                 x for x in [sender.first_name, sender.last_name] if x
             ).strip()
             info["sender_display"] = full_name or f"user:{sender.id}"
-
         return info
 
-    # Case 2: sender 其實係 chat / channel
     if isinstance(sender, (types.Chat, types.Channel)):
         info["sender_type"] = "chat"
+        chat_sender_username = getattr(sender, "username", None)
+        chat_sender_title = getattr(sender, "title", None)
+        info["sender_username"] = chat_sender_username
 
-        chat_username = getattr(sender, "username", None)
-        title = getattr(sender, "title", None)
-
-        info["sender_username"] = chat_username
-
-        if chat_username:
-            info["sender_display"] = f"@{chat_username}"
+        if chat_sender_username:
+            info["sender_display"] = f"@{chat_sender_username}"
         else:
-            info["sender_display"] = f"[{title or sender.id}]"
-
+            info["sender_display"] = f"[{chat_sender_title or sender.id}]"
         return info
 
-    # Case 3: post_author（常見於 channel post/comment 某些情況）
     if info["post_author"]:
         info["sender_type"] = "post_author"
         info["sender_display"] = str(info["post_author"])
         return info
 
-    # Case 4: 只有 sender_id
     if getattr(msg, "sender_id", None):
         info["sender_type"] = "sender_id_only"
         info["sender_display"] = f"id:{msg.sender_id}"
         return info
 
-    # Case 5: 連 sender_id 都冇
     info["sender_type"] = "anonymous_or_unknown"
     info["sender_display"] = "anonymous"
     return info
 
 
-async def build_header(event: events.NewMessage.Event) -> str:
-    info = await resolve_sender_info(event)
-    return f"[{info['chat_title']}] {info['sender_display']}"
+def format_sender_line(info: dict) -> str:
+    return (
+        f"{safe_str(info.get('sender_display'))}"
+        f"({safe_str(info.get('sender_id'))}-"
+        f"{safe_str(info.get('sender_username'))}-"
+        f"{safe_str(info.get('sender_type'))})"
+    )
+
+
+def build_header_from_info(info: dict) -> str:
+    return f"[{safe_str(info.get('chat_title'))}]\n{format_sender_line(info)}"
 
 
 def should_ignore(info: dict) -> bool:
     sender_username = info.get("sender_username")
     sender_id = info.get("sender_id")
 
-    if sender_username and sender_username.lower() in IGNORE_USERS:
+    if sender_username and sender_username.lower().lstrip("@") in IGNORE_USERS:
         return True
 
     if sender_id is not None and sender_id in IGNORE_IDS:
@@ -261,13 +334,246 @@ def should_ignore(info: dict) -> bool:
     return False
 
 
-# ── main handler ─────────────────────────────────────────────
+async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, info: dict):
+    extra = {
+        "route": route["name"],
+        "dst": tgt,
+        "src_msg": info["msg_id"],
+        "chat_id": info["chat_id"],
+        "chat_title": info["chat_title"],
+        "sender_id": info["sender_id"],
+        "sender_username": info["sender_username"],
+        "sender_display": info["sender_display"],
+    }
+    try:
+        await throttle()
+        await run_api(client.send_message(tgt, combined), op="send_text", extra=extra)
+        log({
+            "ts": tstamp(),
+            "type": "out",
+            "op": "send_text",
+            "status": "ok",
+            **extra,
+        })
+    except Exception:
+        pass
 
-@client.on(events.NewMessage(incoming=True))
-async def handle(event: events.NewMessage.Event):
+
+async def send_header_and_forward(route: Dict[str, Any], tgt: Any, hdr: str, msg, info: dict) -> bool:
+    extra = {
+        "route": route["name"],
+        "dst": tgt,
+        "src_msg": info["msg_id"],
+        "chat_id": info["chat_id"],
+        "chat_title": info["chat_title"],
+        "sender_id": info["sender_id"],
+        "sender_username": info["sender_username"],
+        "sender_display": info["sender_display"],
+    }
+    try:
+        await throttle()
+        await run_api(client.send_message(tgt, hdr), op="send_header_before_forward", extra=extra)
+        await run_api(client.forward_messages(tgt, msg, msg.peer_id), op="forward", extra=extra)
+        log({
+            "ts": tstamp(),
+            "type": "out",
+            "op": "forward",
+            "status": "ok",
+            **extra,
+        })
+        return True
+    except errors.ChatForwardsRestrictedError:
+        log({
+            "ts": tstamp(),
+            "type": "warn",
+            "op": "forward",
+            "note": "chat_forwards_restricted",
+            **extra,
+        })
+        return False
+    except Exception:
+        return False
+
+
+async def send_header_and_copy(route: Dict[str, Any], tgt: Any, hdr: str, msg, info: dict) -> bool:
+    extra = {
+        "route": route["name"],
+        "dst": tgt,
+        "src_msg": info["msg_id"],
+        "chat_id": info["chat_id"],
+        "chat_title": info["chat_title"],
+        "sender_id": info["sender_id"],
+        "sender_username": info["sender_username"],
+        "sender_display": info["sender_display"],
+    }
+    try:
+        await throttle()
+        await run_api(client.send_message(tgt, hdr), op="send_header_before_copy", extra=extra)
+        await run_api(client.copy_messages(tgt, msg.peer_id, [msg.id]), op="copy", extra=extra)
+        log({
+            "ts": tstamp(),
+            "type": "out",
+            "op": "copy",
+            "status": "ok",
+            **extra,
+        })
+        return True
+    except Exception:
+        return False
+
+
+async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, caption: str, info: dict):
+    extra = {
+        "route": route["name"],
+        "dst": tgt,
+        "src_msg": info["msg_id"],
+        "chat_id": info["chat_id"],
+        "chat_title": info["chat_title"],
+        "sender_id": info["sender_id"],
+        "sender_username": info["sender_username"],
+        "sender_display": info["sender_display"],
+        "file": str(fpath),
+    }
+    try:
+        await throttle()
+        await run_api(client.send_file(tgt, fpath, caption=caption), op="send_file", extra=extra)
+        log({
+            "ts": tstamp(),
+            "type": "out",
+            "op": "send_file",
+            "status": "ok",
+            **extra,
+        })
+    except Exception:
+        pass
+
+
+async def process_route(route: Dict[str, Any], event: events.NewMessage.Event, info: dict):
     msg = event.message
 
-    if SOURCE_CHATS and event.chat_id not in SOURCE_CHATS:
+    if should_ignore(info):
+        log({
+            "ts": tstamp(),
+            "type": "info",
+            "note": "ignored",
+            "route": route["name"],
+            "chat_id": info["chat_id"],
+            "chat_title": info["chat_title"],
+            "chat_username": info["chat_username"],
+            "sender_id": info["sender_id"],
+            "sender_username": info["sender_username"],
+            "sender_display": info["sender_display"],
+            "sender_type": info["sender_type"],
+        })
+        return
+
+    hdr = build_header_from_info(info)
+
+    if msg.media is None:
+        body = msg.text or msg.message or "[empty]"
+        combined = f"{hdr}\n{body}"
+        for tgt in route["targets"]:
+            await send_text_to_target(route, tgt, combined, info)
+        return
+
+    if DOWNLOAD_MODE != "always":
+        forward_success_count = 0
+        for tgt in route["targets"]:
+            ok = await send_header_and_forward(route, tgt, hdr, msg, info)
+            if ok:
+                forward_success_count += 1
+
+        if forward_success_count == len(route["targets"]) and route["targets"]:
+            return
+
+    if DOWNLOAD_MODE != "always":
+        copy_success_count = 0
+        for tgt in route["targets"]:
+            ok = await send_header_and_copy(route, tgt, hdr, msg, info)
+            if ok:
+                copy_success_count += 1
+
+        if copy_success_count == len(route["targets"]) and route["targets"]:
+            return
+
+    if DOWNLOAD_MODE != "never":
+        dl_dir = DOWNLOAD_DIR / route["name"] / str(event.chat_id)
+        dl_dir.mkdir(parents=True, exist_ok=True)
+
+        file_name = build_filename(msg, format_sender_line(info))
+        save_path = dl_dir / file_name
+
+        extra = {
+            "route": route["name"],
+            "chat_id": info["chat_id"],
+            "chat_title": info["chat_title"],
+            "src_msg": info["msg_id"],
+            "save_path": str(save_path),
+        }
+
+        try:
+            fpath = await run_api(msg.download_media(save_path), op="download_media", extra=extra)
+            if not fpath:
+                log({
+                    "ts": tstamp(),
+                    "type": "err",
+                    "op": "download_media",
+                    "msg": "download returned empty path",
+                    **extra,
+                })
+                return
+
+            fpath = Path(fpath)
+            log({
+                "ts": tstamp(),
+                "type": "save",
+                "route": route["name"],
+                "src_msg": info["msg_id"],
+                "chat_id": info["chat_id"],
+                "chat_title": info["chat_title"],
+                "sender_id": info["sender_id"],
+                "sender_username": info["sender_username"],
+                "sender_display": info["sender_display"],
+                "file": str(fpath),
+            })
+
+            caption_body = (msg.text or msg.message or "").strip()
+            caption = f"{hdr}\n{caption_body}".strip()
+
+            for tgt in route["targets"]:
+                await send_file_to_target(route, tgt, fpath, caption, info)
+
+        finally:
+            if DELETE_AFTER_SEND:
+                try:
+                    if save_path.exists():
+                        save_path.unlink(missing_ok=True)
+                        log({
+                            "ts": tstamp(),
+                            "type": "cleanup",
+                            "op": "delete_temp_file",
+                            "route": route["name"],
+                            "file": str(save_path),
+                            "src_msg": info["msg_id"],
+                        })
+                except Exception as e:
+                    log({
+                        "ts": tstamp(),
+                        "type": "warn",
+                        "op": "delete_temp_file",
+                        "route": route["name"],
+                        "file": str(save_path),
+                        "src_msg": info["msg_id"],
+                        "err": e.__class__.__name__,
+                        "msg": str(e),
+                    })
+
+
+async def process_event(event: events.NewMessage.Event):
+    msg = event.message
+    routes = find_matching_routes(event.chat_id)
+
+    if not routes:
         return
 
     info = await resolve_sender_info(event)
@@ -275,147 +581,132 @@ async def handle(event: events.NewMessage.Event):
     log({
         "ts": tstamp(),
         "type": "in",
-        "chat": event.chat_id,
+        "matched_routes": [r["name"] for r in routes],
+
+        "chat_id": info["chat_id"],
+        "chat_title": info["chat_title"],
+        "chat_username": info["chat_username"],
+        "chat_type": info["chat_type"],
+        "raw_chat_class": info["raw_chat_class"],
+
         "msg": msg.id,
         "media": media_type(msg),
-        "preview": (msg.text or msg.message or "")[:120],
+        "preview": (msg.text or msg.message or "")[:160],
+
         "sender_type": info["sender_type"],
         "sender_id": info["sender_id"],
         "sender_username": info["sender_username"],
         "sender_display": info["sender_display"],
+        "sender_first_name": info["sender_first_name"],
+        "sender_last_name": info["sender_last_name"],
+
         "post_author": info["post_author"],
         "raw_sender_class": info["raw_sender_class"],
+
+        "msg_date": info["msg_date"],
+        "edit_date": info["edit_date"],
+        "grouped_id": info["grouped_id"],
+        "reply_to_msg_id": info["reply_to_msg_id"],
     })
 
-    if should_ignore(info):
-        log({
-            "ts": tstamp(),
-            "type": "info",
-            "note": "ignored",
-            "sender_id": info["sender_id"],
-            "sender_username": info["sender_username"],
-            "sender_display": info["sender_display"],
-        })
-        return
-
-    hdr = f"[{info['chat_title']}] {info['sender_display']}"
-
-    # ── TEXT ONLY ───────────────────────────────────────────
-    if msg.media is None:
-        combined = f"{hdr}\n{msg.text or msg.message or '[empty]'}"
-        for tgt in TARGET_CHATS:
-            await throttle()
-            await run_api(client.send_message(tgt, combined))
-            log({
-                "ts": tstamp(),
-                "type": "out",
-                "op": "send_text",
-                "dst": tgt,
-                "src_msg": msg.id,
-            })
-        return
-
-    # ── MEDIA: forward first ────────────────────────────────
-    if DOWNLOAD_MODE != "always":
+    for route in routes:
         try:
-            for tgt in TARGET_CHATS:
-                await throttle()
-                await run_api(client.send_message(tgt, hdr))
-                await run_api(client.forward_messages(tgt, msg, msg.peer_id))
-                log({
-                    "ts": tstamp(),
-                    "type": "out",
-                    "op": "forward",
-                    "dst": tgt,
-                    "src_msg": msg.id,
-                })
-            return
-
-        except errors.ChatForwardsRestrictedError:
-            log({
-                "ts": tstamp(),
-                "type": "warn",
-                "op": "forward",
-                "note": "chat_forwards_restricted",
-                "src_msg": msg.id,
-            })
-
-        except errors.RPCError as e:
+            await process_route(route, event, info)
+        except Exception as e:
             log({
                 "ts": tstamp(),
                 "type": "err",
-                "op": "forward",
+                "op": "process_route",
+                "route": route["name"],
+                "chat_id": info["chat_id"],
+                "chat_title": info["chat_title"],
+                "src_msg": info["msg_id"],
                 "err": e.__class__.__name__,
-                "msg": getattr(e, "message", str(e)),
-                "src_msg": msg.id,
+                "msg": str(e),
             })
 
-    # ── MEDIA: try copy_messages if available ───────────────
-    if DOWNLOAD_MODE != "always" and hasattr(client, "copy_messages"):
-        try:
-            for tgt in TARGET_CHATS:
-                await throttle()
-                await run_api(client.send_message(tgt, hdr))
-                await run_api(client.copy_messages(tgt, msg.peer_id, [msg.id]))
-                log({
-                    "ts": tstamp(),
-                    "type": "out",
-                    "op": "copy",
-                    "dst": tgt,
-                    "src_msg": msg.id,
-                })
-            return
 
-        except errors.RPCError as e:
+async def worker(worker_id: int):
+    log({
+        "ts": tstamp(),
+        "type": "info",
+        "note": "worker_started",
+        "worker_id": worker_id,
+    })
+
+    while True:
+        event = await event_queue.get()
+        try:
+            await process_event(event)
+        except Exception as e:
             log({
                 "ts": tstamp(),
                 "type": "err",
-                "op": "copy",
+                "op": "worker_process_event",
+                "worker_id": worker_id,
                 "err": e.__class__.__name__,
-                "msg": getattr(e, "message", str(e)),
-                "src_msg": msg.id,
+                "msg": str(e),
             })
+        finally:
+            event_queue.task_done()
 
-    # ── MEDIA: fallback download + send_file ────────────────
-    if DOWNLOAD_MODE != "never":
-        dl_dir = DOWNLOAD_DIR / str(event.chat_id)
-        dl_dir.mkdir(parents=True, exist_ok=True)
 
-        file_name = build_filename(msg, info["sender_display"])
-        save_path = dl_dir / file_name
+@client.on(events.NewMessage(incoming=True))
+async def handle(event: events.NewMessage.Event):
+    routes = find_matching_routes(event.chat_id)
+    if not routes:
+        return
 
-        fpath = await msg.download_media(save_path)
-
+    try:
+        await event_queue.put(event)
+    except Exception as e:
         log({
             "ts": tstamp(),
-            "type": "save",
-            "file": str(fpath),
-            "src_msg": msg.id,
+            "type": "err",
+            "op": "queue_put",
+            "chat_id": event.chat_id,
+            "msg_id": event.message.id,
+            "err": e.__class__.__name__,
+            "msg": str(e),
         })
 
-        caption = f"{hdr}\n{msg.text or msg.message or ''}".strip()
 
-        for tgt in TARGET_CHATS:
-            await throttle()
-            await run_api(client.send_file(tgt, fpath, caption=caption))
-            log({
-                "ts": tstamp(),
-                "type": "out",
-                "op": "send_file",
-                "dst": tgt,
-                "src_msg": msg.id,
-                "file": str(fpath),
-            })
+def print_route_summary():
+    summary = []
+    for route in ROUTES:
+        summary.append({
+            "name": route["name"],
+            "sources": list(route["sources"]),
+            "targets": route["targets"],
+        })
+    print(json.dumps({
+        "startup": "ok",
+        "worker_concurrency": WORKER_CONCURRENCY,
+        "download_mode": DOWNLOAD_MODE,
+        "delay_seconds": DELAY_SECONDS,
+        "delete_after_send": DELETE_AFTER_SEND,
+        "ignore_users": sorted(list(IGNORE_USERS)),
+        "ignore_ids": sorted(list(IGNORE_IDS)),
+        "routes": summary,
+    }, ensure_ascii=False, indent=2))
 
-
-# ── run ─────────────────────────────────────────────────────
 
 async def main():
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    print_route_summary()
     print("✔ Telegram forwarder running — Ctrl+C to stop…")
+
+    workers = [asyncio.create_task(worker(i + 1)) for i in range(WORKER_CONCURRENCY)]
+
     async with client:
-        await client.run_until_disconnected()
+        try:
+            await client.run_until_disconnected()
+        finally:
+            for w in workers:
+                w.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
 
 
 if __name__ == "__main__":
