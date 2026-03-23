@@ -55,6 +55,7 @@ LARGE_MEDIA_FORWARD_THRESHOLD_BYTES = LARGE_MEDIA_FORWARD_THRESHOLD_MB * 1024 * 
 # allowlist -> only FORWARDABLE_SOURCE_CHATS may try large-media forward
 # never     -> never try direct forward for large media
 FORWARD_POLICY = os.getenv("FORWARD_POLICY", "auto").strip().lower()
+LISTEN_EDITED_MESSAGES = os.getenv("LISTEN_EDITED_MESSAGES", "true").strip().lower() in {"1", "true", "yes", "y"}
 
 IGNORE_USERS = {
     u.strip().lower().lstrip("@")
@@ -1444,6 +1445,9 @@ async def on_new_message(event: events.NewMessage.Event):
 
 @client.on(events.MessageEdited(incoming=True))
 async def on_message_edited(event: events.MessageEdited.Event):
+    if not LISTEN_EDITED_MESSAGES:
+        return
+
     try:
         await handle_incoming_message(event.message, source_kind="edited")
     except Exception as e:
@@ -1456,7 +1460,6 @@ async def on_message_edited(event: events.MessageEdited.Event):
             "err": e.__class__.__name__,
             "msg": str(e),
         })
-
 
 # ============================================================
 # Kafka startup/shutdown
@@ -1518,6 +1521,7 @@ def print_route_summary():
         "album_gather_seconds": ALBUM_GATHER_SECONDS,
         "large_media_forward_threshold_mb": LARGE_MEDIA_FORWARD_THRESHOLD_MB,
         "forward_policy": FORWARD_POLICY,
+        "listen_edited_messages": LISTEN_EDITED_MESSAGES,
         "forwardable_source_chats": sorted(list(FORWARDABLE_SOURCE_CHATS)),
         "nonforwardable_source_chats": sorted(list(NONFORWARDABLE_SOURCE_CHATS)),
         "delete_after_send": DELETE_AFTER_SEND,
@@ -1525,7 +1529,6 @@ def print_route_summary():
         "ignore_ids": sorted(list(IGNORE_IDS)),
         "routes": summary,
     }, ensure_ascii=False, indent=2))
-
 
 # ============================================================
 # Main
