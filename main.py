@@ -39,6 +39,8 @@ IGNORE_IDS = {
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+client.parse_mode = "md"
+
 event_queue: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE if QUEUE_MAXSIZE > 0 else 0)
 
 
@@ -95,6 +97,7 @@ def media_type(m):
 
 
 def build_filename(msg, sender_display="unknown"):
+    # 注意：filename 用原始 sender_display，唔用 markdown/code format
     safe_sender = sanitize_filename_part(sender_display)
     ext = ""
 
@@ -174,7 +177,7 @@ def load_routes() -> List[Dict[str, Any]]:
             raise RuntimeError(f"Route #{idx} has no targets")
 
         routes.append({
-            "name": raw.get("name", f"route_{idx}"),
+            "name": str(raw.get("name", f"route_{idx}")),
             "sources": set(sources),
             "targets": targets,
         })
@@ -308,17 +311,47 @@ async def resolve_sender_info(event: events.NewMessage.Event) -> dict:
     return info
 
 
-def format_sender_line(info: dict) -> str:
-    return (
-        f"{safe_str(info.get('sender_display'))}"
-        f"({safe_str(info.get('sender_id'))}-"
-        f"{safe_str(info.get('sender_username'))}-"
-        f"{safe_str(info.get('sender_type'))})"
-    )
+def md_code(value: Any) -> str:
+    s = str(value)
+    s = s.replace("\\", "\\\\").replace("`", "\\`")
+    return f"`{s}`"
+
+
+def format_copyable_identity_lines(info: dict) -> str:
+    lines = []
+
+    sender_display = info.get("sender_display")
+    sender_username = info.get("sender_username")
+    sender_id = info.get("sender_id")
+
+    normalized_display = None
+    if sender_display:
+        normalized_display = str(sender_display).strip().lower()
+
+    normalized_username_display = None
+    if sender_username:
+        normalized_username_display = f"@{str(sender_username).strip().lower()}"
+
+    if sender_display:
+        lines.append(md_code(sender_display))
+
+    # 如果 sender_display 已經等於 @username，就唔重複再出 username
+    if sender_username and normalized_display != normalized_username_display:
+        lines.append(md_code(sender_username))
+
+    if sender_id is not None:
+        lines.append(md_code(sender_id))
+
+    return "\n".join(lines)
 
 
 def build_header_from_info(info: dict) -> str:
-    return f"[{safe_str(info.get('chat_title'))}]\n{format_sender_line(info)}"
+    group_line = f"[{safe_str(info.get('chat_title'))}]"
+    identity_lines = format_copyable_identity_lines(info)
+
+    if identity_lines:
+        return f"{group_line}\n{identity_lines}"
+    return group_line
 
 
 def should_ignore(info: dict) -> bool:
@@ -500,7 +533,8 @@ async def process_route(route: Dict[str, Any], event: events.NewMessage.Event, i
         dl_dir = DOWNLOAD_DIR / route["name"] / str(event.chat_id)
         dl_dir.mkdir(parents=True, exist_ok=True)
 
-        file_name = build_filename(msg, format_sender_line(info))
+        # filename 用原始 display，唔受 markdown header 影響
+        file_name = build_filename(msg, info.get("sender_display", "unknown"))
         save_path = dl_dir / file_name
 
         extra = {
