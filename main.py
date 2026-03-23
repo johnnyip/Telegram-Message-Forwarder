@@ -1323,6 +1323,23 @@ async def flush_album(source_kind: str, chat_id: int, grouped_id: int):
 
     info = await resolve_sender_info_from_message(msgs[0], chat_id_hint=chat_id)
 
+    if should_ignore(info):
+        log({
+            "ts": tstamp(),
+            "type": "info",
+            "note": "ignored_album_early",
+            "source_kind": source_kind,
+            "chat_id": info["chat_id"],
+            "chat_title": info["chat_title"],
+            "grouped_id": grouped_id,
+            "msg_ids": [m.id for m in msgs],
+            "sender_type": info["sender_type"],
+            "sender_id": info["sender_id"],
+            "sender_username": info["sender_username"],
+            "sender_display": info["sender_display"],
+        })
+        return
+        
     log({
         "ts": tstamp(),
         "type": "album_flush",
@@ -1376,6 +1393,23 @@ async def handle_incoming_message(msg, source_kind: str):
         return
 
     info = await resolve_sender_info_from_message(msg, chat_id_hint=msg.chat_id)
+
+    if should_ignore(info):
+        log({
+            "ts": tstamp(),
+            "type": "info",
+            "note": "ignored_early",
+            "source_kind": source_kind,
+            "chat_id": info["chat_id"],
+            "chat_title": info["chat_title"],
+            "msg": info["msg_id"],
+            "media": media_type(msg),
+            "sender_type": info["sender_type"],
+            "sender_id": info["sender_id"],
+            "sender_username": info["sender_username"],
+            "sender_display": info["sender_display"],
+        })
+        return
 
     log({
         "ts": tstamp(),
