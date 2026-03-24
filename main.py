@@ -11,7 +11,9 @@ from telethon import TelegramClient, events, errors, types
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 
 from tg_forwarder.formatting import build_header_from_info, should_ignore
+from tg_forwarder.logging_setup import setup_logging
 from tg_forwarder.media import build_filename_from_message, get_media_size, media_type
+from tg_forwarder.metrics import StepTimer
 from tg_forwarder.routes import find_matching_routes, load_routes, route_names
 from tg_forwarder.telegram_info import resolve_sender_info_from_message
 from tg_forwarder.utils import cleanup_files, json_bytes, log as base_log, now_ts, parse_int_or_str, safe_str, sanitize_filename_part, tstamp
@@ -87,7 +89,9 @@ NONFORWARDABLE_SOURCE_CHATS = {
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 SPOOL_DIR.mkdir(parents=True, exist_ok=True)
 
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+LOGGER = setup_logging()
+
+client = TelegramClient(SESSION_NAME, API_ID, API_HASH, base_logger="telethon")
 client.parse_mode = "md"
 
 download_semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
@@ -234,6 +238,7 @@ def should_direct_forward_large_album(chat_id: int, info: dict, msgs: List[Any])
 # ============================================================
 
 async def snapshot_media_message(msg, info: dict, source_kind: str) -> Optional[dict]:
+    timer = StepTimer()
     sender_display = info.get("sender_display", "unknown")
     file_name = build_filename_from_message(msg, sender_display)
 
@@ -277,6 +282,16 @@ async def snapshot_media_message(msg, info: dict, source_kind: str) -> Optional[
         "caption_text": (msg.text or msg.message or "").strip(),
         "msg_id": msg.id,
     }
+
+    log({
+        "ts": tstamp(),
+        "type": "perf",
+        "step": "snapshot_media_message",
+        "source_kind": source_kind,
+        "chat_id": chat_id,
+        "msg_id": msg_id,
+        "ms": timer.ms(),
+    })
 
     log({
         "ts": tstamp(),
@@ -326,7 +341,18 @@ async def snapshot_album_messages(msgs: List[Any], info: dict, source_kind: str)
 
 async def kafka_send(topic: str, payload: dict):
     assert producer is not None
+    timer = StepTimer()
     await producer.send_and_wait(topic, json_bytes(payload))
+    log({
+        "ts": tstamp(),
+        "type": "perf",
+        "step": "kafka_send",
+        "topic": topic,
+        "job_type": payload.get("job_type"),
+        "chat_id": payload.get("info", {}).get("chat_id") if isinstance(payload.get("info"), dict) else None,
+        "msg_id": payload.get("info", {}).get("msg_id") if isinstance(payload.get("info"), dict) else None,
+        "ms": timer.ms(),
+    })
 
 
 def due_ts_for_text() -> float:
@@ -481,6 +507,7 @@ async def publish_album_job(msgs: List[Any], info: dict, routes: List[Dict[str, 
 # ============================================================
 
 async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, info: dict, source_kind: str) -> bool:
+    timer = StepTimer()
     extra = {
         "route": route["name"],
         "dst": tgt,
@@ -496,6 +523,13 @@ async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, in
         await run_api(client.send_message(tgt, combined), op="send_text", extra=extra)
         log({
             "ts": tstamp(),
+            "type": "perf",
+            "step": "send_text",
+            "ms": timer.ms(),
+            **extra,
+        })
+        log({
+            "ts": tstamp(),
             "type": "out",
             "op": "send_text",
             "status": "ok",
@@ -507,6 +541,7 @@ async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, in
 
 
 async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, caption: str, info: dict, source_kind: str) -> bool:
+    timer = StepTimer()
     extra = {
         "route": route["name"],
         "dst": tgt,
@@ -523,6 +558,13 @@ async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, capt
         await run_api(client.send_file(tgt, fpath, caption=caption), op="send_file", extra=extra)
         log({
             "ts": tstamp(),
+            "type": "perf",
+            "step": "send_file",
+            "ms": timer.ms(),
+            **extra,
+        })
+        log({
+            "ts": tstamp(),
             "type": "out",
             "op": "send_file",
             "status": "ok",
@@ -534,6 +576,7 @@ async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, capt
 
 
 async def send_album_to_target(route: Dict[str, Any], tgt: Any, files: List[str], caption: str, info: dict, source_kind: str) -> bool:
+    timer = StepTimer()
     extra = {
         "route": route["name"],
         "dst": tgt,
@@ -548,6 +591,13 @@ async def send_album_to_target(route: Dict[str, Any], tgt: Any, files: List[str]
     }
     try:
         await run_api(client.send_file(tgt, files, caption=caption), op="send_album", extra=extra)
+        log({
+            "ts": tstamp(),
+            "type": "perf",
+            "step": "send_album",
+            "ms": timer.ms(),
+            **extra,
+        })
         log({
             "ts": tstamp(),
             "type": "out",
@@ -1048,11 +1098,38 @@ async def _album_timer(source_kind: str, chat_id: int, grouped_id: int):
 # ============================================================
 
 async def handle_incoming_message(msg, source_kind: str):
-    routes = find_matching_routes(msg.chat_id)
+    overall_timer = StepTimer()
+
+    log({
+        "ts": tstamp(),
+        "type": "event_received",
+        "source_kind": source_kind,
+        "chat_id": getattr(msg, "chat_id", None),
+        "msg_id": getattr(msg, "id", None),
+        "msg_date": str(getattr(msg, "date", None)),
+        "edit_date": str(getattr(msg, "edit_date", None)),
+        "has_media": msg.media is not None,
+        "grouped_id": getattr(msg, "grouped_id", None),
+    })
+
+    routes_timer = StepTimer()
+    routes = find_matching_routes(msg.chat_id, ROUTES)
+    routes_ms = routes_timer.ms()
     if not routes:
+        log({
+            "ts": tstamp(),
+            "type": "perf",
+            "step": "find_matching_routes",
+            "chat_id": getattr(msg, "chat_id", None),
+            "msg_id": getattr(msg, "id", None),
+            "ms": routes_ms,
+            "matched": 0,
+        })
         return
 
+    resolve_timer = StepTimer()
     info = await resolve_sender_info_from_message(msg, chat_id_hint=msg.chat_id)
+    resolve_ms = resolve_timer.ms()
 
     if should_ignore(info, IGNORE_USERS, IGNORE_IDS):
         log({
@@ -1070,6 +1147,17 @@ async def handle_incoming_message(msg, source_kind: str):
             "sender_display": info["sender_display"],
         })
         return
+
+    log({
+        "ts": tstamp(),
+        "type": "perf",
+        "step": "handle_incoming_message_preprocess",
+        "chat_id": info["chat_id"],
+        "msg_id": info["msg_id"],
+        "find_matching_routes_ms": routes_ms,
+        "resolve_sender_info_ms": resolve_ms,
+        "total_preprocess_ms": overall_timer.ms(),
+    })
 
     log({
         "ts": tstamp(),
@@ -1234,6 +1322,7 @@ async def main():
     SPOOL_DIR.mkdir(parents=True, exist_ok=True)
 
     print_route_summary()
+    LOGGER.info("startup connected")
     print("✔ Telegram forwarder + Kafka + Album + Auto-forward-detect running — Ctrl+C to stop…")
 
     await startup_kafka()
@@ -1245,7 +1334,10 @@ async def main():
 
     try:
         async with client:
-            await client.run_until_disconnected()
+            try:
+                await client.run_until_disconnected()
+            finally:
+                LOGGER.warning("client disconnected")
     finally:
         for t in consumer_tasks:
             t.cancel()
