@@ -143,7 +143,40 @@ def log(obj: dict):
 def spawn_bg(coro):
     task = asyncio.create_task(coro)
     BACKGROUND_TASKS.add(task)
-    task.add_done_callback(BACKGROUND_TASKS.discard)
+
+    def _on_done(t: asyncio.Task):
+        BACKGROUND_TASKS.discard(t)
+        try:
+            exc = t.exception()
+        except asyncio.CancelledError:
+            log({
+                "ts": tstamp(),
+                "type": "info",
+                "op": "background_task_cancelled",
+            })
+            return
+        except Exception as e:
+            log({
+                "ts": tstamp(),
+                "type": "err",
+                "op": "background_task_exception_probe_failed",
+                "err": e.__class__.__name__,
+                "msg": str(e),
+            })
+            return
+
+        if exc is not None:
+            log({
+                "ts": tstamp(),
+                "type": "err",
+                "op": "background_task_failed",
+                "err": exc.__class__.__name__,
+                "msg": str(exc),
+                "task": repr(t),
+                "coro": repr(coro),
+            })
+
+    task.add_done_callback(_on_done)
     return task
 
 
@@ -941,7 +974,7 @@ async def flush_album(source_kind: str, chat_id: int, grouped_id: int):
     if not msgs:
         return
 
-    routes = find_matching_routes(chat_id)
+    routes = find_matching_routes(chat_id, ROUTES)
     if not routes:
         return
 
