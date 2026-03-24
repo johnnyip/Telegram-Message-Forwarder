@@ -27,5 +27,5 @@ RUN mkdir -p /app/downloads \
 
 USER ${USER}
 
-# 預設執行
+# 預設執行（runtime behavior controlled by APP_MODE env: listen | send）
 CMD ["python", "-u", "main.py"]

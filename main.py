@@ -9,10 +9,17 @@ from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, errors, types
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
+from telegram import Bot
+from telegram.error import TelegramError
 
+from tg_forwarder.bot_sender import bot_send_album, bot_send_file, bot_send_text
+from tg_forwarder.file_policy import is_stale_file
+from tg_forwarder.healthcheck import default_health_path, write_health_file
+from tg_forwarder.debug_flags import ENABLE_DEBUG_LOGS, configure_telethon_logger, maybe_debug_log
 from tg_forwarder.formatting import build_header_from_info, should_ignore
 from tg_forwarder.forward_cache import forward_cache_get, forward_cache_set
 from tg_forwarder.kafka_jobs import publish_album_job as publish_album_job_mod, publish_media_job as publish_media_job_mod, publish_text_job as publish_text_job_mod
+from tg_forwarder.lag_stats import lag_record, lag_summary
 from tg_forwarder.logging_setup import setup_logging
 from tg_forwarder.media import get_media_size, media_type
 from tg_forwarder.metrics import StepTimer
@@ -55,6 +62,10 @@ KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 KAFKA_TEXT_TOPIC = os.getenv("KAFKA_TEXT_TOPIC", "tg-forward-text")
 KAFKA_MEDIA_TOPIC = os.getenv("KAFKA_MEDIA_TOPIC", "tg-forward-media")
 KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP", "tg-forwarder")
+APP_MODE = os.getenv("APP_MODE", "listen").strip().lower()
+if APP_MODE not in {"listen", "send"}:
+    raise RuntimeError("APP_MODE must be 'listen' or 'send'")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
 # Large media forward threshold
 LARGE_MEDIA_FORWARD_THRESHOLD_MB = int(os.getenv("LARGE_MEDIA_FORWARD_THRESHOLD_MB", "30"))
@@ -94,9 +105,12 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 SPOOL_DIR.mkdir(parents=True, exist_ok=True)
 
 LOGGER = setup_logging()
+configure_telethon_logger()
 
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH, base_logger="telethon")
-client.parse_mode = "md"
+client: Optional[TelegramClient] = None
+if APP_MODE == "listen":
+    client = TelegramClient(SESSION_NAME, API_ID, API_HASH, base_logger="telethon")
+    client.parse_mode = "md"
 
 download_semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
 BACKGROUND_TASKS = set()
@@ -104,6 +118,7 @@ BACKGROUND_TASKS = set()
 producer: Optional[AIOKafkaProducer] = None
 text_consumer: Optional[AIOKafkaConsumer] = None
 media_consumer: Optional[AIOKafkaConsumer] = None
+bot: Optional[Bot] = None
 
 # Pending albums:
 # (source_kind, chat_id, grouped_id) -> {"messages": {msg_id: msg}, "task": asyncio.Task}
@@ -215,6 +230,8 @@ def can_attempt_large_forward(chat_id: int, info: dict) -> bool:
 
 
 def should_direct_forward_large_media(info: dict, msg) -> bool:
+    if APP_MODE == "listen":
+        return False
     size = get_media_size(msg)
     if size is None or size <= LARGE_MEDIA_FORWARD_THRESHOLD_BYTES:
         return False
@@ -222,6 +239,8 @@ def should_direct_forward_large_media(info: dict, msg) -> bool:
 
 
 def should_direct_forward_large_album(chat_id: int, info: dict, msgs: List[Any]) -> bool:
+    if APP_MODE == "listen":
+        return False
     if not can_attempt_large_forward(chat_id, info):
         return False
 
@@ -304,23 +323,86 @@ TEXT_TARGET_PARALLEL = os.getenv("TEXT_TARGET_PARALLEL", "true").strip().lower()
 MEDIA_TARGET_PARALLEL = os.getenv("MEDIA_TARGET_PARALLEL", "false").strip().lower() in {"1", "true", "yes", "y"}
 
 
+def job_media_type_from_info(info: dict) -> Optional[str]:
+    if isinstance(info, dict):
+        if info.get("_media_type"):
+            return info.get("_media_type")
+        snaps = info.get("_album_snapshots")
+        if isinstance(snaps, list) and snaps:
+            return snaps[0].get("media_type")
+    return None
+
+
 async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, info: dict, source_kind: str) -> bool:
+    if APP_MODE == "send" and bot is not None:
+        extra = {
+            "route": route["name"], "dst": tgt, "src_msg": info["msg_id"], "chat_id": info["chat_id"],
+            "chat_title": info["chat_title"], "sender_id": info["sender_id"], "sender_username": info["sender_username"],
+            "sender_display": info["sender_display"], "source_kind": source_kind,
+        }
+        try:
+            await bot_send_text(bot, tgt, combined)
+            log({"ts": tstamp(), "type": "out", "op": "send_text", "status": "ok", **extra})
+            return True
+        except Exception as e:
+            log({"ts": tstamp(), "type": "err", "op": "send_text", "err": e.__class__.__name__, "msg": str(e), **extra})
+            return False
     return await send_text_to_target_mod(route, tgt, combined, info, source_kind, client=client, run_api=run_api, log=log)
 
 
 async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, caption: str, info: dict, source_kind: str) -> bool:
+    if APP_MODE == "send" and bot is not None:
+        extra = {
+            "route": route["name"], "dst": tgt, "src_msg": info["msg_id"], "chat_id": info["chat_id"],
+            "chat_title": info["chat_title"], "sender_id": info["sender_id"], "sender_username": info["sender_username"],
+            "sender_display": info["sender_display"], "file": str(fpath), "source_kind": source_kind,
+        }
+        try:
+            await bot_send_file(bot, tgt, str(fpath), caption, media_type=job_media_type_from_info(info))
+            log({"ts": tstamp(), "type": "out", "op": "send_file", "status": "ok", **extra})
+            return True
+        except Exception as e:
+            log({"ts": tstamp(), "type": "err", "op": "send_file", "err": e.__class__.__name__, "msg": str(e), **extra})
+            return False
     return await send_file_to_target_mod(route, tgt, fpath, caption, info, source_kind, client=client, run_api=run_api, log=log)
 
 
 async def send_album_to_target(route: Dict[str, Any], tgt: Any, files: List[str], caption: str, info: dict, source_kind: str) -> bool:
+    if APP_MODE == "send" and bot is not None:
+        extra = {
+            "route": route["name"], "dst": tgt, "src_msg": info["msg_id"], "chat_id": info["chat_id"],
+            "chat_title": info["chat_title"], "sender_id": info["sender_id"], "sender_username": info["sender_username"],
+            "sender_display": info["sender_display"], "files": files, "source_kind": source_kind,
+        }
+        try:
+            media_types = [s.get("media_type") for s in info.get("_album_snapshots", [])] if isinstance(info.get("_album_snapshots"), list) else None
+            await bot_send_album(bot, tgt, files, caption, media_types=media_types)
+            log({"ts": tstamp(), "type": "out", "op": "send_album", "status": "ok", **extra})
+            return True
+        except Exception as e:
+            log({"ts": tstamp(), "type": "warn", "op": "send_album_fallback_to_single", "err": e.__class__.__name__, "msg": str(e), **extra})
+            ok_count = 0
+            for idx, single in enumerate(files):
+                single_type = media_types[idx] if media_types and idx < len(media_types) else None
+                single_caption = caption if idx == 0 else ""
+                try:
+                    await bot_send_file(bot, tgt, single, single_caption, media_type=single_type)
+                    ok_count += 1
+                except Exception as inner:
+                    log({"ts": tstamp(), "type": "err", "op": "send_album_single_fallback", "err": inner.__class__.__name__, "msg": str(inner), "file": single, **extra})
+            return ok_count > 0
     return await send_album_to_target_mod(route, tgt, files, caption, info, source_kind, client=client, run_api=run_api, log=log)
 
 
 async def fetch_message_by_id(chat_id: int, msg_id: int):
+    if client is None:
+        raise RuntimeError("Telethon client unavailable in current mode")
     return await fetch_message_by_id_mod(chat_id, msg_id, client=client, log=log)
 
 
 async def fetch_messages_by_ids(chat_id: int, msg_ids: List[int]):
+    if client is None:
+        raise RuntimeError("Telethon client unavailable in current mode")
     return await fetch_messages_by_ids_mod(chat_id, msg_ids, client=client, log=log)
 
 
@@ -362,6 +444,7 @@ async def process_media_file_job(job: dict) -> List[str]:
         return []
 
     snapshot = job["snapshot"]
+    info["_media_type"] = snapshot.get("media_type")
     fpath = Path(snapshot["path"])
     if not fpath.exists():
         log({
@@ -373,6 +456,15 @@ async def process_media_file_job(job: dict) -> List[str]:
             "file": str(fpath),
         })
         return []
+    if is_stale_file(str(fpath)):
+        log({
+            "ts": tstamp(),
+            "type": "warn",
+            "op": "media_file_stale",
+            "chat_id": info["chat_id"],
+            "msg_id": info["msg_id"],
+            "file": str(fpath),
+        })
 
     is_edit = job["source_kind"] == "edited"
     hdr = build_header_from_info(info, is_edit=is_edit)
@@ -404,6 +496,7 @@ async def process_media_album_file_job(job: dict) -> List[str]:
 
     snapshots = job["snapshots"]
     files = [s["path"] for s in snapshots if Path(s["path"]).exists()]
+    info["_album_snapshots"] = snapshots
     if not files:
         log({
             "ts": tstamp(),
@@ -413,6 +506,16 @@ async def process_media_album_file_job(job: dict) -> List[str]:
             "grouped_id": info.get("grouped_id"),
         })
         return []
+    stale_files = [f for f in files if is_stale_file(f)]
+    if stale_files:
+        log({
+            "ts": tstamp(),
+            "type": "warn",
+            "op": "media_album_files_stale",
+            "chat_id": info["chat_id"],
+            "grouped_id": info.get("grouped_id"),
+            "count": len(stale_files),
+        })
 
     is_edit = job["source_kind"] == "edited"
     hdr = build_header_from_info(info, is_edit=is_edit)
@@ -440,6 +543,10 @@ async def process_media_forward_job(job: dict) -> List[str]:
     info = job["info"]
     if should_ignore(info, IGNORE_USERS, IGNORE_IDS):
         log({"ts": tstamp(), "type": "info", "note": "ignored_media_forward_job", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
+        return []
+
+    if APP_MODE == "send" and bot is not None:
+        log({"ts": tstamp(), "type": "warn", "op": "media_forward_job_unsupported_in_bot_mode", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
         return []
 
     msg = await fetch_message_by_id(job["chat_id"], job["msg_id"])
@@ -526,6 +633,10 @@ async def process_media_album_forward_job(job: dict) -> List[str]:
     info = job["info"]
     if should_ignore(info, IGNORE_USERS, IGNORE_IDS):
         log({"ts": tstamp(), "type": "info", "note": "ignored_media_album_forward_job", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
+        return []
+
+    if APP_MODE == "send" and bot is not None:
+        log({"ts": tstamp(), "type": "warn", "op": "media_album_forward_job_unsupported_in_bot_mode", "chat_id": info["chat_id"], "grouped_id": info.get("grouped_id")})
         return []
 
     msgs = await fetch_messages_by_ids(job["chat_id"], job["msg_ids"])
@@ -618,6 +729,10 @@ async def sleep_until_due(job: dict):
     delay = due_at - now_ts()
     if delay > 0:
         await asyncio.sleep(delay)
+
+
+def touch_health(status: str = "ok"):
+    write_health_file(default_health_path(), status)
 
 
 async def text_consumer_loop():
@@ -781,7 +896,8 @@ async def handle_incoming_message(msg, source_kind: str):
     event_lag_ms = int((event_now - msg_date_obj.timestamp()) * 1000) if msg_date_obj else None
     edit_lag_ms = int((event_now - edit_date_obj.timestamp()) * 1000) if edit_date_obj else None
 
-    log({
+    lag_record(getattr(msg, "chat_id", None), event_lag_ms)
+    maybe_debug_log(log, {
         "ts": tstamp(),
         "type": "event_received",
         "source_kind": source_kind,
@@ -791,15 +907,27 @@ async def handle_incoming_message(msg, source_kind: str):
         "edit_date": str(edit_date_obj),
         "event_lag_ms": event_lag_ms,
         "edit_lag_ms": edit_lag_ms,
+        "background_tasks_count": len(BACKGROUND_TASKS),
+        "pending_albums_count": len(PENDING_ALBUMS),
+        "download_slots_in_use": DOWNLOAD_CONCURRENCY - getattr(download_semaphore, "_value", DOWNLOAD_CONCURRENCY),
         "has_media": msg.media is not None,
         "grouped_id": getattr(msg, "grouped_id", None),
     })
+
+    summary = lag_summary(getattr(msg, "chat_id", None))
+    if summary and summary.get("samples", 0) in {1, 5, 10, 20, 50, 100, 200}:
+        log({
+            "ts": tstamp(),
+            "type": "lag_summary",
+            "chat_id": getattr(msg, "chat_id", None),
+            **summary,
+        })
 
     routes_timer = StepTimer()
     routes = find_matching_routes(msg.chat_id, ROUTES)
     routes_ms = routes_timer.ms()
     if not routes:
-        log({
+        maybe_debug_log(log, {
             "ts": tstamp(),
             "type": "perf",
             "step": "find_matching_routes",
@@ -831,7 +959,7 @@ async def handle_incoming_message(msg, source_kind: str):
         })
         return
 
-    log({
+    maybe_debug_log(log, {
         "ts": tstamp(),
         "type": "perf",
         "step": "handle_incoming_message_preprocess",
@@ -892,7 +1020,6 @@ async def handle_incoming_message(msg, source_kind: str):
     spawn_bg(publish_media_job(msg, info, routes, source_kind))
 
 
-@client.on(events.NewMessage(incoming=True))
 async def on_new_message(event: events.NewMessage.Event):
     try:
         await handle_incoming_message(event.message, source_kind="new")
@@ -908,7 +1035,6 @@ async def on_new_message(event: events.NewMessage.Event):
         })
 
 
-@client.on(events.MessageEdited(incoming=True))
 async def on_message_edited(event: events.MessageEdited.Event):
     if not LISTEN_EDITED_MESSAGES:
         return
@@ -930,13 +1056,22 @@ async def on_message_edited(event: events.MessageEdited.Event):
 # Kafka startup/shutdown
 # ============================================================
 
-async def startup_kafka():
-    global producer, text_consumer, media_consumer
+def register_telethon_handlers():
+    assert client is not None
+    client.add_event_handler(on_new_message, events.NewMessage(incoming=True))
+    client.add_event_handler(on_message_edited, events.MessageEdited(incoming=True))
 
+
+async def startup_kafka_producer():
+    global producer
     producer = AIOKafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
     )
     await producer.start()
+
+
+async def startup_kafka_consumers():
+    global text_consumer, media_consumer
 
     text_consumer = AIOKafkaConsumer(
         KAFKA_TEXT_TOPIC,
@@ -956,10 +1091,12 @@ async def startup_kafka():
 
 
 async def shutdown_kafka():
-    global producer
+    global producer, text_consumer, media_consumer
     if producer is not None:
         await producer.stop()
         producer = None
+    text_consumer = None
+    media_consumer = None
 
 
 # ============================================================
@@ -976,6 +1113,7 @@ def print_route_summary():
         })
     print(json.dumps({
         "startup": "ok",
+        "app_mode": APP_MODE,
         "kafka_bootstrap_servers": KAFKA_BOOTSTRAP_SERVERS,
         "kafka_text_topic": KAFKA_TEXT_TOPIC,
         "kafka_media_topic": KAFKA_MEDIA_TOPIC,
@@ -1005,31 +1143,54 @@ async def main():
     SPOOL_DIR.mkdir(parents=True, exist_ok=True)
 
     print_route_summary()
-    LOGGER.info("startup connected")
-    try:
-        me = await client.get_me()
-        LOGGER.info("telethon auth ok id=%s username=%s", getattr(me, "id", None), getattr(me, "username", None))
-    except Exception as e:
-        LOGGER.warning("telethon auth probe failed err=%s msg=%s", e.__class__.__name__, str(e))
-    print("✔ Telegram forwarder + Kafka + Album + Auto-forward-detect running — Ctrl+C to stop…")
+    touch_health(f"starting:{APP_MODE}")
+    print(f"✔ Telegram forwarder mode={APP_MODE} running — Ctrl+C to stop…")
 
-    await startup_kafka()
-
-    consumer_tasks = [
-        asyncio.create_task(text_consumer_loop()),
-        asyncio.create_task(media_consumer_loop()),
-    ]
+    consumer_tasks = []
 
     try:
-        async with client:
+        if APP_MODE == "listen":
+            LOGGER.info("startup listen mode sender=telethon-user producer=true consumers=false")
+            assert client is not None
+            register_telethon_handlers()
+            async with client:
+                try:
+                    try:
+                        me = await client.get_me()
+                        LOGGER.info("telethon auth ok id=%s username=%s", getattr(me, "id", None), getattr(me, "username", None))
+                    except Exception as e:
+                        LOGGER.warning("telethon auth probe failed err=%s msg=%s", e.__class__.__name__, str(e))
+
+                    await startup_kafka_producer()
+                    touch_health("listen:running")
+                    await client.run_until_disconnected()
+                finally:
+                    LOGGER.warning("client disconnected")
+
+        elif APP_MODE == "send":
+            LOGGER.info("startup send mode sender=telegram-bot producer=false consumers=true")
+            if not TELEGRAM_BOT_TOKEN:
+                raise RuntimeError("TELEGRAM_BOT_TOKEN is required in APP_MODE=send")
+            global bot
+            bot = Bot(token=TELEGRAM_BOT_TOKEN)
             try:
-                await client.run_until_disconnected()
-            finally:
-                LOGGER.warning("client disconnected")
+                me = await bot.get_me()
+                LOGGER.info("bot auth ok id=%s username=%s", getattr(me, "id", None), getattr(me, "username", None))
+            except TelegramError as e:
+                LOGGER.warning("bot auth probe failed err=%s msg=%s", e.__class__.__name__, str(e))
+            await startup_kafka_consumers()
+            touch_health("send:running")
+            consumer_tasks = [
+                asyncio.create_task(text_consumer_loop()),
+                asyncio.create_task(media_consumer_loop()),
+            ]
+            await asyncio.gather(*consumer_tasks)
     finally:
         for t in consumer_tasks:
-            t.cancel()
-        await asyncio.gather(*consumer_tasks, return_exceptions=True)
+            if not t.done():
+                t.cancel()
+        if consumer_tasks:
+            await asyncio.gather(*consumer_tasks, return_exceptions=True)
 
         for key, item in list(PENDING_ALBUMS.items()):
             task = item.get("task")
