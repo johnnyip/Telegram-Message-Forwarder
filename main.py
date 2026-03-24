@@ -28,6 +28,7 @@ from tg_forwarder.senders import fetch_message_by_id as fetch_message_by_id_mod,
 from tg_forwarder.snapshot import snapshot_album_messages as snapshot_album_messages_mod, snapshot_media_message as snapshot_media_message_mod
 from tg_forwarder.telegram_info import resolve_sender_info_from_message
 from tg_forwarder.utils import cleanup_files, json_bytes, log as base_log, now_ts, tstamp
+from tg_forwarder.verbose_flags import BOT_STARTUP_SMOKE_TEST, maybe_verbose_log
 
 
 # ============================================================
@@ -343,7 +344,7 @@ async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, in
             "chat_title": info["chat_title"], "sender_id": info["sender_id"], "sender_username": info["sender_username"],
             "sender_display": info["sender_display"], "source_kind": source_kind,
         }
-        log({"ts": tstamp(), "type": "info", "op": "send_text_attempt", **extra, "target": tgt, "text_preview": combined[:200]})
+        maybe_verbose_log(log, {"ts": tstamp(), "type": "info", "op": "send_text_attempt", **extra, "target": tgt, "text_preview": combined[:200]})
         try:
             await bot_send_text(bot, tgt, combined)
             log({"ts": tstamp(), "type": "out", "op": "send_text", "status": "ok", **extra})
@@ -362,7 +363,7 @@ async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, capt
             "sender_display": info["sender_display"], "file": str(fpath), "source_kind": source_kind,
         }
         media_kind = job_media_type_from_info(info)
-        log({"ts": tstamp(), "type": "info", "op": "send_file_attempt", **extra, "target": tgt, "media_kind": media_kind, "caption_preview": caption[:200]})
+        maybe_verbose_log(log, {"ts": tstamp(), "type": "info", "op": "send_file_attempt", **extra, "target": tgt, "media_kind": media_kind, "caption_preview": caption[:200]})
         try:
             await bot_send_file(bot, tgt, str(fpath), caption, media_type=media_kind)
             log({"ts": tstamp(), "type": "out", "op": "send_file", "status": "ok", **extra, "media_kind": media_kind})
@@ -382,7 +383,7 @@ async def send_album_to_target(route: Dict[str, Any], tgt: Any, files: List[str]
         }
         try:
             media_types = [s.get("media_type") for s in info.get("_album_snapshots", [])] if isinstance(info.get("_album_snapshots"), list) else None
-            log({"ts": tstamp(), "type": "info", "op": "send_album_attempt", **extra, "target": tgt, "media_types": media_types, "caption_preview": caption[:200]})
+            maybe_verbose_log(log, {"ts": tstamp(), "type": "info", "op": "send_album_attempt", **extra, "target": tgt, "media_types": media_types, "caption_preview": caption[:200]})
             await bot_send_album(bot, tgt, files, caption, media_types=media_types)
             log({"ts": tstamp(), "type": "out", "op": "send_album", "status": "ok", **extra})
             return True
@@ -431,7 +432,7 @@ async def process_text_job(job: dict) -> List[str]:
 
     route_names = job.get("route_names", [])
     routes = [ROUTE_MAP[name] for name in route_names if name in ROUTE_MAP]
-    log({
+    maybe_verbose_log(log, {
         "ts": tstamp(),
         "type": "info",
         "op": "process_text_job_start",
@@ -448,7 +449,7 @@ async def process_text_job(job: dict) -> List[str]:
 
     for route in routes:
         total_count += len(route["targets"])
-        log({
+        maybe_verbose_log(log, {
             "ts": tstamp(),
             "type": "info",
             "op": "process_text_job_route",
@@ -461,7 +462,7 @@ async def process_text_job(job: dict) -> List[str]:
         for tgt in route["targets"]:
             ok = await send_text_to_target(route, tgt, combined, info, job["source_kind"])
             results.append(ok)
-        log({
+        maybe_verbose_log(log, {
             "ts": tstamp(),
             "type": "info",
             "op": "process_text_job_route_results",
@@ -473,7 +474,7 @@ async def process_text_job(job: dict) -> List[str]:
         })
         success_count += sum(1 for ok in results if ok)
 
-    log({
+    maybe_verbose_log(log, {
         "ts": tstamp(),
         "type": "info",
         "op": "process_text_job_done",
@@ -498,7 +499,7 @@ async def process_media_file_job(job: dict) -> List[str]:
     snapshot = job["snapshot"]
     info["_media_type"] = snapshot.get("media_type")
     fpath = Path(snapshot["path"])
-    log({
+    maybe_verbose_log(log, {
         "ts": tstamp(),
         "type": "info",
         "op": "process_media_file_job_start",
@@ -538,7 +539,7 @@ async def process_media_file_job(job: dict) -> List[str]:
     total_count = 0
 
     for route in routes:
-        log({
+        maybe_verbose_log(log, {
             "ts": tstamp(),
             "type": "info",
             "op": "process_media_file_job_route",
@@ -550,7 +551,7 @@ async def process_media_file_job(job: dict) -> List[str]:
         for tgt in route["targets"]:
             total_count += 1
             ok = await send_file_to_target(route, tgt, fpath, caption, info, job["source_kind"])
-            log({
+            maybe_verbose_log(log, {
                 "ts": tstamp(),
                 "type": "info",
                 "op": "process_media_file_job_target_result",
@@ -1232,6 +1233,12 @@ def print_route_summary():
 # Main
 # ============================================================
 
+def startup_banner() -> str:
+    if APP_MODE == "listen":
+        return f"🚀 tg-forwarder listen up | session={SESSION_NAME} | receiver=telethon | kafka=producer"
+    return "🚀 tg-forwarder send up | sender=telegram-bot | kafka=consumers"
+
+
 async def main():
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1239,7 +1246,9 @@ async def main():
 
     print_route_summary()
     touch_health(f"starting:{APP_MODE}")
-    print(f"✔ Telegram forwarder mode={APP_MODE} running — Ctrl+C to stop…")
+    banner = startup_banner()
+    print(banner)
+    LOGGER.info(banner)
 
     consumer_tasks = []
 
@@ -1271,13 +1280,13 @@ async def main():
             try:
                 me = await bot.get_me()
                 LOGGER.info("bot auth ok id=%s username=%s", getattr(me, "id", None), getattr(me, "username", None))
-                # startup smoke tests for known-good target types
-                for smoke_target in (-1003836445993, -1002548092183):
-                    try:
-                        r = await bot.send_message(chat_id=smoke_target, text="startup smoke test from tg-forwarder-send")
-                        LOGGER.info("bot startup smoke ok target=%s message_id=%s", smoke_target, getattr(r, "message_id", None))
-                    except Exception as smoke_err:
-                        LOGGER.warning("bot startup smoke failed target=%s err=%s msg=%s", smoke_target, smoke_err.__class__.__name__, str(smoke_err))
+                if BOT_STARTUP_SMOKE_TEST:
+                    for smoke_target in (-1003836445993, -1002548092183):
+                        try:
+                            r = await bot.send_message(chat_id=smoke_target, text="startup smoke test from tg-forwarder-send")
+                            LOGGER.info("bot startup smoke ok target=%s message_id=%s", smoke_target, getattr(r, "message_id", None))
+                        except Exception as smoke_err:
+                            LOGGER.warning("bot startup smoke failed target=%s err=%s msg=%s", smoke_target, smoke_err.__class__.__name__, str(smoke_err))
             except TelegramError as e:
                 LOGGER.warning("bot auth probe failed err=%s msg=%s", e.__class__.__name__, str(e))
             await startup_kafka_consumers()
