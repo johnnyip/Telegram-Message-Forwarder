@@ -2,15 +2,19 @@ import os
 import asyncio
 from pathlib import Path
 from datetime import datetime
-import mimetypes
 import json
 import uuid
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, errors, types
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
+
+from tg_forwarder.formatting import build_header_from_info, should_ignore
+from tg_forwarder.media import build_filename_from_message, get_media_size, media_type
+from tg_forwarder.routes import find_matching_routes, load_routes, route_names
+from tg_forwarder.telegram_info import resolve_sender_info_from_message
+from tg_forwarder.utils import cleanup_files, json_bytes, log as base_log, now_ts, parse_int_or_str, safe_str, sanitize_filename_part, tstamp
 
 
 # ============================================================
@@ -106,23 +110,8 @@ PENDING_ALBUMS: Dict[Tuple[str, int, int], dict] = {}
 # Basic helpers
 # ============================================================
 
-def tstamp() -> str:
-    return datetime.now().isoformat(timespec="seconds")
-
-
-def now_ts() -> float:
-    return time.time()
-
-
 def log(obj: dict):
-    line = json.dumps(obj, ensure_ascii=False, default=str)
-    print(line)
-    try:
-        today_file = LOG_DIR / f"{datetime.now().strftime('%Y-%m-%d')}.log"
-        with today_file.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-    except Exception as e:
-        print(f"[LOG_ERR] {e}")
+    base_log(obj, LOG_DIR)
 
 
 def spawn_bg(coro):
@@ -130,68 +119,6 @@ def spawn_bg(coro):
     BACKGROUND_TASKS.add(task)
     task.add_done_callback(BACKGROUND_TASKS.discard)
     return task
-
-
-def safe_str(value) -> str:
-    return "null" if value is None or value == "" else str(value)
-
-
-def sanitize_filename_part(value: str) -> str:
-    if not value:
-        return "unknown"
-    cleaned = "".join(c for c in str(value) if c.isalnum() or c in ("@", "_", "-", ".", " ", "(", ")"))
-    cleaned = cleaned.strip().replace(" ", "_")
-    return cleaned[:100] or "unknown"
-
-
-def parse_int_or_str(value: Any):
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        v = value.strip()
-        if v.lstrip("-").isdigit():
-            return int(v)
-        return v
-    return value
-
-
-def json_bytes(obj: dict) -> bytes:
-    return json.dumps(obj, ensure_ascii=False).encode("utf-8")
-
-
-def media_type(m):
-    if m.media is None:
-        return "text"
-    return (
-        "photo" if m.photo else
-        "video" if m.video else
-        "video_note" if getattr(m, "video_note", None) else
-        "voice" if m.voice else
-        "audio" if m.audio else
-        "animation" if m.animation else
-        "document" if m.document else
-        "other"
-    )
-
-
-def get_media_size(msg) -> Optional[int]:
-    file_obj = getattr(msg, "file", None)
-    size = getattr(file_obj, "size", None)
-    if isinstance(size, int):
-        return size
-    return None
-
-
-def build_filename_from_message(msg, sender_display="unknown"):
-    safe_sender = sanitize_filename_part(sender_display)
-    ext = ""
-
-    if msg.document and msg.file and msg.file.name:
-        ext = Path(msg.file.name).suffix
-    elif msg.file and msg.file.mime_type:
-        ext = mimetypes.guess_extension(msg.file.mime_type) or ""
-
-    return f"{msg.id}_{safe_sender}{ext}"
 
 
 async def throttle(seconds: int):
@@ -236,275 +163,8 @@ async def run_api(coro, op: str, extra: Optional[dict] = None):
         raise
 
 
-def cleanup_files(paths: List[str], source_kind: str, src_msg: Any):
-    for path in paths:
-        try:
-            p = Path(path)
-            if p.exists():
-                p.unlink(missing_ok=True)
-                log({
-                    "ts": tstamp(),
-                    "type": "cleanup",
-                    "op": "delete_temp_file",
-                    "file": str(p),
-                    "src_msg": src_msg,
-                    "source_kind": source_kind,
-                })
-        except Exception as e:
-            log({
-                "ts": tstamp(),
-                "type": "warn",
-                "op": "delete_temp_file",
-                "file": path,
-                "src_msg": src_msg,
-                "source_kind": source_kind,
-                "err": e.__class__.__name__,
-                "msg": str(e),
-            })
-
-
-# ============================================================
-# Routes
-# ============================================================
-
-def load_routes() -> List[Dict[str, Any]]:
-    routes_json = os.getenv("ROUTES_JSON", "").strip()
-    if not routes_json:
-        raise RuntimeError("ROUTES_JSON is required")
-
-    raw_routes = json.loads(routes_json)
-    if not isinstance(raw_routes, list):
-        raise RuntimeError("ROUTES_JSON must be a JSON array")
-
-    routes: List[Dict[str, Any]] = []
-    for idx, raw in enumerate(raw_routes, start=1):
-        if not isinstance(raw, dict):
-            raise RuntimeError(f"Route #{idx} must be an object")
-
-        sources = [parse_int_or_str(x) for x in raw.get("sources", [])]
-        targets = [parse_int_or_str(x) for x in raw.get("targets", [])]
-
-        if not sources:
-            raise RuntimeError(f"Route #{idx} has no sources")
-        if not targets:
-            raise RuntimeError(f"Route #{idx} has no targets")
-
-        routes.append({
-            "name": str(raw.get("name", f"route_{idx}")),
-            "sources": set(sources),
-            "targets": targets,
-        })
-    return routes
-
-
-ROUTES = load_routes()
+ROUTES = load_routes(os.getenv("ROUTES_JSON", ""))
 ROUTE_MAP = {r["name"]: r for r in ROUTES}
-
-
-def find_matching_routes(chat_id: Any) -> List[Dict[str, Any]]:
-    return [route for route in ROUTES if chat_id in route["sources"]]
-
-
-def route_names(routes: List[Dict[str, Any]]) -> List[str]:
-    return [r["name"] for r in routes]
-
-
-# ============================================================
-# Sender/chat info resolution
-# ============================================================
-
-async def resolve_sender_info_from_message(msg, chat_id_hint=None) -> dict:
-    chat = None
-    sender = None
-
-    if hasattr(msg, "get_chat"):
-        try:
-            chat = await msg.get_chat()
-        except Exception:
-            chat = None
-
-    if hasattr(msg, "get_sender"):
-        try:
-            sender = await msg.get_sender()
-        except Exception:
-            sender = None
-
-    chat_id = chat_id_hint if chat_id_hint is not None else getattr(msg, "chat_id", None)
-    chat_title = getattr(chat, "title", None) or str(chat_id)
-    chat_username = getattr(chat, "username", None)
-    chat_noforwards = bool(getattr(chat, "noforwards", False)) if chat is not None else False
-    msg_noforwards = bool(getattr(msg, "noforwards", False))
-
-    if isinstance(chat, types.Channel):
-        chat_type = "channel" if getattr(chat, "broadcast", False) else "supergroup"
-    elif isinstance(chat, types.Chat):
-        chat_type = "group"
-    elif isinstance(chat, types.User):
-        chat_type = "private"
-    else:
-        chat_type = "unknown"
-
-    info = {
-        "chat_id": chat_id,
-        "chat_title": chat_title,
-        "chat_username": chat_username,
-        "chat_type": chat_type,
-        "raw_chat_class": chat.__class__.__name__ if chat is not None else None,
-        "chat_noforwards": chat_noforwards,
-        "msg_noforwards": msg_noforwards,
-
-        "sender_id": getattr(sender, "id", None) or getattr(msg, "sender_id", None),
-        "sender_type": "unknown",
-        "sender_username": None,
-        "sender_display": "user",
-        "sender_first_name": None,
-        "sender_last_name": None,
-
-        "post_author": getattr(msg, "post_author", None),
-        "raw_sender_class": sender.__class__.__name__ if sender is not None else None,
-
-        "msg_id": msg.id,
-        "msg_date": str(getattr(msg, "date", None)),
-        "edit_date": str(getattr(msg, "edit_date", None)),
-        "grouped_id": getattr(msg, "grouped_id", None),
-        "reply_to_msg_id": getattr(getattr(msg, "reply_to", None), "reply_to_msg_id", None),
-    }
-
-    if isinstance(sender, types.User):
-        info["sender_type"] = "user"
-        info["sender_username"] = sender.username
-        info["sender_first_name"] = sender.first_name
-        info["sender_last_name"] = sender.last_name
-
-        if sender.username:
-            info["sender_display"] = f"@{sender.username}"
-        else:
-            full_name = " ".join(x for x in [sender.first_name, sender.last_name] if x).strip()
-            info["sender_display"] = full_name or f"user:{sender.id}"
-        return info
-
-    if isinstance(sender, (types.Chat, types.Channel)):
-        info["sender_type"] = "chat"
-        chat_sender_username = getattr(sender, "username", None)
-        chat_sender_title = getattr(sender, "title", None)
-        info["sender_username"] = chat_sender_username
-
-        if chat_sender_username:
-            info["sender_display"] = f"@{chat_sender_username}"
-        else:
-            info["sender_display"] = f"[{chat_sender_title or sender.id}]"
-        return info
-
-    if info["post_author"]:
-        info["sender_type"] = "post_author"
-        info["sender_display"] = str(info["post_author"])
-        return info
-
-    if getattr(msg, "sender_id", None):
-        info["sender_type"] = "sender_id_only"
-        info["sender_display"] = f"id:{msg.sender_id}"
-        return info
-
-    info["sender_type"] = "anonymous_or_unknown"
-    info["sender_display"] = "anonymous"
-    return info
-
-
-# ============================================================
-# Formatting
-# ============================================================
-
-def md_code(value: Any) -> str:
-    s = str(value)
-    s = s.replace("\\", "\\\\").replace("`", "\\`")
-    return f"`{s}`"
-
-
-def escape_md_link_text(text: Any) -> str:
-    s = str(text)
-    for ch in ["\\", "[", "]", "(", ")"]:
-        s = s.replace(ch, f"\\{ch}")
-    return s
-
-
-def build_chat_message_url(info: dict) -> Optional[str]:
-    chat_username = info.get("chat_username")
-    chat_id = info.get("chat_id")
-    msg_id = info.get("msg_id")
-
-    if not msg_id:
-        return None
-
-    if chat_username:
-        return f"https://t.me/{chat_username}/{msg_id}"
-
-    if isinstance(chat_id, int):
-        s = str(chat_id)
-        if s.startswith("-100"):
-            return f"https://t.me/c/{s[4:]}/{msg_id}"
-
-    return None
-
-
-def format_copyable_identity_lines(info: dict) -> str:
-    lines = []
-
-    sender_display = info.get("sender_display")
-    sender_username = info.get("sender_username")
-    sender_id = info.get("sender_id")
-
-    normalized_display = None
-    if sender_display:
-        normalized_display = str(sender_display).strip().lower()
-
-    normalized_username_display = None
-    if sender_username:
-        normalized_username_display = f"@{str(sender_username).strip().lower()}"
-
-    if sender_display:
-        lines.append(md_code(sender_display))
-
-    if sender_username and normalized_display != normalized_username_display:
-        lines.append(md_code(sender_username))
-
-    if sender_id is not None:
-        lines.append(md_code(sender_id))
-
-    return "\n".join(lines)
-
-
-def build_header_from_info(info: dict, is_edit=False) -> str:
-    chat_title = safe_str(info.get("chat_title"))
-    url = build_chat_message_url(info)
-
-    if url:
-        group_line = f"[{escape_md_link_text(chat_title)}]({url})"
-    else:
-        group_line = f"[{escape_md_link_text(chat_title)}]"
-
-    identity_lines = format_copyable_identity_lines(info)
-
-    if is_edit:
-        if identity_lines:
-            return f"{group_line}\n`[EDITED]`\n{identity_lines}"
-        return f"{group_line}\n`[EDITED]`"
-
-    if identity_lines:
-        return f"{group_line}\n{identity_lines}"
-    return group_line
-
-
-def should_ignore(info: dict) -> bool:
-    sender_username = info.get("sender_username")
-    sender_id = info.get("sender_id")
-
-    if sender_username and sender_username.lower().lstrip("@") in IGNORE_USERS:
-        return True
-
-    if sender_id is not None and sender_id in IGNORE_IDS:
-        return True
-
-    return False
 
 
 # ============================================================
@@ -944,7 +604,7 @@ async def fetch_messages_by_ids(chat_id: int, msg_ids: List[int]):
 
 async def process_text_job(job: dict) -> List[str]:
     info = job["info"]
-    if should_ignore(info):
+    if should_ignore(info, IGNORE_USERS, IGNORE_IDS):
         log({"ts": tstamp(), "type": "info", "note": "ignored_text_job", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
         return []
 
@@ -972,7 +632,7 @@ async def process_text_job(job: dict) -> List[str]:
 
 async def process_media_file_job(job: dict) -> List[str]:
     info = job["info"]
-    if should_ignore(info):
+    if should_ignore(info, IGNORE_USERS, IGNORE_IDS):
         log({"ts": tstamp(), "type": "info", "note": "ignored_media_file_job", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
         return []
 
@@ -1013,7 +673,7 @@ async def process_media_file_job(job: dict) -> List[str]:
 
 async def process_media_album_file_job(job: dict) -> List[str]:
     info = job["info"]
-    if should_ignore(info):
+    if should_ignore(info, IGNORE_USERS, IGNORE_IDS):
         log({"ts": tstamp(), "type": "info", "note": "ignored_media_album_file_job", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
         return []
 
@@ -1053,7 +713,7 @@ async def process_media_album_file_job(job: dict) -> List[str]:
 
 async def process_media_forward_job(job: dict) -> List[str]:
     info = job["info"]
-    if should_ignore(info):
+    if should_ignore(info, IGNORE_USERS, IGNORE_IDS):
         log({"ts": tstamp(), "type": "info", "note": "ignored_media_forward_job", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
         return []
 
@@ -1139,7 +799,7 @@ async def process_media_forward_job(job: dict) -> List[str]:
 
 async def process_media_album_forward_job(job: dict) -> List[str]:
     info = job["info"]
-    if should_ignore(info):
+    if should_ignore(info, IGNORE_USERS, IGNORE_IDS):
         log({"ts": tstamp(), "type": "info", "note": "ignored_media_album_forward_job", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
         return []
 
@@ -1323,7 +983,7 @@ async def flush_album(source_kind: str, chat_id: int, grouped_id: int):
 
     info = await resolve_sender_info_from_message(msgs[0], chat_id_hint=chat_id)
 
-    if should_ignore(info):
+    if should_ignore(info, IGNORE_USERS, IGNORE_IDS):
         log({
             "ts": tstamp(),
             "type": "info",
@@ -1394,7 +1054,7 @@ async def handle_incoming_message(msg, source_kind: str):
 
     info = await resolve_sender_info_from_message(msg, chat_id_hint=msg.chat_id)
 
-    if should_ignore(info):
+    if should_ignore(info, IGNORE_USERS, IGNORE_IDS):
         log({
             "ts": tstamp(),
             "type": "info",
