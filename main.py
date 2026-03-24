@@ -36,9 +36,10 @@ from tg_forwarder.utils import cleanup_files, json_bytes, log as base_log, now_t
 
 load_dotenv()
 
-API_ID = int(os.getenv("API_ID"))
+API_ID_RAW = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 SESSION_NAME = os.getenv("SESSION_NAME", "my_account")
+API_ID = int(API_ID_RAW) if API_ID_RAW else None
 
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads")).expanduser()
 LOG_DIR = DOWNLOAD_DIR / "log"
@@ -109,6 +110,8 @@ configure_telethon_logger()
 
 client: Optional[TelegramClient] = None
 if APP_MODE == "listen":
+    if API_ID is None or not API_HASH:
+        raise RuntimeError("API_ID and API_HASH are required in APP_MODE=listen")
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH, base_logger="telethon")
     client.parse_mode = "md"
 
