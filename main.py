@@ -348,7 +348,7 @@ async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, in
             log({"ts": tstamp(), "type": "out", "op": "send_text", "status": "ok", **extra})
             return True
         except Exception as e:
-            log({"ts": tstamp(), "type": "err", "op": "send_text", "err": e.__class__.__name__, "msg": str(e), **extra})
+            log({"ts": tstamp(), "type": "err", "op": "send_text", "err": e.__class__.__name__, "msg": str(e), **extra, "target": tgt, "text_preview": combined[:200]})
             return False
     return await send_text_to_target_mod(route, tgt, combined, info, source_kind, client=client, run_api=run_api, log=log)
 
@@ -365,7 +365,7 @@ async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, capt
             log({"ts": tstamp(), "type": "out", "op": "send_file", "status": "ok", **extra})
             return True
         except Exception as e:
-            log({"ts": tstamp(), "type": "err", "op": "send_file", "err": e.__class__.__name__, "msg": str(e), **extra})
+            log({"ts": tstamp(), "type": "err", "op": "send_file", "err": e.__class__.__name__, "msg": str(e), **extra, "target": tgt, "caption_preview": caption[:200]})
             return False
     return await send_file_to_target_mod(route, tgt, fpath, caption, info, source_kind, client=client, run_api=run_api, log=log)
 
@@ -392,7 +392,7 @@ async def send_album_to_target(route: Dict[str, Any], tgt: Any, files: List[str]
                     await bot_send_file(bot, tgt, single, single_caption, media_type=single_type)
                     ok_count += 1
                 except Exception as inner:
-                    log({"ts": tstamp(), "type": "err", "op": "send_album_single_fallback", "err": inner.__class__.__name__, "msg": str(inner), "file": single, **extra})
+                    log({"ts": tstamp(), "type": "err", "op": "send_album_single_fallback", "err": inner.__class__.__name__, "msg": str(inner), "file": single, "target": tgt, **extra})
             return ok_count > 0
     return await send_album_to_target_mod(route, tgt, files, caption, info, source_kind, client=client, run_api=run_api, log=log)
 
