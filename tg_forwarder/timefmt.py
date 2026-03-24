@@ -23,7 +23,7 @@ def append_original_time(text: str, msg_date: Optional[str]) -> str:
     hhmm = hhmm_from_msg_date(msg_date)
     if not hhmm:
         return text
-    suffix = f"\nOriginal send {hhmm}"
+    suffix = f"\n[Original send {hhmm}]"
     if text.endswith(suffix):
         return text
     return f"{text}{suffix}"

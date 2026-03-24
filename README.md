@@ -93,14 +93,47 @@ Optional override:
 - **Mode-specific startup summary**
   - listen mode logs `sender=telethon-user producer=true consumers=false`
   - send mode logs `sender=telegram-bot producer=false consumers=true`
+- **Startup banner**
+  - listen mode prints `🚀 tg-forwarder listen up | session=<name> | receiver=telethon | kafka=producer`
+  - send mode prints `🚀 tg-forwarder send up | sender=telegram-bot | kafka=consumers`
 - **Bot auth probe on startup**
   - send mode verifies bot token with `get_me()`
 - **Album fallback**
   - if `send_media_group` fails, send mode falls back to single-file sends
+- **Rate-limit protection**
+  - send mode uses a global bot send semaphore via `BOT_SEND_CONCURRENCY` (production default: `1`)
+  - `RetryAfter` and timeout errors are retried with backoff before failing the Kafka job
 - **Stale file warning**
   - send mode warns when local media files are older than `STALE_FILE_HOURS` (default 72)
 - **Health file**
   - runtime writes a health marker file (default `/tmp/tg-forwarder-health.txt`)
+
+## Forwarded message footer
+
+Forwarded text and media captions append the source message time as the final line:
+
+```text
+Original send HH:MM
+```
+
+The displayed time is converted using:
+1. `DISPLAY_TIMEZONE`
+2. fallback `TZ`
+3. fallback `Asia/Hong_Kong`
+
+For Johnny's production deploy, this is intended to display **HKT**.
+
+## Production defaults
+
+Recommended production defaults for `APP_MODE=send`:
+
+- `TEXT_TARGET_PARALLEL=false`
+- `MEDIA_TARGET_PARALLEL=false`
+- `BOT_SEND_CONCURRENCY=1`
+- `BOT_STARTUP_SMOKE_TEST=false`
+- `VERBOSE_JOB_LOGS=false`
+- `ENABLE_DEBUG_LOGS=false`
+- `TELETHON_DEBUG=false`
 
 ## Docker image
 The Docker image includes:
