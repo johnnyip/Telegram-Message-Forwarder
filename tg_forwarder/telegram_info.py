@@ -115,7 +115,14 @@ async def resolve_sender_info_from_message(msg, chat_id_hint=None) -> dict:
 
     if getattr(msg, "sender_id", None):
         info["sender_type"] = "sender_id_only"
-        info["sender_display"] = f"id:{msg.sender_id}"
+        if not info.get("sender_display") or info.get("sender_display") == "user":
+            if info.get("sender_username"):
+                info["sender_display"] = f"@{info['sender_username']}"
+            elif info.get("sender_first_name") or info.get("sender_last_name"):
+                full_name = " ".join(x for x in [info.get("sender_first_name"), info.get("sender_last_name")] if x).strip()
+                info["sender_display"] = full_name or f"id:{msg.sender_id}"
+            else:
+                info["sender_display"] = f"id:{msg.sender_id}"
         return info
 
     info["sender_type"] = "anonymous_or_unknown"

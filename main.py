@@ -634,7 +634,7 @@ async def text_consumer_loop():
                 await text_consumer.commit()
 
                 if cleanup_paths:
-                    cleanup_files(cleanup_paths, job.get("source_kind", "unknown"), job.get("info", {}).get("msg_id"))
+                    cleanup_files(cleanup_paths, job.get("source_kind", "unknown"), job.get("info", {}).get("msg_id"), log)
             except Exception as e:
                 log({
                     "ts": tstamp(),
@@ -674,7 +674,7 @@ async def media_consumer_loop():
                 await media_consumer.commit()
 
                 if cleanup_paths:
-                    cleanup_files(cleanup_paths, job.get("source_kind", "unknown"), job.get("info", {}).get("msg_id"))
+                    cleanup_files(cleanup_paths, job.get("source_kind", "unknown"), job.get("info", {}).get("msg_id"), log)
             except Exception as e:
                 log({
                     "ts": tstamp(),
@@ -775,14 +775,22 @@ async def _album_timer(source_kind: str, chat_id: int, grouped_id: int):
 async def handle_incoming_message(msg, source_kind: str):
     overall_timer = StepTimer()
 
+    msg_date_obj = getattr(msg, "date", None)
+    edit_date_obj = getattr(msg, "edit_date", None)
+    event_now = now_ts()
+    event_lag_ms = int((event_now - msg_date_obj.timestamp()) * 1000) if msg_date_obj else None
+    edit_lag_ms = int((event_now - edit_date_obj.timestamp()) * 1000) if edit_date_obj else None
+
     log({
         "ts": tstamp(),
         "type": "event_received",
         "source_kind": source_kind,
         "chat_id": getattr(msg, "chat_id", None),
         "msg_id": getattr(msg, "id", None),
-        "msg_date": str(getattr(msg, "date", None)),
-        "edit_date": str(getattr(msg, "edit_date", None)),
+        "msg_date": str(msg_date_obj),
+        "edit_date": str(edit_date_obj),
+        "event_lag_ms": event_lag_ms,
+        "edit_lag_ms": edit_lag_ms,
         "has_media": msg.media is not None,
         "grouped_id": getattr(msg, "grouped_id", None),
     })
@@ -998,6 +1006,11 @@ async def main():
 
     print_route_summary()
     LOGGER.info("startup connected")
+    try:
+        me = await client.get_me()
+        LOGGER.info("telethon auth ok id=%s username=%s", getattr(me, "id", None), getattr(me, "username", None))
+    except Exception as e:
+        LOGGER.warning("telethon auth probe failed err=%s msg=%s", e.__class__.__name__, str(e))
     print("✔ Telegram forwarder + Kafka + Album + Auto-forward-detect running — Ctrl+C to stop…")
 
     await startup_kafka()
