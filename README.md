@@ -68,6 +68,7 @@ This is the safest design when send mode uses a bot token and should not depend 
 - `TEXT_TARGET_PARALLEL`
 - `MEDIA_TARGET_PARALLEL`
 - `BOT_SEND_AS_DOCUMENT`
+- `BOT_SEND_CONCURRENCY`
 - `HEALTH_FILE`
 - `STALE_FILE_HOURS`
 

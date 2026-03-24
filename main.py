@@ -29,6 +29,7 @@ from tg_forwarder.snapshot import snapshot_album_messages as snapshot_album_mess
 from tg_forwarder.telegram_info import resolve_sender_info_from_message
 from tg_forwarder.utils import cleanup_files, json_bytes, log as base_log, now_ts, tstamp
 from tg_forwarder.verbose_flags import BOT_STARTUP_SMOKE_TEST, maybe_verbose_log
+from tg_forwarder.timefmt import append_original_time
 
 
 # ============================================================
@@ -123,6 +124,8 @@ producer: Optional[AIOKafkaProducer] = None
 text_consumer: Optional[AIOKafkaConsumer] = None
 media_consumer: Optional[AIOKafkaConsumer] = None
 bot: Optional[Bot] = None
+BOT_SEND_CONCURRENCY = max(1, int(os.getenv("BOT_SEND_CONCURRENCY", "1")))
+bot_send_semaphore = asyncio.Semaphore(BOT_SEND_CONCURRENCY)
 
 # Pending albums:
 # (source_kind, chat_id, grouped_id) -> {"messages": {msg_id: msg}, "task": asyncio.Task}
@@ -339,6 +342,7 @@ def job_media_type_from_info(info: dict) -> Optional[str]:
 
 async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, info: dict, source_kind: str) -> bool:
     if APP_MODE == "send" and bot is not None:
+        combined = append_original_time(combined, info.get("msg_date"))
         extra = {
             "route": route["name"], "dst": tgt, "src_msg": info["msg_id"], "chat_id": info["chat_id"],
             "chat_title": info["chat_title"], "sender_id": info["sender_id"], "sender_username": info["sender_username"],
@@ -346,7 +350,19 @@ async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, in
         }
         maybe_verbose_log(log, {"ts": tstamp(), "type": "info", "op": "send_text_attempt", **extra, "target": tgt, "text_preview": combined[:200]})
         try:
-            await bot_send_text(bot, tgt, combined)
+            async with bot_send_semaphore:
+                try:
+                    await bot_send_text(bot, tgt, combined)
+                except Exception as e:
+                    retry_after = getattr(e, "retry_after", None)
+                    if retry_after:
+                        await asyncio.sleep(float(retry_after) + 1)
+                        await bot_send_text(bot, tgt, combined)
+                    elif e.__class__.__name__ == "TimedOut":
+                        await asyncio.sleep(2)
+                        await bot_send_text(bot, tgt, combined)
+                    else:
+                        raise
             log({"ts": tstamp(), "type": "out", "op": "send_text", "status": "ok", **extra})
             return True
         except Exception as e:
@@ -357,6 +373,7 @@ async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, in
 
 async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, caption: str, info: dict, source_kind: str) -> bool:
     if APP_MODE == "send" and bot is not None:
+        caption = append_original_time(caption, info.get("msg_date"))
         extra = {
             "route": route["name"], "dst": tgt, "src_msg": info["msg_id"], "chat_id": info["chat_id"],
             "chat_title": info["chat_title"], "sender_id": info["sender_id"], "sender_username": info["sender_username"],
@@ -365,7 +382,19 @@ async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, capt
         media_kind = job_media_type_from_info(info)
         maybe_verbose_log(log, {"ts": tstamp(), "type": "info", "op": "send_file_attempt", **extra, "target": tgt, "media_kind": media_kind, "caption_preview": caption[:200]})
         try:
-            await bot_send_file(bot, tgt, str(fpath), caption, media_type=media_kind)
+            async with bot_send_semaphore:
+                try:
+                    await bot_send_file(bot, tgt, str(fpath), caption, media_type=media_kind)
+                except Exception as e:
+                    retry_after = getattr(e, "retry_after", None)
+                    if retry_after:
+                        await asyncio.sleep(float(retry_after) + 1)
+                        await bot_send_file(bot, tgt, str(fpath), caption, media_type=media_kind)
+                    elif e.__class__.__name__ == "TimedOut":
+                        await asyncio.sleep(2)
+                        await bot_send_file(bot, tgt, str(fpath), caption, media_type=media_kind)
+                    else:
+                        raise
             log({"ts": tstamp(), "type": "out", "op": "send_file", "status": "ok", **extra, "media_kind": media_kind})
             return True
         except Exception as e:
@@ -376,6 +405,7 @@ async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, capt
 
 async def send_album_to_target(route: Dict[str, Any], tgt: Any, files: List[str], caption: str, info: dict, source_kind: str) -> bool:
     if APP_MODE == "send" and bot is not None:
+        caption = append_original_time(caption, info.get("msg_date"))
         extra = {
             "route": route["name"], "dst": tgt, "src_msg": info["msg_id"], "chat_id": info["chat_id"],
             "chat_title": info["chat_title"], "sender_id": info["sender_id"], "sender_username": info["sender_username"],
@@ -384,7 +414,19 @@ async def send_album_to_target(route: Dict[str, Any], tgt: Any, files: List[str]
         try:
             media_types = [s.get("media_type") for s in info.get("_album_snapshots", [])] if isinstance(info.get("_album_snapshots"), list) else None
             maybe_verbose_log(log, {"ts": tstamp(), "type": "info", "op": "send_album_attempt", **extra, "target": tgt, "media_types": media_types, "caption_preview": caption[:200]})
-            await bot_send_album(bot, tgt, files, caption, media_types=media_types)
+            async with bot_send_semaphore:
+                try:
+                    await bot_send_album(bot, tgt, files, caption, media_types=media_types)
+                except Exception as e:
+                    retry_after = getattr(e, "retry_after", None)
+                    if retry_after:
+                        await asyncio.sleep(float(retry_after) + 1)
+                        await bot_send_album(bot, tgt, files, caption, media_types=media_types)
+                    elif e.__class__.__name__ == "TimedOut":
+                        await asyncio.sleep(2)
+                        await bot_send_album(bot, tgt, files, caption, media_types=media_types)
+                    else:
+                        raise
             log({"ts": tstamp(), "type": "out", "op": "send_album", "status": "ok", **extra})
             return True
         except Exception as e:
@@ -1224,6 +1266,7 @@ def print_route_summary():
             "sender": "telegram-bot",
             "text_target_parallel": TEXT_TARGET_PARALLEL,
             "media_target_parallel": MEDIA_TARGET_PARALLEL,
+            "bot_send_concurrency": BOT_SEND_CONCURRENCY,
             "has_bot_token": bool(TELEGRAM_BOT_TOKEN),
         })
 
