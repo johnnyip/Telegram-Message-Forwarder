@@ -457,7 +457,10 @@ async def process_text_job(job: dict) -> List[str]:
             "route": route.get("name"),
             "targets": route.get("targets"),
         })
-        results = await send_text_to_many_mod(route, route["targets"], combined, info, job["source_kind"], client=client, run_api=run_api, log=log, parallel=TEXT_TARGET_PARALLEL)
+        results = []
+        for tgt in route["targets"]:
+            ok = await send_text_to_target(route, tgt, combined, info, job["source_kind"])
+            results.append(ok)
         log({
             "ts": tstamp(),
             "type": "info",
