@@ -24,6 +24,7 @@ ENV TELETHON_NO_UPDATES_TIMEOUT=${TELETHON_NO_UPDATES_TIMEOUT}
 # patch Telethon _updates/messagebox.py
 RUN python - <<'PY'
 from pathlib import Path
+import re
 import telethon
 import os
 
@@ -32,20 +33,35 @@ timeout = os.environ["TELETHON_NO_UPDATES_TIMEOUT"]
 p = Path(telethon.__file__).resolve().parent / "_updates" / "messagebox.py"
 text = p.read_text(encoding="utf-8")
 
-old = "NO_UPDATES_TIMEOUT = 15 * 60"
-new = f"NO_UPDATES_TIMEOUT = {timeout}"
+pattern = r"NO_UPDATES_TIMEOUT\s*=\s*\d+\s*\*\s*\d+|NO_UPDATES_TIMEOUT\s*=\s*\d+"
+replacement = f"NO_UPDATES_TIMEOUT = {timeout}"
 
-if old not in text:
-    raise SystemExit(f"pattern not found in {p}")
+new_text, count = re.subn(pattern, replacement, text, count=1)
+if count != 1:
+    raise SystemExit(f"PATCH FAILED: NO_UPDATES_TIMEOUT not found in {p}")
 
-p.write_text(text.replace(old, new), encoding="utf-8")
-print(f"patched {p}: {new}")
+p.write_text(new_text, encoding="utf-8")
+
+# verify file content
+verify_text = p.read_text(encoding="utf-8")
+if replacement not in verify_text:
+    raise SystemExit(f"PATCH VERIFY FAILED in file {p}")
+
+print(f"patched {p}: {replacement}")
 PY
 
-# 驗證 patch 真係生效
+# 驗證 import 後真係生效，唔啱就直接 fail build
 RUN python - <<'PY'
+import os
 import telethon._updates.messagebox as mb
-print("VERIFY NO_UPDATES_TIMEOUT =", mb.NO_UPDATES_TIMEOUT)
+
+expected = int(os.environ["TELETHON_NO_UPDATES_TIMEOUT"])
+actual = mb.NO_UPDATES_TIMEOUT
+
+print("VERIFY NO_UPDATES_TIMEOUT =", actual)
+
+if actual != expected:
+    raise SystemExit(f"VERIFY FAILED: expected {expected}, got {actual}")
 PY
 
 # 再複製程式碼
