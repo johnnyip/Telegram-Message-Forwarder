@@ -429,14 +429,56 @@ async def process_text_job(job: dict) -> List[str]:
     body = job["text"]
     combined = f"{hdr}\n{body}"
 
-    routes = [ROUTE_MAP[name] for name in job["route_names"] if name in ROUTE_MAP]
+    route_names = job.get("route_names", [])
+    routes = [ROUTE_MAP[name] for name in route_names if name in ROUTE_MAP]
+    log({
+        "ts": tstamp(),
+        "type": "info",
+        "op": "process_text_job_start",
+        "chat_id": info.get("chat_id"),
+        "msg_id": info.get("msg_id"),
+        "route_names": route_names,
+        "resolved_routes": [r.get("name") for r in routes],
+        "text_preview": combined[:200],
+        "text_len": len(combined),
+    })
+
     success_count = 0
     total_count = 0
 
     for route in routes:
         total_count += len(route["targets"])
+        log({
+            "ts": tstamp(),
+            "type": "info",
+            "op": "process_text_job_route",
+            "chat_id": info.get("chat_id"),
+            "msg_id": info.get("msg_id"),
+            "route": route.get("name"),
+            "targets": route.get("targets"),
+        })
         results = await send_text_to_many_mod(route, route["targets"], combined, info, job["source_kind"], client=client, run_api=run_api, log=log, parallel=TEXT_TARGET_PARALLEL)
+        log({
+            "ts": tstamp(),
+            "type": "info",
+            "op": "process_text_job_route_results",
+            "chat_id": info.get("chat_id"),
+            "msg_id": info.get("msg_id"),
+            "route": route.get("name"),
+            "targets": route.get("targets"),
+            "results": results,
+        })
         success_count += sum(1 for ok in results if ok)
+
+    log({
+        "ts": tstamp(),
+        "type": "info",
+        "op": "process_text_job_done",
+        "chat_id": info.get("chat_id"),
+        "msg_id": info.get("msg_id"),
+        "total_count": total_count,
+        "success_count": success_count,
+    })
 
     if total_count > 0 and success_count == 0:
         raise RuntimeError(f"text job failed for all targets chat_id={info['chat_id']} msg_id={info['msg_id']}")
@@ -453,6 +495,16 @@ async def process_media_file_job(job: dict) -> List[str]:
     snapshot = job["snapshot"]
     info["_media_type"] = snapshot.get("media_type")
     fpath = Path(snapshot["path"])
+    log({
+        "ts": tstamp(),
+        "type": "info",
+        "op": "process_media_file_job_start",
+        "chat_id": info.get("chat_id"),
+        "msg_id": info.get("msg_id"),
+        "route_names": job.get("route_names", []),
+        "file": str(fpath),
+        "media_type": snapshot.get("media_type"),
+    })
     if not fpath.exists():
         log({
             "ts": tstamp(),
@@ -483,9 +535,28 @@ async def process_media_file_job(job: dict) -> List[str]:
     total_count = 0
 
     for route in routes:
+        log({
+            "ts": tstamp(),
+            "type": "info",
+            "op": "process_media_file_job_route",
+            "chat_id": info.get("chat_id"),
+            "msg_id": info.get("msg_id"),
+            "route": route.get("name"),
+            "targets": route.get("targets"),
+        })
         for tgt in route["targets"]:
             total_count += 1
             ok = await send_file_to_target(route, tgt, fpath, caption, info, job["source_kind"])
+            log({
+                "ts": tstamp(),
+                "type": "info",
+                "op": "process_media_file_job_target_result",
+                "chat_id": info.get("chat_id"),
+                "msg_id": info.get("msg_id"),
+                "route": route.get("name"),
+                "target": tgt,
+                "ok": ok,
+            })
             if ok:
                 success_count += 1
 
@@ -1118,7 +1189,8 @@ def print_route_summary():
             "sources": list(route["sources"]),
             "targets": route["targets"],
         })
-    print(json.dumps({
+
+    payload = {
         "startup": "ok",
         "app_mode": APP_MODE,
         "kafka_bootstrap_servers": KAFKA_BOOTSTRAP_SERVERS,
@@ -1127,18 +1199,31 @@ def print_route_summary():
         "kafka_consumer_group": KAFKA_CONSUMER_GROUP,
         "text_delay_seconds": DELAY_SECONDS,
         "media_delay_seconds": MEDIA_DELAY_SECONDS,
-        "download_concurrency": DOWNLOAD_CONCURRENCY,
-        "album_gather_seconds": ALBUM_GATHER_SECONDS,
-        "large_media_forward_threshold_mb": LARGE_MEDIA_FORWARD_THRESHOLD_MB,
-        "forward_policy": FORWARD_POLICY,
-        "listen_edited_messages": LISTEN_EDITED_MESSAGES,
-        "forwardable_source_chats": sorted(list(FORWARDABLE_SOURCE_CHATS)),
-        "nonforwardable_source_chats": sorted(list(NONFORWARDABLE_SOURCE_CHATS)),
         "delete_after_send": DELETE_AFTER_SEND,
         "ignore_users": sorted(list(IGNORE_USERS)),
         "ignore_ids": sorted(list(IGNORE_IDS)),
         "routes": summary,
-    }, ensure_ascii=False, indent=2))
+    }
+
+    if APP_MODE == "listen":
+        payload.update({
+            "download_concurrency": DOWNLOAD_CONCURRENCY,
+            "album_gather_seconds": ALBUM_GATHER_SECONDS,
+            "large_media_forward_threshold_mb": LARGE_MEDIA_FORWARD_THRESHOLD_MB,
+            "forward_policy": FORWARD_POLICY,
+            "listen_edited_messages": LISTEN_EDITED_MESSAGES,
+            "forwardable_source_chats": sorted(list(FORWARDABLE_SOURCE_CHATS)),
+            "nonforwardable_source_chats": sorted(list(NONFORWARDABLE_SOURCE_CHATS)),
+        })
+    elif APP_MODE == "send":
+        payload.update({
+            "sender": "telegram-bot",
+            "text_target_parallel": TEXT_TARGET_PARALLEL,
+            "media_target_parallel": MEDIA_TARGET_PARALLEL,
+            "has_bot_token": bool(TELEGRAM_BOT_TOKEN),
+        })
+
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 # ============================================================
 # Main
