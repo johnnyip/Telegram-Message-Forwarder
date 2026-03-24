@@ -1,5 +1,9 @@
+import os
 from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
+
+DISPLAY_TZ = os.getenv("DISPLAY_TIMEZONE") or os.getenv("TZ") or "Asia/Hong_Kong"
 
 
 def hhmm_from_msg_date(value: Optional[str]) -> Optional[str]:
@@ -7,7 +11,10 @@ def hhmm_from_msg_date(value: Optional[str]) -> Optional[str]:
         return None
     try:
         dt = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
-        return dt.strftime('%H:%M')
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo('UTC'))
+        local_dt = dt.astimezone(ZoneInfo(DISPLAY_TZ))
+        return local_dt.strftime('%H:%M')
     except Exception:
         return None
 

@@ -54,6 +54,8 @@ This is the safest design when send mode uses a bot token and should not depend 
 - `LOG_LEVEL`
 - `ENABLE_DEBUG_LOGS`
 - `TELETHON_DEBUG`
+- `TZ`
+- `DISPLAY_TIMEZONE`
 
 ### Listen-only
 - `APP_MODE=listen`
