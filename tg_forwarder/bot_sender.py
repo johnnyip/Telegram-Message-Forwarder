@@ -44,26 +44,33 @@ async def bot_send_text(bot: Bot, target, text: str):
 async def bot_send_file(bot: Bot, target, file_path: str, caption: str = "", media_type: Optional[str] = None):
     media_kind = guess_media_kind(file_path, media_type)
     p = Path(file_path)
+    last_error = None
     with p.open("rb") as fh:
-        async def _send(parse_mode=None):
-            if media_kind == "photo":
+        async def _send(kind: str, parse_mode=None):
+            if kind == "photo":
                 return await bot.send_photo(chat_id=target, photo=fh, caption=caption, parse_mode=parse_mode)
-            if media_kind == "video":
+            if kind == "video":
                 return await bot.send_video(chat_id=target, video=fh, caption=caption, parse_mode=parse_mode)
-            if media_kind == "animation":
+            if kind == "animation":
                 return await bot.send_animation(chat_id=target, animation=fh, caption=caption, parse_mode=parse_mode)
-            if media_kind == "audio":
+            if kind == "audio":
                 return await bot.send_audio(chat_id=target, audio=fh, caption=caption, parse_mode=parse_mode)
-            if media_kind == "voice":
+            if kind == "voice":
                 return await bot.send_voice(chat_id=target, voice=fh, caption=caption, parse_mode=parse_mode)
-            if media_kind == "video_note":
+            if kind == "video_note":
                 return await bot.send_video_note(chat_id=target, video_note=fh)
             return await bot.send_document(chat_id=target, document=fh, caption=caption, parse_mode=parse_mode)
-        try:
-            return await _send("Markdown")
-        except Exception:
-            fh.seek(0)
-            return await _send(None)
+
+        for kind, parse_mode in ((media_kind, "Markdown"), (media_kind, None), ("document", None)):
+            try:
+                fh.seek(0)
+                return await _send(kind, parse_mode)
+            except Exception as e:
+                last_error = e
+                continue
+    if last_error:
+        raise last_error
+    raise RuntimeError("bot_send_file failed without explicit exception")
 
 
 async def bot_send_album(bot: Bot, target, file_paths: List[str], caption: str = "", media_types: Optional[List[str]] = None):

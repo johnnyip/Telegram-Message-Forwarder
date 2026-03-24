@@ -343,12 +343,13 @@ async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, in
             "chat_title": info["chat_title"], "sender_id": info["sender_id"], "sender_username": info["sender_username"],
             "sender_display": info["sender_display"], "source_kind": source_kind,
         }
+        log({"ts": tstamp(), "type": "info", "op": "send_text_attempt", **extra, "target": tgt, "text_preview": combined[:200]})
         try:
             await bot_send_text(bot, tgt, combined)
             log({"ts": tstamp(), "type": "out", "op": "send_text", "status": "ok", **extra})
             return True
         except Exception as e:
-            log({"ts": tstamp(), "type": "err", "op": "send_text", "err": e.__class__.__name__, "msg": str(e), **extra, "target": tgt, "text_preview": combined[:200]})
+            log({"ts": tstamp(), "type": "err", "op": "send_text", "err": e.__class__.__name__, "msg": str(e), **extra, "target": tgt, "text_preview": combined[:200], "text_len": len(combined)})
             return False
     return await send_text_to_target_mod(route, tgt, combined, info, source_kind, client=client, run_api=run_api, log=log)
 
@@ -360,12 +361,14 @@ async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, capt
             "chat_title": info["chat_title"], "sender_id": info["sender_id"], "sender_username": info["sender_username"],
             "sender_display": info["sender_display"], "file": str(fpath), "source_kind": source_kind,
         }
+        media_kind = job_media_type_from_info(info)
+        log({"ts": tstamp(), "type": "info", "op": "send_file_attempt", **extra, "target": tgt, "media_kind": media_kind, "caption_preview": caption[:200]})
         try:
-            await bot_send_file(bot, tgt, str(fpath), caption, media_type=job_media_type_from_info(info))
-            log({"ts": tstamp(), "type": "out", "op": "send_file", "status": "ok", **extra})
+            await bot_send_file(bot, tgt, str(fpath), caption, media_type=media_kind)
+            log({"ts": tstamp(), "type": "out", "op": "send_file", "status": "ok", **extra, "media_kind": media_kind})
             return True
         except Exception as e:
-            log({"ts": tstamp(), "type": "err", "op": "send_file", "err": e.__class__.__name__, "msg": str(e), **extra, "target": tgt, "caption_preview": caption[:200]})
+            log({"ts": tstamp(), "type": "err", "op": "send_file", "err": e.__class__.__name__, "msg": str(e), **extra, "target": tgt, "caption_preview": caption[:200], "media_kind": media_kind})
             return False
     return await send_file_to_target_mod(route, tgt, fpath, caption, info, source_kind, client=client, run_api=run_api, log=log)
 
@@ -379,6 +382,7 @@ async def send_album_to_target(route: Dict[str, Any], tgt: Any, files: List[str]
         }
         try:
             media_types = [s.get("media_type") for s in info.get("_album_snapshots", [])] if isinstance(info.get("_album_snapshots"), list) else None
+            log({"ts": tstamp(), "type": "info", "op": "send_album_attempt", **extra, "target": tgt, "media_types": media_types, "caption_preview": caption[:200]})
             await bot_send_album(bot, tgt, files, caption, media_types=media_types)
             log({"ts": tstamp(), "type": "out", "op": "send_album", "status": "ok", **extra})
             return True
@@ -1179,6 +1183,13 @@ async def main():
             try:
                 me = await bot.get_me()
                 LOGGER.info("bot auth ok id=%s username=%s", getattr(me, "id", None), getattr(me, "username", None))
+                # startup smoke tests for known-good target types
+                for smoke_target in (-1003836445993, -1002548092183):
+                    try:
+                        r = await bot.send_message(chat_id=smoke_target, text="startup smoke test from tg-forwarder-send")
+                        LOGGER.info("bot startup smoke ok target=%s message_id=%s", smoke_target, getattr(r, "message_id", None))
+                    except Exception as smoke_err:
+                        LOGGER.warning("bot startup smoke failed target=%s err=%s msg=%s", smoke_target, smoke_err.__class__.__name__, str(smoke_err))
             except TelegramError as e:
                 LOGGER.warning("bot auth probe failed err=%s msg=%s", e.__class__.__name__, str(e))
             await startup_kafka_consumers()
