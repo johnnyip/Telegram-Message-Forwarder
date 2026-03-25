@@ -417,15 +417,15 @@ async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, capt
         try:
             async with bot_send_semaphore:
                 try:
-                    await bot_send_file(bot, tgt, str(fpath), caption, media_type=media_kind)
+                    await bot_send_file(bot, tgt, str(fpath), caption, media_type=media_kind, log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload}))
                 except Exception as e:
                     retry_after = getattr(e, "retry_after", None)
                     if retry_after:
                         await asyncio.sleep(float(retry_after) + 1)
-                        await bot_send_file(bot, tgt, str(fpath), caption, media_type=media_kind)
+                        await bot_send_file(bot, tgt, str(fpath), caption, media_type=media_kind, log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "retry": True}))
                     elif e.__class__.__name__ == "TimedOut":
                         await asyncio.sleep(2)
-                        await bot_send_file(bot, tgt, str(fpath), caption, media_type=media_kind)
+                        await bot_send_file(bot, tgt, str(fpath), caption, media_type=media_kind, log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "retry": True}))
                     else:
                         raise
             log({"ts": tstamp(), "type": "out", "op": "send_file", "status": "ok", **extra, "media_kind": media_kind})
@@ -449,30 +449,32 @@ async def send_album_to_target(route: Dict[str, Any], tgt: Any, files: List[str]
             maybe_verbose_log(log, {"ts": tstamp(), "type": "info", "op": "send_album_attempt", **extra, "target": tgt, "media_types": media_types, "caption_preview": caption[:200]})
             async with bot_send_semaphore:
                 try:
-                    await bot_send_album(bot, tgt, files, caption, media_types=media_types)
+                    await bot_send_album(bot, tgt, files, caption, media_types=media_types, log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload}))
                 except Exception as e:
                     retry_after = getattr(e, "retry_after", None)
                     if retry_after:
                         await asyncio.sleep(float(retry_after) + 1)
-                        await bot_send_album(bot, tgt, files, caption, media_types=media_types)
+                        await bot_send_album(bot, tgt, files, caption, media_types=media_types, log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "retry": True}))
                     elif e.__class__.__name__ == "TimedOut":
                         await asyncio.sleep(2)
-                        await bot_send_album(bot, tgt, files, caption, media_types=media_types)
+                        await bot_send_album(bot, tgt, files, caption, media_types=media_types, log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "retry": True}))
                     else:
                         raise
             log({"ts": tstamp(), "type": "out", "op": "send_album", "status": "ok", **extra})
             return True
         except Exception as e:
-            log({"ts": tstamp(), "type": "warn", "op": "send_album_fallback_to_single", "err": e.__class__.__name__, "msg": str(e), **extra})
+            log({"ts": tstamp(), "type": "warn", "op": "send_album_fallback_to_single", "err": e.__class__.__name__, "msg": str(e), **extra, "caption_preview": caption[:200], "media_types": media_types})
             ok_count = 0
             for idx, single in enumerate(files):
                 single_type = media_types[idx] if media_types and idx < len(media_types) else None
                 single_caption = caption if idx == 0 else ""
                 try:
-                    await bot_send_file(bot, tgt, single, single_caption, media_type=single_type)
+                    async with bot_send_semaphore:
+                        await bot_send_file(bot, tgt, single, single_caption, media_type=single_type, log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "fallback_single": True, "file": single, "media_type": single_type}))
+                    log({"ts": tstamp(), "type": "out", "op": "send_album_single_fallback", "status": "ok", "file": single, "target": tgt, "media_type": single_type, **extra})
                     ok_count += 1
                 except Exception as inner:
-                    log({"ts": tstamp(), "type": "err", "op": "send_album_single_fallback", "err": inner.__class__.__name__, "msg": str(inner), "file": single, "target": tgt, **extra})
+                    log({"ts": tstamp(), "type": "err", "op": "send_album_single_fallback", "err": inner.__class__.__name__, "msg": str(inner), "file": single, "target": tgt, "media_type": single_type, "caption_preview": single_caption[:200], **extra})
             return ok_count > 0
     return await send_album_to_target_mod(route, tgt, files, caption, info, source_kind, client=client, run_api=run_api, log=log)
 
@@ -929,6 +931,18 @@ async def media_consumer_loop():
             job = None
             try:
                 job = json.loads(record.value.decode("utf-8"))
+                maybe_debug_log(log, {
+                    "ts": tstamp(),
+                    "type": "debug",
+                    "op": "media_consumer_job_received",
+                    "job_type": job.get("job_type"),
+                    "source_kind": job.get("source_kind"),
+                    "chat_id": job.get("info", {}).get("chat_id") if isinstance(job.get("info"), dict) else None,
+                    "msg_id": job.get("info", {}).get("msg_id") if isinstance(job.get("info"), dict) else None,
+                    "grouped_id": job.get("info", {}).get("grouped_id") if isinstance(job.get("info"), dict) else None,
+                    "due_at": job.get("due_at"),
+                    "created_at": job.get("created_at"),
+                })
                 await sleep_until_due(job)
 
                 job_type = job.get("job_type")
@@ -944,6 +958,16 @@ async def media_consumer_loop():
                     raise RuntimeError(f"unknown media job_type={job_type}")
 
                 await media_consumer.commit()
+                maybe_debug_log(log, {
+                    "ts": tstamp(),
+                    "type": "debug",
+                    "op": "media_consumer_job_committed",
+                    "job_type": job.get("job_type") if isinstance(job, dict) else None,
+                    "chat_id": job.get("info", {}).get("chat_id") if isinstance(job, dict) and isinstance(job.get("info"), dict) else None,
+                    "msg_id": job.get("info", {}).get("msg_id") if isinstance(job, dict) and isinstance(job.get("info"), dict) else None,
+                    "grouped_id": job.get("info", {}).get("grouped_id") if isinstance(job, dict) and isinstance(job.get("info"), dict) else None,
+                    "cleanup_count": len(cleanup_paths),
+                })
 
                 if cleanup_paths:
                     cleanup_files(cleanup_paths, job.get("source_kind", "unknown"), job.get("info", {}).get("msg_id"), log)
