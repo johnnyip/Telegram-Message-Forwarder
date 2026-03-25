@@ -270,7 +270,7 @@ def can_attempt_large_forward(chat_id: int, info: dict) -> bool:
 
 
 def should_direct_forward_large_media(info: dict, msg) -> bool:
-    if APP_MODE == "listen":
+    if APP_MODE != "listen":
         return False
     size = get_media_size(msg)
     if size is None or size <= LARGE_MEDIA_FORWARD_THRESHOLD_BYTES:
@@ -279,7 +279,7 @@ def should_direct_forward_large_media(info: dict, msg) -> bool:
 
 
 def should_direct_forward_large_album(chat_id: int, info: dict, msgs: List[Any]) -> bool:
-    if APP_MODE == "listen":
+    if APP_MODE != "listen":
         return False
     if not can_attempt_large_forward(chat_id, info):
         return False
@@ -361,6 +361,8 @@ async def publish_album_job(msgs: List[Any], info: dict, routes: List[Dict[str, 
 
 TEXT_TARGET_PARALLEL = os.getenv("TEXT_TARGET_PARALLEL", "true").strip().lower() in {"1", "true", "yes", "y"}
 MEDIA_TARGET_PARALLEL = os.getenv("MEDIA_TARGET_PARALLEL", "false").strip().lower() in {"1", "true", "yes", "y"}
+BOT_ALBUM_MAX_TOTAL_MB = int(os.getenv("BOT_ALBUM_MAX_TOTAL_MB", "100"))
+BOT_ALBUM_MAX_TOTAL_BYTES = BOT_ALBUM_MAX_TOTAL_MB * 1024 * 1024
 
 
 def job_media_type_from_info(info: dict) -> Optional[str]:
@@ -446,7 +448,11 @@ async def send_album_to_target(route: Dict[str, Any], tgt: Any, files: List[str]
         }
         try:
             media_types = [s.get("media_type") for s in info.get("_album_snapshots", [])] if isinstance(info.get("_album_snapshots"), list) else None
-            maybe_verbose_log(log, {"ts": tstamp(), "type": "info", "op": "send_album_attempt", **extra, "target": tgt, "media_types": media_types, "caption_preview": caption[:200]})
+            total_size = sum(Path(p).stat().st_size for p in files if Path(p).exists())
+            has_large_video = any((mt == "video") for mt in (media_types or [])) and total_size > BOT_ALBUM_MAX_TOTAL_BYTES
+            maybe_verbose_log(log, {"ts": tstamp(), "type": "info", "op": "send_album_attempt", **extra, "target": tgt, "media_types": media_types, "caption_preview": caption[:200], "total_size": total_size, "album_max_total_bytes": BOT_ALBUM_MAX_TOTAL_BYTES})
+            if has_large_video:
+                raise RuntimeError(f"album_too_large_for_media_group total_size={total_size} threshold={BOT_ALBUM_MAX_TOTAL_BYTES}")
             async with bot_send_semaphore:
                 try:
                     await bot_send_album(bot, tgt, files, caption, media_types=media_types, log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload}))
@@ -460,7 +466,7 @@ async def send_album_to_target(route: Dict[str, Any], tgt: Any, files: List[str]
                         await bot_send_album(bot, tgt, files, caption, media_types=media_types, log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "retry": True}))
                     else:
                         raise
-            log({"ts": tstamp(), "type": "out", "op": "send_album", "status": "ok", **extra})
+            log({"ts": tstamp(), "type": "out", "op": "send_album", "status": "ok", **extra, "total_size": total_size})
             return True
         except Exception as e:
             log({"ts": tstamp(), "type": "warn", "op": "send_album_fallback_to_single", "err": e.__class__.__name__, "msg": str(e), **extra, "caption_preview": caption[:200], "media_types": media_types})
