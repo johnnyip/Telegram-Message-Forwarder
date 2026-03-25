@@ -1,35 +1,34 @@
 import os
 import asyncio
 from pathlib import Path
-from datetime import datetime
 import json
-import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
-from telethon import TelegramClient, events, errors, types
+from telethon import TelegramClient, events, errors
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 from telegram import Bot
 from telegram.error import TelegramError
 
-from tg_forwarder.bot_sender import bot_send_album, bot_send_file, bot_send_text
+from tg_forwarder.bot_runtime import send_album_via_bot, send_file_via_bot, send_text_via_bot
+from tg_forwarder.forwarding_policy import ForwardingPolicyConfig, should_direct_forward_large_album as should_direct_forward_large_album_mod, should_direct_forward_large_media as should_direct_forward_large_media_mod
 from tg_forwarder.file_policy import is_stale_file
 from tg_forwarder.healthcheck import default_health_path, write_health_file
-from tg_forwarder.debug_flags import ENABLE_DEBUG_LOGS, configure_telethon_logger, maybe_debug_log
+from tg_forwarder.debug_flags import configure_telethon_logger, maybe_debug_log
 from tg_forwarder.formatting import build_header_from_info, should_ignore
 from tg_forwarder.forward_cache import forward_cache_get, forward_cache_set
+from tg_forwarder.job_processing import JobProcessingContext, dispatch_media_job, process_text_job as process_text_job_mod
 from tg_forwarder.kafka_jobs import publish_album_job as publish_album_job_mod, publish_media_job as publish_media_job_mod, publish_text_job as publish_text_job_mod
 from tg_forwarder.lag_stats import lag_record, lag_summary
 from tg_forwarder.logging_setup import setup_logging
 from tg_forwarder.media import get_media_size, media_type
 from tg_forwarder.metrics import StepTimer
 from tg_forwarder.routes import find_matching_routes, load_routes
-from tg_forwarder.senders import fetch_message_by_id as fetch_message_by_id_mod, fetch_messages_by_ids as fetch_messages_by_ids_mod, send_album_to_target as send_album_to_target_mod, send_file_to_target as send_file_to_target_mod, send_text_to_many as send_text_to_many_mod, send_text_to_target as send_text_to_target_mod
+from tg_forwarder.senders import fetch_message_by_id as fetch_message_by_id_mod, fetch_messages_by_ids as fetch_messages_by_ids_mod, send_album_to_target as send_album_to_target_mod, send_file_to_target as send_file_to_target_mod, send_text_to_target as send_text_to_target_mod
 from tg_forwarder.snapshot import snapshot_album_messages as snapshot_album_messages_mod, snapshot_media_message as snapshot_media_message_mod
 from tg_forwarder.telegram_info import resolve_sender_info_from_message
 from tg_forwarder.utils import cleanup_files, json_bytes, log as base_log, now_ts, tstamp
-from tg_forwarder.verbose_flags import BOT_STARTUP_SMOKE_TEST, maybe_verbose_log
-from tg_forwarder.timefmt import append_original_time
+from tg_forwarder.verbose_flags import BOT_STARTUP_SMOKE_TEST
 
 
 # ============================================================
@@ -80,6 +79,7 @@ LARGE_MEDIA_FORWARD_THRESHOLD_BYTES = LARGE_MEDIA_FORWARD_THRESHOLD_MB * 1024 * 
 # never     -> never try direct forward for large media
 FORWARD_POLICY = os.getenv("FORWARD_POLICY", "auto").strip().lower()
 LISTEN_EDITED_MESSAGES = os.getenv("LISTEN_EDITED_MESSAGES", "true").strip().lower() in {"1", "true", "yes", "y"}
+ENABLE_DIRECT_FORWARD_JOBS = os.getenv("ENABLE_DIRECT_FORWARD_JOBS", "false").strip().lower() in {"1", "true", "yes", "y"}
 
 IGNORE_USERS = {
     u.strip().lower().lstrip("@")
@@ -130,6 +130,13 @@ bot_send_semaphore = asyncio.Semaphore(BOT_SEND_CONCURRENCY)
 # Pending albums:
 # (source_kind, chat_id, grouped_id) -> {"messages": {msg_id: msg}, "task": asyncio.Task}
 PENDING_ALBUMS: Dict[Tuple[str, int, int], dict] = {}
+FORWARDING_POLICY_CONFIG = ForwardingPolicyConfig(
+    threshold_bytes=LARGE_MEDIA_FORWARD_THRESHOLD_BYTES,
+    policy=FORWARD_POLICY,
+    allowlist=FORWARDABLE_SOURCE_CHATS,
+    denylist=NONFORWARDABLE_SOURCE_CHATS,
+    enable_direct_forward_jobs=ENABLE_DIRECT_FORWARD_JOBS,
+)
 
 
 # ============================================================
@@ -226,70 +233,25 @@ ROUTES = load_routes(os.getenv("ROUTES_JSON", ""))
 ROUTE_MAP = {r["name"]: r for r in ROUTES}
 
 
-# ============================================================
-# Forward auto-detect logic
-# ============================================================
-
-def message_or_chat_blocks_forward(info: dict) -> bool:
-    return bool(info.get("msg_noforwards")) or bool(info.get("chat_noforwards"))
-
-
-def can_attempt_large_forward(chat_id: int, info: dict) -> bool:
-    # Hard deny
-    if chat_id in NONFORWARDABLE_SOURCE_CHATS:
-        return False
-
-    # Raw flags already tell us no
-    if message_or_chat_blocks_forward(info):
-        return False
-
-    # Cache hit
-    cached = forward_cache_get(chat_id)
-    if cached is False:
-        return False
-    if cached is True:
-        return True
-
-    # Explicit policy
-    if FORWARD_POLICY == "never":
-        return False
-
-    if FORWARD_POLICY == "allowlist":
-        return chat_id in FORWARDABLE_SOURCE_CHATS
-
-    # auto
-    if FORWARD_POLICY == "auto":
-        # allowlist, if present, can still be used as strong allow
-        if FORWARDABLE_SOURCE_CHATS and chat_id in FORWARDABLE_SOURCE_CHATS:
-            return True
-        # unknown chat -> try once
-        return True
-
-    # fallback
-    return False
-
-
 def should_direct_forward_large_media(info: dict, msg) -> bool:
-    if APP_MODE != "listen":
-        return False
-    size = get_media_size(msg)
-    if size is None or size <= LARGE_MEDIA_FORWARD_THRESHOLD_BYTES:
-        return False
-    return can_attempt_large_forward(info["chat_id"], info)
+    return should_direct_forward_large_media_mod(
+        info,
+        msg,
+        config=FORWARDING_POLICY_CONFIG,
+        get_media_size=get_media_size,
+        forward_cache_get=forward_cache_get,
+    )
 
 
 def should_direct_forward_large_album(chat_id: int, info: dict, msgs: List[Any]) -> bool:
-    if APP_MODE != "listen":
-        return False
-    if not can_attempt_large_forward(chat_id, info):
-        return False
-
-    # Album: if any item > threshold, treat whole album as large forward candidate
-    for m in msgs:
-        size = get_media_size(m)
-        if size is not None and size > LARGE_MEDIA_FORWARD_THRESHOLD_BYTES:
-            return True
-    return False
+    return should_direct_forward_large_album_mod(
+        chat_id,
+        info,
+        msgs,
+        config=FORWARDING_POLICY_CONFIG,
+        get_media_size=get_media_size,
+        forward_cache_get=forward_cache_get,
+    )
 
 
 # ============================================================
@@ -355,133 +317,41 @@ async def publish_album_job(msgs: List[Any], info: dict, routes: List[Dict[str, 
     )
 
 
-# ============================================================
-# Send helpers
-# ============================================================
-
 TEXT_TARGET_PARALLEL = os.getenv("TEXT_TARGET_PARALLEL", "true").strip().lower() in {"1", "true", "yes", "y"}
 MEDIA_TARGET_PARALLEL = os.getenv("MEDIA_TARGET_PARALLEL", "false").strip().lower() in {"1", "true", "yes", "y"}
+BOT_UPLOAD_MAX_MB = int(os.getenv("BOT_UPLOAD_MAX_MB", "100"))
+BOT_UPLOAD_MAX_BYTES = BOT_UPLOAD_MAX_MB * 1024 * 1024
 BOT_ALBUM_MAX_TOTAL_MB = int(os.getenv("BOT_ALBUM_MAX_TOTAL_MB", "100"))
 BOT_ALBUM_MAX_TOTAL_BYTES = BOT_ALBUM_MAX_TOTAL_MB * 1024 * 1024
 
 
-def job_media_type_from_info(info: dict) -> Optional[str]:
-    if isinstance(info, dict):
-        if info.get("_media_type"):
-            return info.get("_media_type")
-        snaps = info.get("_album_snapshots")
-        if isinstance(snaps, list) and snaps:
-            return snaps[0].get("media_type")
-    return None
-
-
 async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, info: dict, source_kind: str) -> bool:
     if APP_MODE == "send" and bot is not None:
-        combined = append_original_time(combined, info.get("msg_date"))
-        extra = {
-            "route": route["name"], "dst": tgt, "src_msg": info["msg_id"], "chat_id": info["chat_id"],
-            "chat_title": info["chat_title"], "sender_id": info["sender_id"], "sender_username": info["sender_username"],
-            "sender_display": info["sender_display"], "source_kind": source_kind,
-        }
-        maybe_verbose_log(log, {"ts": tstamp(), "type": "info", "op": "send_text_attempt", **extra, "target": tgt, "text_preview": combined[:200]})
-        try:
-            async with bot_send_semaphore:
-                try:
-                    await bot_send_text(bot, tgt, combined)
-                except Exception as e:
-                    retry_after = getattr(e, "retry_after", None)
-                    if retry_after:
-                        await asyncio.sleep(float(retry_after) + 1)
-                        await bot_send_text(bot, tgt, combined)
-                    elif e.__class__.__name__ == "TimedOut":
-                        await asyncio.sleep(2)
-                        await bot_send_text(bot, tgt, combined)
-                    else:
-                        raise
-            log({"ts": tstamp(), "type": "out", "op": "send_text", "status": "ok", **extra})
-            return True
-        except Exception as e:
-            log({"ts": tstamp(), "type": "err", "op": "send_text", "err": e.__class__.__name__, "msg": str(e), **extra, "target": tgt, "text_preview": combined[:200], "text_len": len(combined)})
-            return False
+        return await send_text_via_bot(bot, tgt, combined, info, route, source_kind, bot_send_semaphore=bot_send_semaphore, log=log)
     return await send_text_to_target_mod(route, tgt, combined, info, source_kind, client=client, run_api=run_api, log=log)
 
 
 async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, caption: str, info: dict, source_kind: str) -> bool:
     if APP_MODE == "send" and bot is not None:
-        caption = append_original_time(caption, info.get("msg_date"))
-        extra = {
-            "route": route["name"], "dst": tgt, "src_msg": info["msg_id"], "chat_id": info["chat_id"],
-            "chat_title": info["chat_title"], "sender_id": info["sender_id"], "sender_username": info["sender_username"],
-            "sender_display": info["sender_display"], "file": str(fpath), "source_kind": source_kind,
-        }
-        media_kind = job_media_type_from_info(info)
-        maybe_verbose_log(log, {"ts": tstamp(), "type": "info", "op": "send_file_attempt", **extra, "target": tgt, "media_kind": media_kind, "caption_preview": caption[:200]})
-        try:
-            async with bot_send_semaphore:
-                try:
-                    await bot_send_file(bot, tgt, str(fpath), caption, media_type=media_kind, log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload}))
-                except Exception as e:
-                    retry_after = getattr(e, "retry_after", None)
-                    if retry_after:
-                        await asyncio.sleep(float(retry_after) + 1)
-                        await bot_send_file(bot, tgt, str(fpath), caption, media_type=media_kind, log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "retry": True}))
-                    elif e.__class__.__name__ == "TimedOut":
-                        await asyncio.sleep(2)
-                        await bot_send_file(bot, tgt, str(fpath), caption, media_type=media_kind, log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "retry": True}))
-                    else:
-                        raise
-            log({"ts": tstamp(), "type": "out", "op": "send_file", "status": "ok", **extra, "media_kind": media_kind})
-            return True
-        except Exception as e:
-            log({"ts": tstamp(), "type": "err", "op": "send_file", "err": e.__class__.__name__, "msg": str(e), **extra, "target": tgt, "caption_preview": caption[:200], "media_kind": media_kind})
-            return False
+        return await send_file_via_bot(bot, tgt, fpath, caption, info, route, source_kind, bot_send_semaphore=bot_send_semaphore, log=log, upload_max_bytes=BOT_UPLOAD_MAX_BYTES)
     return await send_file_to_target_mod(route, tgt, fpath, caption, info, source_kind, client=client, run_api=run_api, log=log)
 
 
 async def send_album_to_target(route: Dict[str, Any], tgt: Any, files: List[str], caption: str, info: dict, source_kind: str) -> bool:
     if APP_MODE == "send" and bot is not None:
-        caption = append_original_time(caption, info.get("msg_date"))
-        extra = {
-            "route": route["name"], "dst": tgt, "src_msg": info["msg_id"], "chat_id": info["chat_id"],
-            "chat_title": info["chat_title"], "sender_id": info["sender_id"], "sender_username": info["sender_username"],
-            "sender_display": info["sender_display"], "files": files, "source_kind": source_kind,
-        }
-        try:
-            media_types = [s.get("media_type") for s in info.get("_album_snapshots", [])] if isinstance(info.get("_album_snapshots"), list) else None
-            total_size = sum(Path(p).stat().st_size for p in files if Path(p).exists())
-            has_large_video = any((mt == "video") for mt in (media_types or [])) and total_size > BOT_ALBUM_MAX_TOTAL_BYTES
-            maybe_verbose_log(log, {"ts": tstamp(), "type": "info", "op": "send_album_attempt", **extra, "target": tgt, "media_types": media_types, "caption_preview": caption[:200], "total_size": total_size, "album_max_total_bytes": BOT_ALBUM_MAX_TOTAL_BYTES})
-            if has_large_video:
-                raise RuntimeError(f"album_too_large_for_media_group total_size={total_size} threshold={BOT_ALBUM_MAX_TOTAL_BYTES}")
-            async with bot_send_semaphore:
-                try:
-                    await bot_send_album(bot, tgt, files, caption, media_types=media_types, log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload}))
-                except Exception as e:
-                    retry_after = getattr(e, "retry_after", None)
-                    if retry_after:
-                        await asyncio.sleep(float(retry_after) + 1)
-                        await bot_send_album(bot, tgt, files, caption, media_types=media_types, log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "retry": True}))
-                    elif e.__class__.__name__ == "TimedOut":
-                        await asyncio.sleep(2)
-                        await bot_send_album(bot, tgt, files, caption, media_types=media_types, log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "retry": True}))
-                    else:
-                        raise
-            log({"ts": tstamp(), "type": "out", "op": "send_album", "status": "ok", **extra, "total_size": total_size})
-            return True
-        except Exception as e:
-            log({"ts": tstamp(), "type": "warn", "op": "send_album_fallback_to_single", "err": e.__class__.__name__, "msg": str(e), **extra, "caption_preview": caption[:200], "media_types": media_types})
-            ok_count = 0
-            for idx, single in enumerate(files):
-                single_type = media_types[idx] if media_types and idx < len(media_types) else None
-                single_caption = caption if idx == 0 else ""
-                try:
-                    async with bot_send_semaphore:
-                        await bot_send_file(bot, tgt, single, single_caption, media_type=single_type, log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "fallback_single": True, "file": single, "media_type": single_type}))
-                    log({"ts": tstamp(), "type": "out", "op": "send_album_single_fallback", "status": "ok", "file": single, "target": tgt, "media_type": single_type, **extra})
-                    ok_count += 1
-                except Exception as inner:
-                    log({"ts": tstamp(), "type": "err", "op": "send_album_single_fallback", "err": inner.__class__.__name__, "msg": str(inner), "file": single, "target": tgt, "media_type": single_type, "caption_preview": single_caption[:200], **extra})
-            return ok_count > 0
+        return await send_album_via_bot(
+            bot,
+            tgt,
+            files,
+            caption,
+            info,
+            route,
+            source_kind,
+            bot_send_semaphore=bot_send_semaphore,
+            album_max_total_bytes=BOT_ALBUM_MAX_TOTAL_BYTES,
+            upload_max_bytes=BOT_UPLOAD_MAX_BYTES,
+            log=log,
+        )
     return await send_album_to_target_mod(route, tgt, files, caption, info, source_kind, client=client, run_api=run_api, log=log)
 
 
@@ -497,397 +367,31 @@ async def fetch_messages_by_ids(chat_id: int, msg_ids: List[int]):
     return await fetch_messages_by_ids_mod(chat_id, msg_ids, client=client, log=log)
 
 
-# ============================================================
-# Kafka consumer side processing
-# Return cleanup paths to delete only AFTER commit.
-# ============================================================
-
-async def process_text_job(job: dict) -> List[str]:
-    info = job["info"]
-    if should_ignore(info, IGNORE_USERS, IGNORE_IDS):
-        log({"ts": tstamp(), "type": "info", "note": "ignored_text_job", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
-        return []
-
-    is_edit = job["source_kind"] == "edited"
-    hdr = build_header_from_info(info, is_edit=is_edit)
-    body = job["text"]
-    combined = f"{hdr}\n{body}"
-
-    route_names = job.get("route_names", [])
-    routes = [ROUTE_MAP[name] for name in route_names if name in ROUTE_MAP]
-    maybe_verbose_log(log, {
-        "ts": tstamp(),
-        "type": "info",
-        "op": "process_text_job_start",
-        "chat_id": info.get("chat_id"),
-        "msg_id": info.get("msg_id"),
-        "route_names": route_names,
-        "resolved_routes": [r.get("name") for r in routes],
-        "text_preview": combined[:200],
-        "text_len": len(combined),
-    })
-
-    success_count = 0
-    total_count = 0
-
-    for route in routes:
-        total_count += len(route["targets"])
-        maybe_verbose_log(log, {
-            "ts": tstamp(),
-            "type": "info",
-            "op": "process_text_job_route",
-            "chat_id": info.get("chat_id"),
-            "msg_id": info.get("msg_id"),
-            "route": route.get("name"),
-            "targets": route.get("targets"),
-        })
-        results = []
-        for tgt in route["targets"]:
-            ok = await send_text_to_target(route, tgt, combined, info, job["source_kind"])
-            results.append(ok)
-        maybe_verbose_log(log, {
-            "ts": tstamp(),
-            "type": "info",
-            "op": "process_text_job_route_results",
-            "chat_id": info.get("chat_id"),
-            "msg_id": info.get("msg_id"),
-            "route": route.get("name"),
-            "targets": route.get("targets"),
-            "results": results,
-        })
-        success_count += sum(1 for ok in results if ok)
-
-    maybe_verbose_log(log, {
-        "ts": tstamp(),
-        "type": "info",
-        "op": "process_text_job_done",
-        "chat_id": info.get("chat_id"),
-        "msg_id": info.get("msg_id"),
-        "total_count": total_count,
-        "success_count": success_count,
-    })
-
-    if total_count > 0 and success_count == 0:
-        raise RuntimeError(f"text job failed for all targets chat_id={info['chat_id']} msg_id={info['msg_id']}")
-
-    return []
-
-
-async def process_media_file_job(job: dict) -> List[str]:
-    info = job["info"]
-    if should_ignore(info, IGNORE_USERS, IGNORE_IDS):
-        log({"ts": tstamp(), "type": "info", "note": "ignored_media_file_job", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
-        return []
-
-    snapshot = job["snapshot"]
-    info["_media_type"] = snapshot.get("media_type")
-    fpath = Path(snapshot["path"])
-    maybe_verbose_log(log, {
-        "ts": tstamp(),
-        "type": "info",
-        "op": "process_media_file_job_start",
-        "chat_id": info.get("chat_id"),
-        "msg_id": info.get("msg_id"),
-        "route_names": job.get("route_names", []),
-        "file": str(fpath),
-        "media_type": snapshot.get("media_type"),
-    })
-    if not fpath.exists():
-        log({
-            "ts": tstamp(),
-            "type": "err",
-            "op": "media_file_missing",
-            "chat_id": info["chat_id"],
-            "msg_id": info["msg_id"],
-            "file": str(fpath),
-        })
-        return []
-    if is_stale_file(str(fpath)):
-        log({
-            "ts": tstamp(),
-            "type": "warn",
-            "op": "media_file_stale",
-            "chat_id": info["chat_id"],
-            "msg_id": info["msg_id"],
-            "file": str(fpath),
-        })
-
-    is_edit = job["source_kind"] == "edited"
-    hdr = build_header_from_info(info, is_edit=is_edit)
-    caption_body = snapshot.get("caption_text", "").strip()
-    caption = f"{hdr}\n{caption_body}".strip()
-
-    routes = [ROUTE_MAP[name] for name in job["route_names"] if name in ROUTE_MAP]
-    success_count = 0
-    total_count = 0
-
-    for route in routes:
-        maybe_verbose_log(log, {
-            "ts": tstamp(),
-            "type": "info",
-            "op": "process_media_file_job_route",
-            "chat_id": info.get("chat_id"),
-            "msg_id": info.get("msg_id"),
-            "route": route.get("name"),
-            "targets": route.get("targets"),
-        })
-        for tgt in route["targets"]:
-            total_count += 1
-            ok = await send_file_to_target(route, tgt, fpath, caption, info, job["source_kind"])
-            maybe_verbose_log(log, {
-                "ts": tstamp(),
-                "type": "info",
-                "op": "process_media_file_job_target_result",
-                "chat_id": info.get("chat_id"),
-                "msg_id": info.get("msg_id"),
-                "route": route.get("name"),
-                "target": tgt,
-                "ok": ok,
-            })
-            if ok:
-                success_count += 1
-
-    if total_count > 0 and success_count == 0:
-        raise RuntimeError(f"media_file job failed for all targets chat_id={info['chat_id']} msg_id={info['msg_id']}")
-
-    return [str(fpath)] if DELETE_AFTER_SEND else []
-
-
-async def process_media_album_file_job(job: dict) -> List[str]:
-    info = job["info"]
-    if should_ignore(info, IGNORE_USERS, IGNORE_IDS):
-        log({"ts": tstamp(), "type": "info", "note": "ignored_media_album_file_job", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
-        return []
-
-    snapshots = job["snapshots"]
-    files = [s["path"] for s in snapshots if Path(s["path"]).exists()]
-    info["_album_snapshots"] = snapshots
-    if not files:
-        log({
-            "ts": tstamp(),
-            "type": "err",
-            "op": "media_album_files_missing",
-            "chat_id": info["chat_id"],
-            "grouped_id": info.get("grouped_id"),
-        })
-        return []
-    stale_files = [f for f in files if is_stale_file(f)]
-    if stale_files:
-        log({
-            "ts": tstamp(),
-            "type": "warn",
-            "op": "media_album_files_stale",
-            "chat_id": info["chat_id"],
-            "grouped_id": info.get("grouped_id"),
-            "count": len(stale_files),
-        })
-
-    is_edit = job["source_kind"] == "edited"
-    hdr = build_header_from_info(info, is_edit=is_edit)
-    caption_body = snapshots[0].get("caption_text", "").strip() if snapshots else ""
-    caption = f"{hdr}\n{caption_body}".strip()
-
-    routes = [ROUTE_MAP[name] for name in job["route_names"] if name in ROUTE_MAP]
-    success_count = 0
-    total_count = 0
-
-    for route in routes:
-        for tgt in route["targets"]:
-            total_count += 1
-            ok = await send_album_to_target(route, tgt, files, caption, info, job["source_kind"])
-            if ok:
-                success_count += 1
-
-    if total_count > 0 and success_count == 0:
-        raise RuntimeError(f"media_album_file job failed for all targets chat_id={info['chat_id']} grouped_id={info.get('grouped_id')}")
-
-    return files if DELETE_AFTER_SEND else []
-
-
-async def process_media_forward_job(job: dict) -> List[str]:
-    info = job["info"]
-    if should_ignore(info, IGNORE_USERS, IGNORE_IDS):
-        log({"ts": tstamp(), "type": "info", "note": "ignored_media_forward_job", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
-        return []
-
-    if APP_MODE == "send" and bot is not None:
-        log({"ts": tstamp(), "type": "warn", "op": "media_forward_job_unsupported_in_bot_mode", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
-        return []
-
-    msg = await fetch_message_by_id(job["chat_id"], job["msg_id"])
-    if not msg:
-        log({
-            "ts": tstamp(),
-            "type": "err",
-            "op": "media_forward_fetch_failed",
-            "chat_id": job["chat_id"],
-            "msg_id": job["msg_id"],
-        })
-        return []
-
-    is_edit = job["source_kind"] == "edited"
-    hdr = build_header_from_info(info, is_edit=is_edit)
-    routes = [ROUTE_MAP[name] for name in job["route_names"] if name in ROUTE_MAP]
-
-    success_count = 0
-    total_count = 0
-
-    try:
-        for route in routes:
-            for tgt in route["targets"]:
-                total_count += 1
-                extra = {
-                    "route": route["name"],
-                    "dst": tgt,
-                    "src_msg": info["msg_id"],
-                    "chat_id": info["chat_id"],
-                    "chat_title": info["chat_title"],
-                    "sender_id": info["sender_id"],
-                    "sender_username": info["sender_username"],
-                    "sender_display": info["sender_display"],
-                    "source_kind": job["source_kind"],
-                    "media_size": job.get("media_size"),
-                    "media_type": job.get("media_type"),
-                }
-                await run_api(client.send_message(tgt, hdr), op="send_header_before_forward_large", extra=extra)
-                await run_api(client.forward_messages(tgt, msg, msg.peer_id), op="forward_large_media", extra=extra)
-
-                log({
-                    "ts": tstamp(),
-                    "type": "out",
-                    "op": "forward_large_media",
-                    "status": "ok",
-                    **extra,
-                })
-                success_count += 1
-
-        if success_count > 0:
-            forward_cache_set(info["chat_id"], True)
-
-        if total_count > 0 and success_count == 0:
-            raise RuntimeError(f"media_forward job failed for all targets chat_id={info['chat_id']} msg_id={info['msg_id']}")
-
-        return []
-
-    except errors.ChatForwardsRestrictedError:
-        forward_cache_set(info["chat_id"], False)
-        log({
-            "ts": tstamp(),
-            "type": "warn",
-            "op": "forward_large_media",
-            "note": "chat_forwards_restricted_fallback_to_download",
-            "chat_id": info["chat_id"],
-            "msg_id": info["msg_id"],
-        })
-
-        snapshot = await snapshot_media_message(msg, info, job["source_kind"])
-        if not snapshot:
-            return []
-
-        fallback_job = {
-            "job_type": "media_file",
-            "source_kind": job["source_kind"],
-            "route_names": job["route_names"],
-            "info": info,
-            "snapshot": snapshot,
-        }
-        return await process_media_file_job(fallback_job)
-
-
-async def process_media_album_forward_job(job: dict) -> List[str]:
-    info = job["info"]
-    if should_ignore(info, IGNORE_USERS, IGNORE_IDS):
-        log({"ts": tstamp(), "type": "info", "note": "ignored_media_album_forward_job", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
-        return []
-
-    if APP_MODE == "send" and bot is not None:
-        log({"ts": tstamp(), "type": "warn", "op": "media_album_forward_job_unsupported_in_bot_mode", "chat_id": info["chat_id"], "grouped_id": info.get("grouped_id")})
-        return []
-
-    msgs = await fetch_messages_by_ids(job["chat_id"], job["msg_ids"])
-    msgs = sorted([m for m in msgs if m], key=lambda m: m.id)
-    if not msgs:
-        log({
-            "ts": tstamp(),
-            "type": "err",
-            "op": "media_album_forward_fetch_failed",
-            "chat_id": job["chat_id"],
-            "msg_ids": job["msg_ids"],
-        })
-        return []
-
-    is_edit = job["source_kind"] == "edited"
-    hdr = build_header_from_info(info, is_edit=is_edit)
-    routes = [ROUTE_MAP[name] for name in job["route_names"] if name in ROUTE_MAP]
-
-    success_count = 0
-    total_count = 0
-
-    try:
-        for route in routes:
-            for tgt in route["targets"]:
-                total_count += 1
-                extra = {
-                    "route": route["name"],
-                    "dst": tgt,
-                    "chat_id": info["chat_id"],
-                    "chat_title": info["chat_title"],
-                    "sender_id": info["sender_id"],
-                    "sender_username": info["sender_username"],
-                    "sender_display": info["sender_display"],
-                    "source_kind": job["source_kind"],
-                    "msg_ids": job["msg_ids"],
-                    "grouped_id": info.get("grouped_id"),
-                }
-                await run_api(client.send_message(tgt, hdr), op="send_header_before_forward_album", extra=extra)
-                await run_api(client.forward_messages(tgt, msgs, msgs[0].peer_id), op="forward_large_album", extra=extra)
-
-                log({
-                    "ts": tstamp(),
-                    "type": "out",
-                    "op": "forward_large_album",
-                    "status": "ok",
-                    **extra,
-                })
-                success_count += 1
-
-        if success_count > 0:
-            forward_cache_set(info["chat_id"], True)
-
-        if total_count > 0 and success_count == 0:
-            raise RuntimeError(f"media_album_forward job failed for all targets chat_id={info['chat_id']} grouped_id={info.get('grouped_id')}")
-
-        return []
-
-    except errors.ChatForwardsRestrictedError:
-        forward_cache_set(info["chat_id"], False)
-        log({
-            "ts": tstamp(),
-            "type": "warn",
-            "op": "forward_large_album",
-            "note": "chat_forwards_restricted_fallback_to_download",
-            "chat_id": info["chat_id"],
-            "grouped_id": info.get("grouped_id"),
-            "msg_ids": job["msg_ids"],
-        })
-
-        snapshots = await snapshot_album_messages(msgs, info, job["source_kind"])
-        if not snapshots:
-            return []
-
-        fallback_job = {
-            "job_type": "media_album_file",
-            "source_kind": job["source_kind"],
-            "route_names": job["route_names"],
-            "info": info,
-            "snapshots": snapshots,
-        }
-        return await process_media_album_file_job(fallback_job)
-
-
-# ============================================================
-# Kafka consumer loops
-# ============================================================
+def build_job_processing_ctx() -> JobProcessingContext:
+    return JobProcessingContext(
+        app_mode=APP_MODE,
+        bot=bot,
+        client=client,
+        route_map=ROUTE_MAP,
+        ignore_users=IGNORE_USERS,
+        ignore_ids=IGNORE_IDS,
+        delete_after_send=DELETE_AFTER_SEND,
+        text_target_parallel=TEXT_TARGET_PARALLEL,
+        media_target_parallel=MEDIA_TARGET_PARALLEL,
+        log=log,
+        should_ignore=should_ignore,
+        build_header_from_info=build_header_from_info,
+        is_stale_file=is_stale_file,
+        send_text_to_target=send_text_to_target,
+        send_file_to_target=send_file_to_target,
+        send_album_to_target=send_album_to_target,
+        fetch_message_by_id=fetch_message_by_id,
+        fetch_messages_by_ids=fetch_messages_by_ids,
+        run_api=run_api,
+        snapshot_media_message=snapshot_media_message,
+        snapshot_album_messages=snapshot_album_messages,
+        forward_cache_set=forward_cache_set,
+    )
 
 async def sleep_until_due(job: dict):
     due_at = float(job.get("due_at", now_ts()))
@@ -910,7 +414,7 @@ async def text_consumer_loop():
             try:
                 job = json.loads(record.value.decode("utf-8"))
                 await sleep_until_due(job)
-                cleanup_paths = await process_text_job(job)
+                cleanup_paths = await process_text_job_mod(job, build_job_processing_ctx())
                 await text_consumer.commit()
 
                 if cleanup_paths:
@@ -950,18 +454,7 @@ async def media_consumer_loop():
                     "created_at": job.get("created_at"),
                 })
                 await sleep_until_due(job)
-
-                job_type = job.get("job_type")
-                if job_type == "media_file":
-                    cleanup_paths = await process_media_file_job(job)
-                elif job_type == "media_forward":
-                    cleanup_paths = await process_media_forward_job(job)
-                elif job_type == "media_album_file":
-                    cleanup_paths = await process_media_album_file_job(job)
-                elif job_type == "media_album_forward":
-                    cleanup_paths = await process_media_album_forward_job(job)
-                else:
-                    raise RuntimeError(f"unknown media job_type={job_type}")
+                cleanup_paths = await dispatch_media_job(job, build_job_processing_ctx())
 
                 await media_consumer.commit()
                 maybe_debug_log(log, {
@@ -1320,6 +813,7 @@ def print_route_summary():
             "album_gather_seconds": ALBUM_GATHER_SECONDS,
             "large_media_forward_threshold_mb": LARGE_MEDIA_FORWARD_THRESHOLD_MB,
             "forward_policy": FORWARD_POLICY,
+            "enable_direct_forward_jobs": ENABLE_DIRECT_FORWARD_JOBS,
             "listen_edited_messages": LISTEN_EDITED_MESSAGES,
             "forwardable_source_chats": sorted(list(FORWARDABLE_SOURCE_CHATS)),
             "nonforwardable_source_chats": sorted(list(NONFORWARDABLE_SOURCE_CHATS)),

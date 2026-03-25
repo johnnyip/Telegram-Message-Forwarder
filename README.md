@@ -30,6 +30,7 @@ In the current split architecture, the listen side prefers turning media into lo
 - `media_album_file`
 
 This is the safest design when send mode uses a bot token and should not depend on source-side Telethon session access.
+Direct-forward Kafka jobs are therefore disabled by default; `ENABLE_DIRECT_FORWARD_JOBS=true` is an explicit override for non-default deployments that can actually consume those jobs.
 
 ## Important environment variables
 
@@ -63,6 +64,7 @@ This is the safest design when send mode uses a bot token and should not depend 
 - `API_HASH`
 - `SESSION_NAME`
 - `LISTEN_EDITED_MESSAGES`
+- `ENABLE_DIRECT_FORWARD_JOBS`
 
 ### Send-only
 - `APP_MODE=send`
