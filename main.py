@@ -31,7 +31,7 @@ from tg_forwarder.delivery.senders import fetch_message_by_id as fetch_message_b
 from tg_forwarder.processing.snapshot import snapshot_album_messages as snapshot_album_messages_mod, snapshot_media_message as snapshot_media_message_mod
 from tg_forwarder.domain.telegram_info import resolve_sender_info_from_message
 from tg_forwarder.storage.send_journal import journal_get, journal_mark
-from tg_forwarder.core.utils import cleanup_files, cleanup_retained_files, json_bytes, log as base_log, now_ts, tstamp
+from tg_forwarder.core.utils import cleanup_files, cleanup_logs, cleanup_retained_files, json_bytes, log as base_log, now_ts, tstamp
 from tg_forwarder.runtime.verbose_flags import BOT_STARTUP_SMOKE_TEST
 
 
@@ -996,6 +996,7 @@ async def main():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     SPOOL_DIR.mkdir(parents=True, exist_ok=True)
     RETAIN_DIR.mkdir(parents=True, exist_ok=True)
+    cleanup_logs(LOG_DIR, log)
     cleanup_retained_files(RETAIN_DIR, log)
 
     print_route_summary()

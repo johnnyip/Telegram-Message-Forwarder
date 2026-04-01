@@ -53,6 +53,38 @@ def json_bytes(obj: dict) -> bytes:
 
 
 RETAIN_FILE_MAX_AGE_HOURS = int(os.getenv("RETAIN_FILE_MAX_AGE_HOURS", "168"))
+LOG_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "7"))
+
+
+def cleanup_logs(log_dir: Path, logger):
+    cutoff_seconds = LOG_RETENTION_DAYS * 86400
+    now = time.time()
+    if not log_dir.exists():
+        return
+    for path in log_dir.glob("*.log"):
+        if not path.is_file():
+            continue
+        try:
+            age_seconds = now - path.stat().st_mtime
+            if age_seconds <= cutoff_seconds:
+                continue
+            path.unlink(missing_ok=True)
+            logger({
+                "ts": tstamp(),
+                "type": "cleanup",
+                "op": "delete_old_log_file",
+                "file": str(path),
+                "age_days": round(age_seconds / 86400, 2),
+            })
+        except Exception as e:
+            logger({
+                "ts": tstamp(),
+                "type": "warn",
+                "op": "delete_old_log_file",
+                "file": str(path),
+                "err": e.__class__.__name__,
+                "msg": str(e),
+            })
 
 
 def cleanup_retained_files(retain_dir: Path, logger):
@@ -114,7 +146,9 @@ def cleanup_files(paths: List[str], source_kind: str, src_msg: Any, logger):
 
 
 __all__ = [
+    "LOG_RETENTION_DAYS",
     "RETAIN_FILE_MAX_AGE_HOURS",
+    "cleanup_logs",
     "cleanup_files",
     "cleanup_retained_files",
     "json_bytes",
