@@ -28,7 +28,8 @@ from tg_forwarder.routes import find_matching_routes, load_routes
 from tg_forwarder.senders import fetch_message_by_id as fetch_message_by_id_mod, fetch_messages_by_ids as fetch_messages_by_ids_mod, send_album_to_target as send_album_to_target_mod, send_file_to_target as send_file_to_target_mod, send_text_to_target as send_text_to_target_mod
 from tg_forwarder.snapshot import snapshot_album_messages as snapshot_album_messages_mod, snapshot_media_message as snapshot_media_message_mod
 from tg_forwarder.telegram_info import resolve_sender_info_from_message
-from tg_forwarder.utils import cleanup_files, json_bytes, log as base_log, now_ts, tstamp
+from tg_forwarder.send_journal import journal_get, journal_mark
+from tg_forwarder.utils import cleanup_files, cleanup_retained_files, json_bytes, log as base_log, now_ts, tstamp
 from tg_forwarder.verbose_flags import BOT_STARTUP_SMOKE_TEST
 
 
@@ -265,6 +266,21 @@ def dedup_key_for_album(chat_id: int, grouped_id: int, source_kind: str) -> str:
     return f"album:{chat_id}:{grouped_id}:{source_kind}"
 
 
+def job_fingerprint(job: dict) -> str:
+    job_type = job.get("job_type", "unknown")
+    source_kind = job.get("source_kind", "unknown")
+    info = job.get("info", {}) if isinstance(job.get("info"), dict) else {}
+    chat_id = info.get("chat_id") or job.get("chat_id")
+    grouped_id = info.get("grouped_id")
+    msg_id = info.get("msg_id") or job.get("msg_id")
+    if grouped_id is not None:
+        return f"{job_type}:{chat_id}:group:{grouped_id}:{source_kind}"
+    if isinstance(job.get("msg_ids"), list) and job.get("msg_ids"):
+        msg_ids = ",".join(str(x) for x in job.get("msg_ids"))
+        return f"{job_type}:{chat_id}:msgs:{msg_ids}:{source_kind}"
+    return f"{job_type}:{chat_id}:msg:{msg_id}:{source_kind}"
+
+
 # ============================================================
 # Snapshot / spool
 # ============================================================
@@ -425,8 +441,31 @@ async def text_consumer_loop():
             try:
                 job = json.loads(record.value.decode("utf-8"))
                 await sleep_until_due(job)
+                fingerprint = job_fingerprint(job)
+                existing = journal_get(fingerprint)
+                if existing and existing.get("status") == "done":
+                    log({
+                        "ts": tstamp(),
+                        "type": "info",
+                        "op": "skip_text_job_from_journal",
+                        "fingerprint": fingerprint,
+                        "job_type": job.get("job_type"),
+                        "chat_id": job.get("info", {}).get("chat_id"),
+                        "msg_id": job.get("info", {}).get("msg_id"),
+                    })
+                    await text_consumer.commit()
+                    continue
+
                 cleanup_paths = await process_text_job_mod(job, build_job_processing_ctx())
                 await text_consumer.commit()
+                journal_mark(fingerprint, {
+                    "status": "done",
+                    "job_type": job.get("job_type"),
+                    "chat_id": job.get("info", {}).get("chat_id"),
+                    "msg_id": job.get("info", {}).get("msg_id"),
+                    "source_kind": job.get("source_kind"),
+                    "outcome": "text_sent",
+                })
 
                 if cleanup_paths:
                     cleanup_files(cleanup_paths, job.get("source_kind", "unknown"), job.get("info", {}).get("msg_id"), log)
@@ -464,10 +503,35 @@ async def media_consumer_loop():
                     "due_at": job.get("due_at"),
                     "created_at": job.get("created_at"),
                 })
+                fingerprint = job_fingerprint(job)
+                existing = journal_get(fingerprint)
+                if existing and existing.get("status") == "done":
+                    log({
+                        "ts": tstamp(),
+                        "type": "info",
+                        "op": "skip_media_job_from_journal",
+                        "fingerprint": fingerprint,
+                        "job_type": job.get("job_type"),
+                        "chat_id": job.get("info", {}).get("chat_id") if isinstance(job.get("info"), dict) else None,
+                        "msg_id": job.get("info", {}).get("msg_id") if isinstance(job.get("info"), dict) else None,
+                        "grouped_id": job.get("info", {}).get("grouped_id") if isinstance(job.get("info"), dict) else None,
+                    })
+                    await media_consumer.commit()
+                    continue
+
                 await sleep_until_due(job)
                 cleanup_paths = await dispatch_media_job(job, build_job_processing_ctx())
 
                 await media_consumer.commit()
+                journal_mark(fingerprint, {
+                    "status": "done",
+                    "job_type": job.get("job_type"),
+                    "chat_id": job.get("info", {}).get("chat_id") if isinstance(job.get("info"), dict) else None,
+                    "msg_id": job.get("info", {}).get("msg_id") if isinstance(job.get("info"), dict) else None,
+                    "grouped_id": job.get("info", {}).get("grouped_id") if isinstance(job.get("info"), dict) else None,
+                    "source_kind": job.get("source_kind"),
+                    "outcome": "cleanup_pending" if cleanup_paths else "retained_or_forwarded",
+                })
                 maybe_debug_log(log, {
                     "ts": tstamp(),
                     "type": "debug",
@@ -897,6 +961,7 @@ async def main():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     SPOOL_DIR.mkdir(parents=True, exist_ok=True)
     RETAIN_DIR.mkdir(parents=True, exist_ok=True)
+    cleanup_retained_files(RETAIN_DIR, log)
 
     print_route_summary()
     touch_health(f"starting:{APP_MODE}")

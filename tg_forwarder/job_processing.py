@@ -21,7 +21,7 @@ def _retain_path(original: Path) -> Path:
     return original.parent / RETAIN_DIRNAME / original.name
 
 
-def retain_file(path: Path, ctx: JobProcessingContext, *, info: dict, kind: str) -> Path:
+def retain_file(path: Path, ctx, *, info: dict, kind: str) -> Path:
     target = _retain_path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     if path.resolve() == target.resolve():
