@@ -15,6 +15,7 @@ from tg_forwarder.forwarding_policy import ForwardingPolicyConfig, should_direct
 from tg_forwarder.file_policy import is_stale_file
 from tg_forwarder.healthcheck import default_health_path, write_health_file
 from tg_forwarder.debug_flags import configure_telethon_logger, maybe_debug_log
+from tg_forwarder.dedup_cache import dedup_mark, dedup_seen
 from tg_forwarder.formatting import build_header_from_info, should_ignore
 from tg_forwarder.forward_cache import forward_cache_get, forward_cache_set
 from tg_forwarder.job_processing import JobProcessingContext, dispatch_media_job, process_text_job as process_text_job_mod
@@ -45,6 +46,7 @@ API_ID = int(API_ID_RAW) if API_ID_RAW else None
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads")).expanduser()
 LOG_DIR = DOWNLOAD_DIR / "log"
 SPOOL_DIR = DOWNLOAD_DIR / "_spool"
+RETAIN_DIR = DOWNLOAD_DIR / "retained"
 
 # Delay
 DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "5"))                  # text send delay
@@ -106,6 +108,7 @@ NONFORWARDABLE_SOURCE_CHATS = {
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 SPOOL_DIR.mkdir(parents=True, exist_ok=True)
+RETAIN_DIR.mkdir(parents=True, exist_ok=True)
 
 LOGGER = setup_logging()
 configure_telethon_logger()
@@ -252,6 +255,14 @@ def should_direct_forward_large_album(chat_id: int, info: dict, msgs: List[Any])
         get_media_size=get_media_size,
         forward_cache_get=forward_cache_get,
     )
+
+
+def dedup_key_for_message(info: dict, source_kind: str) -> str:
+    return f"media:{info.get('chat_id')}:{info.get('msg_id')}:{source_kind}"
+
+
+def dedup_key_for_album(chat_id: int, grouped_id: int, source_kind: str) -> str:
+    return f"album:{chat_id}:{grouped_id}:{source_kind}"
 
 
 # ============================================================
@@ -538,6 +549,7 @@ async def flush_album(source_kind: str, chat_id: int, grouped_id: int):
     })
 
     await publish_album_job(msgs, info, routes, source_kind)
+    dedup_mark(dedup_key_for_album(info["chat_id"], grouped_id, source_kind))
 
 
 def add_to_album_buffer(msg, source_kind: str):
@@ -573,6 +585,34 @@ async def handle_incoming_message(msg, source_kind: str):
     msg_date_obj = getattr(msg, "date", None)
     edit_date_obj = getattr(msg, "edit_date", None)
     event_now = now_ts()
+
+    if msg.media is not None:
+        grouped_id = getattr(msg, "grouped_id", None)
+        if grouped_id is not None:
+            album_key = dedup_key_for_album(getattr(msg, "chat_id", None), grouped_id, source_kind)
+            if dedup_seen(album_key):
+                log({
+                    "ts": tstamp(),
+                    "type": "info",
+                    "op": "skip_duplicate_album_event",
+                    "chat_id": getattr(msg, "chat_id", None),
+                    "msg_id": getattr(msg, "id", None),
+                    "grouped_id": grouped_id,
+                    "source_kind": source_kind,
+                })
+                return
+        else:
+            media_key = f"media:{getattr(msg, 'chat_id', None)}:{getattr(msg, 'id', None)}:{source_kind}"
+            if dedup_seen(media_key):
+                log({
+                    "ts": tstamp(),
+                    "type": "info",
+                    "op": "skip_duplicate_media_event",
+                    "chat_id": getattr(msg, "chat_id", None),
+                    "msg_id": getattr(msg, "id", None),
+                    "source_kind": source_kind,
+                })
+                return
     event_lag_ms = int((event_now - msg_date_obj.timestamp()) * 1000) if msg_date_obj else None
     edit_lag_ms = int((event_now - edit_date_obj.timestamp()) * 1000) if edit_date_obj else None
 
@@ -697,6 +737,7 @@ async def handle_incoming_message(msg, source_kind: str):
             })
             return
 
+    dedup_mark(dedup_key_for_message(info, source_kind))
     spawn_bg(publish_media_job(msg, info, routes, source_kind))
 
 
@@ -717,6 +758,18 @@ async def on_new_message(event: events.NewMessage.Event):
 
 async def on_message_edited(event: events.MessageEdited.Event):
     if not LISTEN_EDITED_MESSAGES:
+        return
+
+    if getattr(event.message, "media", None) is not None:
+        log({
+            "ts": tstamp(),
+            "type": "info",
+            "op": "skip_edited_media_message",
+            "chat_id": getattr(event, "chat_id", None),
+            "msg_id": getattr(event.message, "id", None),
+            "grouped_id": getattr(event.message, "grouped_id", None),
+            "note": "edited media/album not re-forwarded to avoid duplicates",
+        })
         return
 
     try:
@@ -843,6 +896,7 @@ async def main():
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     SPOOL_DIR.mkdir(parents=True, exist_ok=True)
+    RETAIN_DIR.mkdir(parents=True, exist_ok=True)
 
     print_route_summary()
     touch_health(f"starting:{APP_MODE}")

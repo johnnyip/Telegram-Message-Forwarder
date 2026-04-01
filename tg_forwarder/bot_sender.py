@@ -159,9 +159,10 @@ async def bot_send_album(bot: Bot, target, file_paths: List[str], caption: str =
                 media.append(InputMediaAudio(media=fh, caption=item_caption, parse_mode=parse_mode))
             else:
                 media.append(InputMediaDocument(media=fh, caption=item_caption, parse_mode=parse_mode))
+
+        if log_fn:
+            log_fn({"op": "bot_send_album_attempt", "target": target, "file_count": len(file_paths), "parse_mode": "Markdown" if caption else None})
         try:
-            if log_fn:
-                log_fn({"op": "bot_send_album_attempt", "target": target, "file_count": len(file_paths)})
             result = await bot.send_media_group(chat_id=target, media=media)
             if log_fn:
                 log_fn({"op": "bot_send_album_attempt_ok", "target": target, "message_ids": [getattr(x, "message_id", None) for x in result]})
@@ -169,27 +170,38 @@ async def bot_send_album(bot: Bot, target, file_paths: List[str], caption: str =
         except Exception as e:
             if log_fn:
                 log_fn({"op": "bot_send_album_attempt_err", "target": target, "err": e.__class__.__name__, "msg": str(e)})
-            if caption:
-                media_plain = []
-                for idx, path in enumerate(file_paths):
-                    p2 = Path(path)
-                    fh2 = p2.open("rb")
-                    handles.append(fh2)
-                    mt2 = media_types[idx] if media_types and idx < len(media_types) else None
-                    kind2 = guess_media_kind(path, mt2)
-                    item_caption2 = caption if idx == 0 else None
-                    if kind2 == "photo":
-                        media_plain.append(InputMediaPhoto(media=fh2, caption=item_caption2))
-                    elif kind2 == "video":
-                        media_plain.append(InputMediaVideo(media=fh2, caption=item_caption2))
-                    elif kind2 == "animation":
-                        media_plain.append(InputMediaAnimation(media=fh2, caption=item_caption2))
-                    elif kind2 in {"audio", "voice"}:
-                        media_plain.append(InputMediaAudio(media=fh2, caption=item_caption2))
-                    else:
-                        media_plain.append(InputMediaDocument(media=fh2, caption=item_caption2))
-                return await bot.send_media_group(chat_id=target, media=media_plain)
-            raise
+            err_name = e.__class__.__name__
+            err_msg = str(e)
+            allow_plain_retry = bool(caption) and (
+                err_name == "BadRequest" and any(token in err_msg.lower() for token in ("parse", "entity", "caption"))
+            )
+            if not allow_plain_retry:
+                raise
+
+        media_plain = []
+        for idx, path in enumerate(file_paths):
+            p2 = Path(path)
+            fh2 = p2.open("rb")
+            handles.append(fh2)
+            mt2 = media_types[idx] if media_types and idx < len(media_types) else None
+            kind2 = guess_media_kind(path, mt2)
+            item_caption2 = caption if idx == 0 else None
+            if kind2 == "photo":
+                media_plain.append(InputMediaPhoto(media=fh2, caption=item_caption2))
+            elif kind2 == "video":
+                media_plain.append(InputMediaVideo(media=fh2, caption=item_caption2))
+            elif kind2 == "animation":
+                media_plain.append(InputMediaAnimation(media=fh2, caption=item_caption2))
+            elif kind2 in {"audio", "voice"}:
+                media_plain.append(InputMediaAudio(media=fh2, caption=item_caption2))
+            else:
+                media_plain.append(InputMediaDocument(media=fh2, caption=item_caption2))
+        if log_fn:
+            log_fn({"op": "bot_send_album_attempt_plain_retry", "target": target, "file_count": len(file_paths)})
+        result = await bot.send_media_group(chat_id=target, media=media_plain)
+        if log_fn:
+            log_fn({"op": "bot_send_album_attempt_plain_retry_ok", "target": target, "message_ids": [getattr(x, "message_id", None) for x in result]})
+        return result
     finally:
         for fh in handles:
             try:

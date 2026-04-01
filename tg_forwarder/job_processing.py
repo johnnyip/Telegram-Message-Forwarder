@@ -1,11 +1,44 @@
 import asyncio
 from dataclasses import dataclass
+import shutil
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from telethon import errors
 
 from .utils import tstamp
+
+
+RETAIN_DIRNAME = "retained"
+
+
+def _retain_path(original: Path) -> Path:
+    parts = list(original.parts)
+    if "_spool" in parts:
+        idx = parts.index("_spool")
+        retained_parts = parts[:idx] + [RETAIN_DIRNAME] + parts[idx + 1:]
+        return Path(*retained_parts)
+    return original.parent / RETAIN_DIRNAME / original.name
+
+
+def retain_file(path: Path, ctx: JobProcessingContext, *, info: dict, kind: str) -> Path:
+    target = _retain_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if path.resolve() == target.resolve():
+        return path
+    shutil.move(str(path), str(target))
+    ctx.log({
+        "ts": tstamp(),
+        "type": "retain",
+        "op": "retain_local_file",
+        "kind": kind,
+        "chat_id": info.get("chat_id"),
+        "msg_id": info.get("msg_id"),
+        "grouped_id": info.get("grouped_id"),
+        "from_path": str(path),
+        "to_path": str(target),
+    })
+    return target
 
 
 @dataclass
@@ -93,15 +126,24 @@ async def process_media_file_job(job: dict, ctx: JobProcessingContext) -> List[s
 
     success_count = 0
     total_count = 0
+    preserve_local_copy = False
+    current_path = fpath
     for route in routes:
-        coroutines = [ctx.send_file_to_target(route, target, fpath, caption, info, job["source_kind"]) for target in route["targets"]]
+        coroutines = [ctx.send_file_to_target(route, target, current_path, caption, info, job["source_kind"]) for target in route["targets"]]
         results = await _run_target_coroutines(coroutines, parallel=ctx.media_target_parallel)
         total_count += len(results)
         success_count += sum(1 for ok in results if ok)
+        route_wants_preserve = any(getattr(result, "preserve_local_copy", False) for result in results)
+        if route_wants_preserve and not preserve_local_copy:
+            current_path = retain_file(current_path, ctx, info=info, kind="media_file")
+            job["snapshot"]["path"] = str(current_path)
+            preserve_local_copy = True
+        else:
+            preserve_local_copy = preserve_local_copy or route_wants_preserve
 
     if total_count > 0 and success_count == 0:
         raise RuntimeError(f"media_file job failed for all targets chat_id={info['chat_id']} msg_id={info['msg_id']}")
-    return [str(fpath)] if ctx.delete_after_send else []
+    return [] if preserve_local_copy else ([str(current_path)] if ctx.delete_after_send else [])
 
 
 async def process_media_album_file_job(job: dict, ctx: JobProcessingContext) -> List[str]:
@@ -129,15 +171,29 @@ async def process_media_album_file_job(job: dict, ctx: JobProcessingContext) -> 
 
     success_count = 0
     total_count = 0
+    preserve_local_copy = False
+    current_files = files[:]
     for route in routes:
-        coroutines = [ctx.send_album_to_target(route, target, files, caption, info, job["source_kind"]) for target in route["targets"]]
+        coroutines = [ctx.send_album_to_target(route, target, current_files, caption, info, job["source_kind"]) for target in route["targets"]]
         results = await _run_target_coroutines(coroutines, parallel=ctx.media_target_parallel)
         total_count += len(results)
         success_count += sum(1 for ok in results if ok)
+        route_wants_preserve = any(getattr(result, "preserve_local_copy", False) for result in results)
+        if route_wants_preserve and not preserve_local_copy:
+            retained_files = []
+            for idx, original in enumerate(current_files):
+                retained = retain_file(Path(original), ctx, info=info, kind="media_album_file")
+                retained_files.append(str(retained))
+                if idx < len(job["snapshots"]):
+                    job["snapshots"][idx]["path"] = str(retained)
+            current_files = retained_files
+            preserve_local_copy = True
+        else:
+            preserve_local_copy = preserve_local_copy or route_wants_preserve
 
     if total_count > 0 and success_count == 0:
         raise RuntimeError(f"media_album_file job failed for all targets chat_id={info['chat_id']} grouped_id={info.get('grouped_id')}")
-    return files if ctx.delete_after_send else []
+    return [] if preserve_local_copy else (current_files if ctx.delete_after_send else [])
 
 
 async def process_media_forward_job(job: dict, ctx: JobProcessingContext) -> List[str]:

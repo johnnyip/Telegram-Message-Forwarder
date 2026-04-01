@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -7,6 +8,15 @@ from .formatting import build_header_from_info
 from .timefmt import append_original_time
 from .utils import tstamp
 from .verbose_flags import maybe_verbose_log
+
+
+@dataclass(frozen=True)
+class SendOutcome:
+    ok: bool
+    preserve_local_copy: bool = False
+
+    def __bool__(self) -> bool:
+        return self.ok
 
 
 def job_media_type_from_info(info: dict) -> Optional[str]:
@@ -34,7 +44,7 @@ async def _call_with_retry(send: Callable[[], Any]) -> Any:
         raise
 
 
-async def send_text_via_bot(bot, target: Any, combined: str, info: dict, route: dict, source_kind: str, *, bot_send_semaphore, log) -> bool:
+async def send_text_via_bot(bot, target: Any, combined: str, info: dict, route: dict, source_kind: str, *, bot_send_semaphore, log) -> SendOutcome:
     combined = append_original_time(combined, info.get("msg_date"))
     extra = {
         "route": route["name"],
@@ -52,13 +62,13 @@ async def send_text_via_bot(bot, target: Any, combined: str, info: dict, route: 
         async with bot_send_semaphore:
             await _call_with_retry(lambda: bot_send_text(bot, target, combined))
         log({"ts": tstamp(), "type": "out", "op": "send_text", "status": "ok", **extra})
-        return True
+        return SendOutcome(True)
     except Exception as exc:
         log({"ts": tstamp(), "type": "err", "op": "send_text", "err": exc.__class__.__name__, "msg": str(exc), **extra, "target": target, "text_preview": combined[:200], "text_len": len(combined)})
-        return False
+        return SendOutcome(False)
 
 
-async def send_file_via_bot(bot, target: Any, fpath: Path, caption: str, info: dict, route: dict, source_kind: str, *, bot_send_semaphore, log, upload_max_bytes: Optional[int] = None) -> bool:
+async def send_file_via_bot(bot, target: Any, fpath: Path, caption: str, info: dict, route: dict, source_kind: str, *, bot_send_semaphore, log, upload_max_bytes: Optional[int] = None) -> SendOutcome:
     caption = append_original_time(caption, info.get("msg_date"))
     extra = {
         "route": route["name"],
@@ -89,11 +99,11 @@ async def send_file_via_bot(bot, target: Any, fpath: Path, caption: str, info: d
         try:
             async with bot_send_semaphore:
                 await _call_with_retry(lambda: bot_send_text(bot, target, notice))
-            log({"ts": tstamp(), "type": "out", "op": "send_file_skip_notice", "status": "ok", **extra, "target": target, "file_size": file_size, "upload_max_bytes": upload_max_bytes})
-            return True
+            log({"ts": tstamp(), "type": "out", "op": "send_file_skip_notice", "status": "ok", **extra, "target": target, "file_size": file_size, "upload_max_bytes": upload_max_bytes, "preserve_local_copy": True})
+            return SendOutcome(True, preserve_local_copy=True)
         except Exception as exc:
             log({"ts": tstamp(), "type": "err", "op": "send_file_skip_notice", "err": exc.__class__.__name__, "msg": str(exc), **extra, "target": target, "file_size": file_size, "upload_max_bytes": upload_max_bytes})
-            return False
+            return SendOutcome(False)
 
     try:
         async with bot_send_semaphore:
@@ -108,13 +118,13 @@ async def send_file_via_bot(bot, target: Any, fpath: Path, caption: str, info: d
                 )
             )
         log({"ts": tstamp(), "type": "out", "op": "send_file", "status": "ok", **extra, "media_kind": media_kind})
-        return True
+        return SendOutcome(True)
     except Exception as exc:
         log({"ts": tstamp(), "type": "err", "op": "send_file", "err": exc.__class__.__name__, "msg": str(exc), **extra, "target": target, "caption_preview": caption[:200], "media_kind": media_kind})
-        return False
+        return SendOutcome(False)
 
 
-async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, info: dict, route: dict, source_kind: str, *, bot_send_semaphore, album_max_total_bytes: int, upload_max_bytes: Optional[int], log) -> bool:
+async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, info: dict, route: dict, source_kind: str, *, bot_send_semaphore, album_max_total_bytes: int, upload_max_bytes: Optional[int], log) -> SendOutcome:
     caption = append_original_time(caption, info.get("msg_date"))
     extra = {
         "route": route["name"],
@@ -132,6 +142,7 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
     total_size = sum(Path(path).stat().st_size for path in files if Path(path).exists())
     has_large_video = any(media_type == "video" for media_type in (media_types or [])) and total_size > album_max_total_bytes
     maybe_verbose_log(log, {"ts": tstamp(), "type": "info", "op": "send_album_attempt", **extra, "target": target, "media_types": media_types, "caption_preview": caption[:200], "total_size": total_size, "album_max_total_bytes": album_max_total_bytes})
+    preserve_local_copy = False
     try:
         if has_large_video:
             raise RuntimeError(f"album_too_large_for_media_group total_size={total_size} threshold={album_max_total_bytes}")
@@ -147,9 +158,20 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
                 )
             )
         log({"ts": tstamp(), "type": "out", "op": "send_album", "status": "ok", **extra, "total_size": total_size})
-        return True
+        return SendOutcome(True)
     except Exception as exc:
-        log({"ts": tstamp(), "type": "warn", "op": "send_album_fallback_to_single", "err": exc.__class__.__name__, "msg": str(exc), **extra, "caption_preview": caption[:200], "media_types": media_types})
+        err_name = exc.__class__.__name__
+        err_msg = str(exc)
+        allow_single_fallback = (
+            err_name == "RuntimeError" and "album_too_large_for_media_group" in err_msg
+        ) or (
+            err_name == "BadRequest" and any(token in err_msg.lower() for token in ("group", "media", "caption", "entity", "parse"))
+        )
+        log({"ts": tstamp(), "type": "warn", "op": "send_album_group_failed", "err": err_name, "msg": err_msg, "allow_single_fallback": allow_single_fallback, **extra, "caption_preview": caption[:200], "media_types": media_types})
+        if not allow_single_fallback:
+            return SendOutcome(False)
+
+        log({"ts": tstamp(), "type": "warn", "op": "send_album_fallback_to_single", "err": err_name, "msg": err_msg, **extra, "caption_preview": caption[:200], "media_types": media_types})
         ok_count = 0
         for idx, single in enumerate(files):
             single_type = media_types[idx] if media_types and idx < len(media_types) else None
@@ -176,10 +198,11 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
                     )
                     notice = append_original_time(notice, info.get("msg_date"))
                     await _call_with_retry(lambda: bot_send_text(bot, target, notice))
-                    log({"ts": tstamp(), "type": "out", "op": "send_album_single_skip_notice", "status": "ok", "file": single, "target": target, "media_type": single_type, **extra})
+                    log({"ts": tstamp(), "type": "out", "op": "send_album_single_skip_notice", "status": "ok", "file": single, "target": target, "media_type": single_type, "preserve_local_copy": True, **extra})
+                    preserve_local_copy = True
                 else:
                     log({"ts": tstamp(), "type": "out", "op": "send_album_single_fallback", "status": "ok", "file": single, "target": target, "media_type": single_type, **extra})
                 ok_count += 1
             except Exception as inner:
                 log({"ts": tstamp(), "type": "err", "op": "send_album_single_fallback", "err": inner.__class__.__name__, "msg": str(inner), "file": single, "target": target, "media_type": single_type, "caption_preview": single_caption[:200], **extra})
-        return ok_count > 0
+        return SendOutcome(ok_count > 0, preserve_local_copy=preserve_local_copy)
