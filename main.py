@@ -10,27 +10,29 @@ from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 from telegram import Bot
 from telegram.error import TelegramError
 
-from tg_forwarder.bot_runtime import send_album_via_bot, send_file_via_bot, send_text_via_bot
-from tg_forwarder.forwarding_policy import ForwardingPolicyConfig, should_direct_forward_large_album as should_direct_forward_large_album_mod, should_direct_forward_large_media as should_direct_forward_large_media_mod
-from tg_forwarder.file_policy import is_stale_file
-from tg_forwarder.healthcheck import default_health_path, write_health_file
-from tg_forwarder.debug_flags import configure_telethon_logger, maybe_debug_log
-from tg_forwarder.dedup_cache import dedup_mark, dedup_seen
-from tg_forwarder.formatting import build_header_from_info, should_ignore
-from tg_forwarder.forward_cache import forward_cache_get, forward_cache_set
-from tg_forwarder.job_processing import JobProcessingContext, dispatch_media_job, process_text_job as process_text_job_mod
-from tg_forwarder.kafka_jobs import publish_album_job as publish_album_job_mod, publish_media_job as publish_media_job_mod, publish_text_job as publish_text_job_mod
-from tg_forwarder.lag_stats import lag_record, lag_summary
-from tg_forwarder.logging_setup import setup_logging
-from tg_forwarder.media import get_media_size, media_type
-from tg_forwarder.metrics import StepTimer
-from tg_forwarder.routes import find_matching_routes, load_routes
-from tg_forwarder.senders import fetch_message_by_id as fetch_message_by_id_mod, fetch_messages_by_ids as fetch_messages_by_ids_mod, send_album_to_target as send_album_to_target_mod, send_file_to_target as send_file_to_target_mod, send_text_to_target as send_text_to_target_mod
-from tg_forwarder.snapshot import snapshot_album_messages as snapshot_album_messages_mod, snapshot_media_message as snapshot_media_message_mod
-from tg_forwarder.telegram_info import resolve_sender_info_from_message
-from tg_forwarder.send_journal import journal_get, journal_mark
-from tg_forwarder.utils import cleanup_files, cleanup_retained_files, json_bytes, log as base_log, now_ts, tstamp
-from tg_forwarder.verbose_flags import BOT_STARTUP_SMOKE_TEST
+from tg_forwarder.runtime.bot_runtime import send_album_via_bot, send_file_via_bot, send_text_via_bot
+from tg_forwarder.domain.forwarding_policy import ForwardingPolicyConfig, should_direct_forward_large_album as should_direct_forward_large_album_mod, should_direct_forward_large_media as should_direct_forward_large_media_mod
+from tg_forwarder.domain.file_policy import is_stale_file
+from tg_forwarder.runtime.healthcheck import default_health_path, write_health_file
+from tg_forwarder.runtime.debug_flags import configure_telethon_logger, maybe_debug_log
+from tg_forwarder.storage.dedup_cache import dedup_mark, dedup_seen
+from tg_forwarder.storage.edit_mapping import enabled as edit_mapping_enabled, get_redis
+from tg_forwarder.delivery.edit_updates import edit_forwarded_album_caption, edit_forwarded_media_caption, edit_forwarded_text
+from tg_forwarder.domain.formatting import build_header_from_info, should_ignore
+from tg_forwarder.storage.forward_cache import forward_cache_get, forward_cache_set
+from tg_forwarder.processing.job_processing import JobProcessingContext, dispatch_media_job, process_text_job as process_text_job_mod
+from tg_forwarder.processing.kafka_jobs import publish_album_job as publish_album_job_mod, publish_media_job as publish_media_job_mod, publish_text_job as publish_text_job_mod
+from tg_forwarder.runtime.lag_stats import lag_record, lag_summary
+from tg_forwarder.runtime.logging_setup import setup_logging
+from tg_forwarder.domain.media import get_media_size, media_type
+from tg_forwarder.core.metrics import StepTimer
+from tg_forwarder.domain.routes import find_matching_routes, load_routes
+from tg_forwarder.delivery.senders import fetch_message_by_id as fetch_message_by_id_mod, fetch_messages_by_ids as fetch_messages_by_ids_mod, send_album_to_target as send_album_to_target_mod, send_file_to_target as send_file_to_target_mod, send_text_to_target as send_text_to_target_mod
+from tg_forwarder.processing.snapshot import snapshot_album_messages as snapshot_album_messages_mod, snapshot_media_message as snapshot_media_message_mod
+from tg_forwarder.domain.telegram_info import resolve_sender_info_from_message
+from tg_forwarder.storage.send_journal import journal_get, journal_mark
+from tg_forwarder.core.utils import cleanup_files, cleanup_retained_files, json_bytes, log as base_log, now_ts, tstamp
+from tg_forwarder.runtime.verbose_flags import BOT_STARTUP_SMOKE_TEST
 
 
 # ============================================================
@@ -121,13 +123,15 @@ if APP_MODE == "listen":
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH, base_logger="telethon")
     client.parse_mode = "md"
 
+if TELEGRAM_BOT_TOKEN:
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+
 download_semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
 BACKGROUND_TASKS = set()
 
 producer: Optional[AIOKafkaProducer] = None
 text_consumer: Optional[AIOKafkaConsumer] = None
 media_consumer: Optional[AIOKafkaConsumer] = None
-bot: Optional[Bot] = None
 BOT_SEND_CONCURRENCY = max(1, int(os.getenv("BOT_SEND_CONCURRENCY", "1")))
 bot_send_semaphore = asyncio.Semaphore(BOT_SEND_CONCURRENCY)
 
@@ -824,20 +828,51 @@ async def on_message_edited(event: events.MessageEdited.Event):
     if not LISTEN_EDITED_MESSAGES:
         return
 
-    if getattr(event.message, "media", None) is not None:
-        log({
-            "ts": tstamp(),
-            "type": "info",
-            "op": "skip_edited_media_message",
-            "chat_id": getattr(event, "chat_id", None),
-            "msg_id": getattr(event.message, "id", None),
-            "grouped_id": getattr(event.message, "grouped_id", None),
-            "note": "edited media/album not re-forwarded to avoid duplicates",
-        })
-        return
-
     try:
-        await handle_incoming_message(event.message, source_kind="edited")
+        msg = event.message
+        info = await resolve_sender_info_from_message(msg, chat_id_hint=getattr(event, "chat_id", None))
+
+        if APP_MODE != "listen" or not edit_mapping_enabled() or bot is None:
+            if getattr(msg, "media", None) is not None:
+                log({
+                    "ts": tstamp(),
+                    "type": "info",
+                    "op": "skip_edited_media_message",
+                    "chat_id": getattr(event, "chat_id", None),
+                    "msg_id": getattr(msg, "id", None),
+                    "grouped_id": getattr(msg, "grouped_id", None),
+                    "note": "edited media/album not re-forwarded to avoid duplicates",
+                })
+                return
+            await handle_incoming_message(msg, source_kind="edited")
+            return
+
+        redis = await get_redis()
+        if redis is None:
+            log({
+                "ts": tstamp(),
+                "type": "warn",
+                "op": "edit_mapping_redis_unavailable",
+                "chat_id": info.get("chat_id"),
+                "msg_id": info.get("msg_id"),
+            })
+            return
+
+        if getattr(msg, "media", None) is None:
+            edited = await edit_forwarded_text(bot, info, msg.text or msg.message or "[empty]", log)
+            if not edited:
+                log({"ts": tstamp(), "type": "warn", "op": "edited_text_no_mapping_or_failed", "chat_id": info.get("chat_id"), "msg_id": info.get("msg_id")})
+            return
+
+        if getattr(msg, "grouped_id", None) is not None:
+            edited = await edit_forwarded_album_caption(bot, info, (msg.text or msg.message or "").strip(), log)
+            if not edited:
+                log({"ts": tstamp(), "type": "warn", "op": "edited_album_no_mapping_or_failed", "chat_id": info.get("chat_id"), "grouped_id": info.get("grouped_id")})
+            return
+
+        edited = await edit_forwarded_media_caption(bot, info, (msg.text or msg.message or "").strip(), log)
+        if not edited:
+            log({"ts": tstamp(), "type": "warn", "op": "edited_media_no_mapping_or_failed", "chat_id": info.get("chat_id"), "msg_id": info.get("msg_id")})
     except Exception as e:
         log({
             "ts": tstamp(),
@@ -994,8 +1029,7 @@ async def main():
             LOGGER.info("startup send mode sender=telegram-bot producer=false consumers=true")
             if not TELEGRAM_BOT_TOKEN:
                 raise RuntimeError("TELEGRAM_BOT_TOKEN is required in APP_MODE=send")
-            global bot
-            bot = Bot(token=TELEGRAM_BOT_TOKEN)
+            assert bot is not None
             try:
                 me = await bot.get_me()
                 LOGGER.info("bot auth ok id=%s username=%s", getattr(me, "id", None), getattr(me, "username", None))

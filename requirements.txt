@@ -3,3 +3,4 @@ cryptg>=0.4.0
 python-dotenv==1.0.1
 aiokafka==0.13.0
 python-telegram-bot==21.11.1
+redis[hiredis]==6.1.0
