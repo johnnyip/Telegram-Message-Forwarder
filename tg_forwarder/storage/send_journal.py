@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 
 SEND_JOURNAL_PATH = Path(os.getenv("SEND_JOURNAL_PATH", "./downloads/send_journal.json")).expanduser()
 SEND_JOURNAL_TTL_SECONDS = int(os.getenv("SEND_JOURNAL_TTL_SECONDS", str(7 * 24 * 3600)))
+SEND_JOURNAL_INFLIGHT_TTL_SECONDS = int(os.getenv("SEND_JOURNAL_INFLIGHT_TTL_SECONDS", "900"))
 
 
 def _now() -> float:
@@ -26,12 +27,20 @@ def _save(data: Dict[str, Dict[str, Any]]) -> None:
     SEND_JOURNAL_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def _is_entry_alive(value: Dict[str, Any], now: float) -> bool:
+    ts = value.get("ts")
+    if not isinstance(ts, (int, float)):
+        return False
+    status = value.get("status")
+    ttl = SEND_JOURNAL_INFLIGHT_TTL_SECONDS if status == "processing" else SEND_JOURNAL_TTL_SECONDS
+    return now - float(ts) <= ttl
+
+
 def _purge(data: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     now = _now()
     kept: Dict[str, Dict[str, Any]] = {}
     for key, value in data.items():
-        ts = value.get("ts")
-        if isinstance(ts, (int, float)) and now - float(ts) <= SEND_JOURNAL_TTL_SECONDS:
+        if isinstance(value, dict) and _is_entry_alive(value, now):
             kept[key] = value
     return kept
 
@@ -52,9 +61,26 @@ def journal_mark(key: str, payload: Dict[str, Any]) -> None:
     _save(data)
 
 
+def journal_claim(key: str, payload: Optional[Dict[str, Any]] = None) -> bool:
+    data = _purge(_load())
+    existing = data.get(key)
+    if isinstance(existing, dict) and existing.get("status") in {"processing", "done"}:
+        _save(data)
+        return False
+    data[key] = {
+        "ts": _now(),
+        "status": "processing",
+        **(payload or {}),
+    }
+    _save(data)
+    return True
+
+
 __all__ = [
+    "SEND_JOURNAL_INFLIGHT_TTL_SECONDS",
     "SEND_JOURNAL_PATH",
     "SEND_JOURNAL_TTL_SECONDS",
+    "journal_claim",
     "journal_get",
     "journal_mark",
 ]

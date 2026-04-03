@@ -75,8 +75,8 @@ def build_header_from_info(info: dict, is_edit=False) -> str:
 
     if is_edit:
         if identity_lines:
-            return f"{group_line}\n`[EDITED]`\n{identity_lines}"
-        return f"{group_line}\n`[EDITED]`"
+            return f"{group_line}\n`[Edited]`\n{identity_lines}"
+        return f"{group_line}\n`[Edited]`"
 
     if identity_lines:
         return f"{group_line}\n{identity_lines}"

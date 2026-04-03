@@ -30,7 +30,7 @@ from tg_forwarder.domain.routes import find_matching_routes, load_routes
 from tg_forwarder.delivery.senders import fetch_message_by_id as fetch_message_by_id_mod, fetch_messages_by_ids as fetch_messages_by_ids_mod, send_album_to_target as send_album_to_target_mod, send_file_to_target as send_file_to_target_mod, send_text_to_target as send_text_to_target_mod
 from tg_forwarder.processing.snapshot import snapshot_album_messages as snapshot_album_messages_mod, snapshot_media_message as snapshot_media_message_mod
 from tg_forwarder.domain.telegram_info import resolve_sender_info_from_message
-from tg_forwarder.storage.send_journal import journal_get, journal_mark
+from tg_forwarder.storage.send_journal import journal_claim, journal_get, journal_mark
 from tg_forwarder.core.utils import cleanup_files, cleanup_logs, cleanup_retained_files, json_bytes, log as base_log, now_ts, tstamp
 from tg_forwarder.runtime.verbose_flags import BOT_STARTUP_SMOKE_TEST
 
@@ -447,11 +447,31 @@ async def text_consumer_loop():
                 await sleep_until_due(job)
                 fingerprint = job_fingerprint(job)
                 existing = journal_get(fingerprint)
-                if existing and existing.get("status") == "done":
+                if existing and existing.get("status") in {"processing", "done"}:
                     log({
                         "ts": tstamp(),
                         "type": "info",
                         "op": "skip_text_job_from_journal",
+                        "fingerprint": fingerprint,
+                        "job_type": job.get("job_type"),
+                        "chat_id": job.get("info", {}).get("chat_id"),
+                        "msg_id": job.get("info", {}).get("msg_id"),
+                        "journal_status": existing.get("status"),
+                    })
+                    await text_consumer.commit()
+                    continue
+
+                claimed = journal_claim(fingerprint, {
+                    "job_type": job.get("job_type"),
+                    "chat_id": job.get("info", {}).get("chat_id"),
+                    "msg_id": job.get("info", {}).get("msg_id"),
+                    "source_kind": job.get("source_kind"),
+                })
+                if not claimed:
+                    log({
+                        "ts": tstamp(),
+                        "type": "info",
+                        "op": "skip_text_job_claim_failed",
                         "fingerprint": fingerprint,
                         "job_type": job.get("job_type"),
                         "chat_id": job.get("info", {}).get("chat_id"),
@@ -509,11 +529,33 @@ async def media_consumer_loop():
                 })
                 fingerprint = job_fingerprint(job)
                 existing = journal_get(fingerprint)
-                if existing and existing.get("status") == "done":
+                if existing and existing.get("status") in {"processing", "done"}:
                     log({
                         "ts": tstamp(),
                         "type": "info",
                         "op": "skip_media_job_from_journal",
+                        "fingerprint": fingerprint,
+                        "job_type": job.get("job_type"),
+                        "chat_id": job.get("info", {}).get("chat_id") if isinstance(job.get("info"), dict) else None,
+                        "msg_id": job.get("info", {}).get("msg_id") if isinstance(job.get("info"), dict) else None,
+                        "grouped_id": job.get("info", {}).get("grouped_id") if isinstance(job.get("info"), dict) else None,
+                        "journal_status": existing.get("status"),
+                    })
+                    await media_consumer.commit()
+                    continue
+
+                claimed = journal_claim(fingerprint, {
+                    "job_type": job.get("job_type"),
+                    "chat_id": job.get("info", {}).get("chat_id") if isinstance(job.get("info"), dict) else None,
+                    "msg_id": job.get("info", {}).get("msg_id") if isinstance(job.get("info"), dict) else None,
+                    "grouped_id": job.get("info", {}).get("grouped_id") if isinstance(job.get("info"), dict) else None,
+                    "source_kind": job.get("source_kind"),
+                })
+                if not claimed:
+                    log({
+                        "ts": tstamp(),
+                        "type": "info",
+                        "op": "skip_media_job_claim_failed",
                         "fingerprint": fingerprint,
                         "job_type": job.get("job_type"),
                         "chat_id": job.get("info", {}).get("chat_id") if isinstance(job.get("info"), dict) else None,
