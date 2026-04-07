@@ -136,7 +136,7 @@ BOT_SEND_CONCURRENCY = max(1, int(os.getenv("BOT_SEND_CONCURRENCY", "1")))
 bot_send_semaphore = asyncio.Semaphore(BOT_SEND_CONCURRENCY)
 
 # Pending albums:
-# (source_kind, chat_id, grouped_id) -> {"messages": {msg_id: msg}, "task": asyncio.Task}
+# (source_kind, chat_id, grouped_id) -> {"messages": {msg_id: msg}, "task": asyncio.Task, "last_update": float}
 PENDING_ALBUMS: Dict[Tuple[str, int, int], dict] = {}
 FORWARDING_POLICY_CONFIG = ForwardingPolicyConfig(
     threshold_bytes=LARGE_MEDIA_FORWARD_THRESHOLD_BYTES,
@@ -669,20 +669,36 @@ def add_to_album_buffer(msg, source_kind: str):
         return False
 
     key = (source_kind, chat_id, grouped_id)
+    now = now_ts()
     if key not in PENDING_ALBUMS:
-        task = spawn_bg(_album_timer(source_kind, chat_id, grouped_id))
         PENDING_ALBUMS[key] = {
             "messages": {},
-            "task": task,
+            "task": None,
+            "last_update": now,
         }
 
-    PENDING_ALBUMS[key]["messages"][msg.id] = msg
+    album = PENDING_ALBUMS[key]
+    album["messages"][msg.id] = msg
+    album["last_update"] = now
+
+    task = album.get("task")
+    if task is None or task.done():
+        album["task"] = spawn_bg(_album_timer(source_kind, chat_id, grouped_id))
+
     return True
 
 
 async def _album_timer(source_kind: str, chat_id: int, grouped_id: int):
-    await asyncio.sleep(ALBUM_GATHER_SECONDS)
-    await flush_album(source_kind, chat_id, grouped_id)
+    key = (source_kind, chat_id, grouped_id)
+    while True:
+        await asyncio.sleep(ALBUM_GATHER_SECONDS)
+        album = PENDING_ALBUMS.get(key)
+        if not album:
+            return
+        idle_for = now_ts() - float(album.get("last_update", 0))
+        if idle_for >= ALBUM_GATHER_SECONDS:
+            await flush_album(source_kind, chat_id, grouped_id)
+            return
 
 
 # ============================================================
