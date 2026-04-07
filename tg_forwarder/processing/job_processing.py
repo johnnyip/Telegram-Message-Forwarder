@@ -257,8 +257,8 @@ async def process_media_forward_job(job: dict, ctx: JobProcessingContext) -> Lis
                     "media_size": job.get("media_size"),
                     "media_type": job.get("media_type"),
                 }
-                await ctx.run_api(ctx.client.send_message(target, hdr), op="send_header_before_forward_large", extra=extra)
-                await ctx.run_api(ctx.client.forward_messages(target, msg, msg.peer_id), op="forward_large_media", extra=extra)
+                await ctx.run_api(lambda t=target, h=hdr: ctx.client.send_message(t, h), op="send_header_before_forward_large", extra=extra)
+                await ctx.run_api(lambda t=target, m=msg: ctx.client.forward_messages(t, m, m.peer_id), op="forward_large_media", extra=extra)
                 ctx.log({"ts": tstamp(), "type": "out", "op": "forward_large_media", "status": "ok", **extra})
                 success_count += 1
 
@@ -315,8 +315,8 @@ async def process_media_album_forward_job(job: dict, ctx: JobProcessingContext) 
                     "msg_ids": job["msg_ids"],
                     "grouped_id": info.get("grouped_id"),
                 }
-                await ctx.run_api(ctx.client.send_message(target, hdr), op="send_header_before_forward_album", extra=extra)
-                await ctx.run_api(ctx.client.forward_messages(target, msgs, msgs[0].peer_id), op="forward_large_album", extra=extra)
+                await ctx.run_api(lambda t=target, h=hdr: ctx.client.send_message(t, h), op="send_header_before_forward_album", extra=extra)
+                await ctx.run_api(lambda t=target, ms=msgs: ctx.client.forward_messages(t, ms, ms[0].peer_id), op="forward_large_album", extra=extra)
                 ctx.log({"ts": tstamp(), "type": "out", "op": "forward_large_album", "status": "ok", **extra})
                 success_count += 1
 

@@ -187,20 +187,18 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
         for idx, single in enumerate(files):
             single_type = media_types[idx] if media_types and idx < len(media_types) else None
             single_caption = caption if idx == 0 else ""
+            # Determine whether the file is too large *before* calling _call_with_retry.
+            # Passing `None` (not a coroutine) to _call_with_retry causes `await None`
+            # which raises TypeError and swallows the notice-text path entirely.
+            single_path_obj = Path(single)
+            file_too_large = bool(
+                upload_max_bytes
+                and single_path_obj.exists()
+                and single_path_obj.stat().st_size > upload_max_bytes
+            )
             try:
                 sent = None
-                async with bot_send_semaphore:
-                    sent = await _call_with_retry(
-                        lambda single_path=single, single_caption_text=single_caption, single_media_type=single_type: bot_send_file(
-                            bot,
-                            target,
-                            single_path,
-                            single_caption_text,
-                            media_type=single_media_type,
-                            log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "fallback_single": True, "file": single_path, "media_type": single_media_type}),
-                        ) if not (upload_max_bytes and Path(single).exists() and Path(single).stat().st_size > upload_max_bytes) else None
-                    )
-                if upload_max_bytes and Path(single).exists() and Path(single).stat().st_size > upload_max_bytes:
+                if file_too_large:
                     hdr = build_header_from_info(info, is_edit=(source_kind == "edited"))
                     notice = (
                         f"{hdr}\n"
@@ -209,10 +207,22 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
                         f"`{single}`"
                     )
                     notice = append_original_time(notice, info.get("msg_date"))
-                    sent = await _call_with_retry(lambda: bot_send_text(bot, target, notice))
+                    async with bot_send_semaphore:
+                        sent = await _call_with_retry(lambda n=notice: bot_send_text(bot, target, n))
                     log({"ts": tstamp(), "type": "out", "op": "send_album_single_skip_notice", "status": "ok", "file": single, "target": target, "media_type": single_type, "preserve_local_copy": True, "sent_message_id": getattr(sent, "message_id", None), **extra})
                     preserve_local_copy = True
                 else:
+                    async with bot_send_semaphore:
+                        sent = await _call_with_retry(
+                            lambda sp=single, sc=single_caption, st=single_type: bot_send_file(
+                                bot,
+                                target,
+                                sp,
+                                sc,
+                                media_type=st,
+                                log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "fallback_single": True, "file": sp, "media_type": st}),
+                            )
+                        )
                     log({"ts": tstamp(), "type": "out", "op": "send_album_single_fallback", "status": "ok", "file": single, "target": target, "media_type": single_type, "sent_message_id": getattr(sent, "message_id", None), **extra})
                 if getattr(sent, "message_id", None):
                     fallback_message_ids.append(getattr(sent, "message_id", None))

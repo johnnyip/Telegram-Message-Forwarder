@@ -33,7 +33,7 @@ async def snapshot_media_message(msg, info: dict, source_kind: str, spool_dir: P
     }
 
     async with download_semaphore:
-        fpath = await run_api(msg.download_media(save_path), op="snapshot_download_media", extra=extra)
+        fpath = await run_api(lambda: msg.download_media(save_path), op="snapshot_download_media", extra=extra)
 
     if not fpath:
         log({

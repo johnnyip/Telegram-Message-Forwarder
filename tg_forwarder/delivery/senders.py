@@ -20,7 +20,7 @@ async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, in
         "source_kind": source_kind,
     }
     try:
-        await run_api(client.send_message(tgt, combined), op="send_text", extra=extra)
+        await run_api(lambda: client.send_message(tgt, combined), op="send_text", extra=extra)
         log({"ts": tstamp(), "type": "perf", "step": "send_text", "ms": timer.ms(), **extra})
         log({"ts": tstamp(), "type": "out", "op": "send_text", "status": "ok", **extra})
         return True
@@ -43,7 +43,7 @@ async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, capt
         "source_kind": source_kind,
     }
     try:
-        await run_api(client.send_file(tgt, fpath, caption=caption), op="send_file", extra=extra)
+        await run_api(lambda: client.send_file(tgt, fpath, caption=caption), op="send_file", extra=extra)
         log({"ts": tstamp(), "type": "perf", "step": "send_file", "ms": timer.ms(), **extra})
         log({"ts": tstamp(), "type": "out", "op": "send_file", "status": "ok", **extra})
         return True
@@ -66,7 +66,7 @@ async def send_album_to_target(route: Dict[str, Any], tgt: Any, files: List[str]
         "source_kind": source_kind,
     }
     try:
-        await run_api(client.send_file(tgt, files, caption=caption), op="send_album", extra=extra)
+        await run_api(lambda: client.send_file(tgt, files, caption=caption), op="send_album", extra=extra)
         log({"ts": tstamp(), "type": "perf", "step": "send_album", "ms": timer.ms(), **extra})
         log({"ts": tstamp(), "type": "out", "op": "send_album", "status": "ok", **extra})
         return True

@@ -2,7 +2,7 @@ import os
 import asyncio
 from pathlib import Path
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, errors
@@ -200,10 +200,16 @@ async def throttle(seconds: int):
         await asyncio.sleep(seconds)
 
 
-async def run_api(coro, op: str, extra: Optional[dict] = None):
+async def run_api(coro_fn: Callable[[], Any], op: str, extra: Optional[dict] = None):
+    """
+    Call *coro_fn()* (a zero-argument callable that returns a coroutine) and
+    handle Telethon errors.  A fresh coroutine is created on each attempt so
+    that the FloodWait retry path actually works – re-awaiting an already-
+    exhausted coroutine raises RuntimeError in Python 3.10+.
+    """
     extra = extra or {}
     try:
-        return await coro
+        return await coro_fn()
     except errors.FloodWaitError as e:
         log({
             "ts": tstamp(),
@@ -214,7 +220,7 @@ async def run_api(coro, op: str, extra: Optional[dict] = None):
             **extra,
         })
         await asyncio.sleep(e.seconds + 1)
-        return await coro
+        return await coro_fn()
     except errors.RPCError as e:
         log({
             "ts": tstamp(),
@@ -863,8 +869,17 @@ async def handle_incoming_message(msg, source_kind: str):
             })
             return
 
-    dedup_mark(dedup_key_for_message(info, source_kind))
-    spawn_bg(publish_media_job(msg, info, routes, source_kind))
+    # Dedup mark is set only AFTER Kafka publish succeeds.
+    # Marking before publish means a Kafka failure (broker down, network blip)
+    # causes the downloaded file to be orphaned in spool with no job referencing
+    # it, and Telethon re-deliveries of the same message are silently dropped.
+    _dedup_key = dedup_key_for_message(info, source_kind)
+
+    async def _publish_and_mark():
+        await publish_media_job(msg, info, routes, source_kind)
+        dedup_mark(_dedup_key)
+
+    spawn_bg(_publish_and_mark())
 
 
 async def on_new_message(event: events.NewMessage.Event):
@@ -1115,6 +1130,27 @@ async def main():
         if consumer_tasks:
             await asyncio.gather(*consumer_tasks, return_exceptions=True)
 
+        # Flush all in-progress album buffers before cancelling their timers.
+        # Without this, any album whose gather window hasn't closed yet is
+        # silently discarded on every restart / deploy.  flush_album() pops
+        # the key from PENDING_ALBUMS itself, so the dict will be empty (or
+        # nearly so) by the time we reach the cancel loop below.
+        if PENDING_ALBUMS and APP_MODE == "listen":
+            pending_keys = list(PENDING_ALBUMS.keys())
+            log({
+                "ts": tstamp(),
+                "type": "info",
+                "op": "shutdown_flush_pending_albums",
+                "count": len(pending_keys),
+                "keys": [f"{sk}:{cid}:{gid}" for sk, cid, gid in pending_keys],
+            })
+            await asyncio.gather(
+                *(flush_album(sk, cid, gid) for sk, cid, gid in pending_keys),
+                return_exceptions=True,
+            )
+
+        # Cancel any timer tasks that are still running (e.g. a flush that
+        # arrived just after the gather above already popped its key).
         for key, item in list(PENDING_ALBUMS.items()):
             task = item.get("task")
             if task:
