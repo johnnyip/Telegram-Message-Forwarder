@@ -5,6 +5,7 @@ from typing import Any, Callable, Optional
 
 from ..delivery.bot_sender import bot_send_album, bot_send_file, bot_send_text
 from ..storage.topic_mapping import get_topic_mapping, store_topic_mapping
+from ..storage.edit_mapping import acquire_topic_lock, release_topic_lock
 from ..domain.formatting import build_header_from_info
 from ..domain.timefmt import append_original_time, append_edited_suffix
 from ..core.utils import tstamp
@@ -45,6 +46,8 @@ def job_media_type_from_info(info: dict) -> Optional[str]:
 
 
 async def _call_with_retry(send: Callable[[], Any]) -> Any:
+    # P9: Also retry transient network-level errors, not just FloodWait/TimedOut.
+    _TRANSIENT = {"TimedOut", "NetworkError", "ConnectError", "BadGateway"}
     try:
         return await send()
     except Exception as exc:
@@ -52,8 +55,8 @@ async def _call_with_retry(send: Callable[[], Any]) -> Any:
         if retry_after:
             await asyncio.sleep(float(retry_after) + 1)
             return await send()
-        if exc.__class__.__name__ == "TimedOut":
-            await asyncio.sleep(2)
+        if exc.__class__.__name__ in _TRANSIENT:
+            await asyncio.sleep(3)
             return await send()
         raise
 
@@ -119,6 +122,25 @@ async def resolve_topic_thread_id(bot, target: Any, info: dict, *, log) -> Optio
         if not _should_create_topic(info):
             return None
 
+        # P8: Acquire a distributed Redis lock before creating the topic so that
+        # multiple send-mode workers processing the same sender's first message
+        # concurrently do not each create a separate forum topic.
+        dist_token = await acquire_topic_lock(target_chat_id, sender_id_int, ttl=30)
+        if dist_token is None:
+            # Another worker holds the lock.  Wait briefly, then re-check whether
+            # that worker already stored the mapping.  If so, use it; otherwise
+            # proceed anyway (best-effort — may create a duplicate topic in an
+            # extreme race, but this is far better than blocking indefinitely).
+            log({"ts": tstamp(), "type": "info", "op": "resolve_topic_thread_id", "note": "dist_lock_contended_waiting", "target": target_chat_id, "sender_id": sender_id_int})
+            await asyncio.sleep(2.0)
+            try:
+                existing = await get_topic_mapping(target_chat_id, sender_id_int)
+                thread_id = existing.get("message_thread_id") if isinstance(existing, dict) else None
+                if thread_id:
+                    return int(thread_id)
+            except Exception:
+                pass
+
         try:
             topic = await bot.create_forum_topic(chat_id=target_chat_id, name=desired_title)
             message_thread_id = int(getattr(topic, "message_thread_id", 0) or 0)
@@ -133,6 +155,9 @@ async def resolve_topic_thread_id(bot, target: Any, info: dict, *, log) -> Optio
         except Exception as exc:
             log({"ts": tstamp(), "type": "warn", "op": "create_forum_topic", "note": "topic_create_failed_fallback_no_topic", "err": exc.__class__.__name__, "msg": str(exc), "target": target_chat_id, "sender_id": sender_id_int, "title": desired_title})
             return None
+        finally:
+            if dist_token is not None:
+                await release_topic_lock(target_chat_id, sender_id_int, dist_token)
 
 
 async def send_text_via_bot(bot, target: Any, combined: str, info: dict, route: dict, source_kind: str, *, bot_send_semaphore, log) -> SendOutcome:

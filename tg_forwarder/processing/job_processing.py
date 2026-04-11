@@ -123,8 +123,10 @@ async def process_media_file_job(job: dict, ctx: JobProcessingContext) -> List[s
     info["_media_type"] = snapshot.get("media_type")
     fpath = Path(snapshot["path"])
     if not fpath.exists():
+        # P2: raise so the consumer does NOT commit the offset and can retry on
+        # restart (the file may be present then, or the operator sees a clear error).
         ctx.log({"ts": tstamp(), "type": "err", "op": "media_file_missing", "chat_id": info["chat_id"], "msg_id": info["msg_id"], "file": str(fpath)})
-        return []
+        raise RuntimeError(f"media file missing and cannot be sent: {fpath}")
     if ctx.is_stale_file(str(fpath)):
         ctx.log({"ts": tstamp(), "type": "warn", "op": "media_file_stale", "chat_id": info["chat_id"], "msg_id": info["msg_id"], "file": str(fpath)})
 
@@ -229,7 +231,23 @@ async def process_media_forward_job(job: dict, ctx: JobProcessingContext) -> Lis
         return []
 
     if ctx.app_mode == "send" and ctx.bot is not None:
-        ctx.log({"ts": tstamp(), "type": "warn", "op": "media_forward_job_unsupported_in_bot_mode", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
+        # P11: media_forward jobs require a Telethon session and cannot be
+        # executed by the Bot-API send consumer.  In the current split-runtime
+        # design, direct-forward jobs are handled synchronously in listen mode
+        # (not via Kafka), so this branch should never be reached in production.
+        # We log at critical level and commit the offset (by returning normally)
+        # to unblock the Kafka partition; raising would cause infinite redelivery
+        # since this consumer can never process this job type.
+        ctx.log({
+            "ts": tstamp(),
+            "type": "critical",
+            "op": "media_forward_job_unsupported_in_send_mode",
+            "note": "media_forward jobs require Telethon and cannot run in send mode; "
+                    "job will be acknowledged to prevent partition stall. "
+                    "Check ENABLE_DIRECT_FORWARD_JOBS configuration.",
+            "chat_id": info["chat_id"],
+            "msg_id": info["msg_id"],
+        })
         return []
 
     msg = await ctx.fetch_message_by_id(job["chat_id"], job["msg_id"])
@@ -287,7 +305,16 @@ async def process_media_album_forward_job(job: dict, ctx: JobProcessingContext) 
         return []
 
     if ctx.app_mode == "send" and ctx.bot is not None:
-        ctx.log({"ts": tstamp(), "type": "warn", "op": "media_album_forward_job_unsupported_in_bot_mode", "chat_id": info["chat_id"], "grouped_id": info.get("grouped_id")})
+        ctx.log({
+            "ts": tstamp(),
+            "type": "critical",
+            "op": "media_album_forward_job_unsupported_in_send_mode",
+            "note": "media_album_forward jobs require Telethon and cannot run in send mode; "
+                    "job will be acknowledged to prevent partition stall. "
+                    "Check ENABLE_DIRECT_FORWARD_JOBS configuration.",
+            "chat_id": info["chat_id"],
+            "grouped_id": info.get("grouped_id"),
+        })
         return []
 
     msgs = await ctx.fetch_messages_by_ids(job["chat_id"], job["msg_ids"])

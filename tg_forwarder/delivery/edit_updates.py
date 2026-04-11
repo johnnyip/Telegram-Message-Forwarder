@@ -1,4 +1,5 @@
 import asyncio
+import os
 from typing import Any, Awaitable, Callable
 
 from ..storage.edit_mapping import get_album_mapping, get_message_mapping
@@ -6,9 +7,12 @@ from ..domain.formatting import build_header_from_info
 from ..domain.timefmt import append_original_time, append_edited_suffix
 from ..core.utils import tstamp
 
-
-_EDIT_MAPPING_RETRIES = 3
-_EDIT_MAPPING_RETRY_DELAY_SECONDS = 1.0
+# P5: The mapping is only written AFTER the initial send completes, which
+# happens DELAY_SECONDS after the Kafka job was produced.  The retry window
+# must cover that delay plus processing overhead.  Defaults to 10 retries ×
+# 2 s fixed delay = 20 s total, which comfortably covers DELAY_SECONDS=5.
+_EDIT_MAPPING_RETRIES = int(os.getenv("EDIT_MAPPING_RETRIES", "10"))
+_EDIT_MAPPING_RETRY_DELAY_SECONDS = float(os.getenv("EDIT_MAPPING_RETRY_DELAY_SECONDS", "2.0"))
 _EDIT_API_RETRIES = 2
 _EDIT_API_RETRY_DELAY_SECONDS = 1.5
 
@@ -31,7 +35,7 @@ async def _get_mapping_with_retry(fetcher: Callable[[], Awaitable[dict]], missin
             return mapping
         if attempt < _EDIT_MAPPING_RETRIES:
             log({**missing_log, "attempt": attempt, "note": "mapping_missing_retrying"})
-            await asyncio.sleep(_EDIT_MAPPING_RETRY_DELAY_SECONDS * attempt)
+            await asyncio.sleep(_EDIT_MAPPING_RETRY_DELAY_SECONDS)
     log(missing_log)
     return {}
 

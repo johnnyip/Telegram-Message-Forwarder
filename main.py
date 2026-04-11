@@ -31,7 +31,7 @@ from tg_forwarder.domain.routes import find_matching_routes, load_routes
 from tg_forwarder.delivery.senders import fetch_message_by_id as fetch_message_by_id_mod, fetch_messages_by_ids as fetch_messages_by_ids_mod, send_album_to_target as send_album_to_target_mod, send_file_to_target as send_file_to_target_mod, send_text_to_target as send_text_to_target_mod
 from tg_forwarder.processing.snapshot import snapshot_album_messages as snapshot_album_messages_mod, snapshot_media_message as snapshot_media_message_mod
 from tg_forwarder.domain.telegram_info import resolve_sender_info_from_message
-from tg_forwarder.storage.send_journal import journal_claim, journal_get, journal_mark
+from tg_forwarder.storage.send_journal import journal_claim, journal_get, journal_mark, journal_record_failure, journal_is_poison, SEND_JOURNAL_MAX_FAILURES
 from tg_forwarder.core.utils import cleanup_files, cleanup_logs, cleanup_retained_files, json_bytes, log as base_log, now_ts, tstamp
 from tg_forwarder.runtime.verbose_flags import BOT_STARTUP_SMOKE_TEST
 
@@ -577,6 +577,7 @@ async def text_consumer_loop():
         async for record in text_consumer:
             cleanup_paths: List[str] = []
             job = None
+            fingerprint = None
             try:
                 job = json.loads(record.value.decode("utf-8"))
                 await sleep_until_due(job)
@@ -629,6 +630,28 @@ async def text_consumer_loop():
                 if cleanup_paths:
                     cleanup_files(cleanup_paths, job.get("source_kind", "unknown"), job.get("info", {}).get("msg_id"), log)
             except Exception as e:
+                # P12: Track consecutive failures per fingerprint.  After
+                # SEND_JOURNAL_MAX_FAILURES attempts the message is treated as a
+                # poison pill: we commit the offset to unblock the partition and
+                # log at critical level so operators can investigate.
+                if fingerprint:
+                    failures = journal_record_failure(fingerprint, {
+                        "job_type": job.get("job_type") if isinstance(job, dict) else None,
+                        "err": e.__class__.__name__,
+                    })
+                    if failures >= SEND_JOURNAL_MAX_FAILURES:
+                        log({
+                            "ts": tstamp(),
+                            "type": "critical",
+                            "op": "text_consumer_poison_skip",
+                            "fingerprint": fingerprint,
+                            "failures": failures,
+                            "job_type": job.get("job_type") if isinstance(job, dict) else None,
+                            "chat_id": job.get("info", {}).get("chat_id") if isinstance(job, dict) else None,
+                            "msg_id": job.get("info", {}).get("msg_id") if isinstance(job, dict) else None,
+                            "note": "max failures exceeded; committing offset to unblock partition",
+                        })
+                        await text_consumer.commit()
                 log({
                     "ts": tstamp(),
                     "type": "err",
@@ -648,6 +671,7 @@ async def media_consumer_loop():
         async for record in media_consumer:
             cleanup_paths: List[str] = []
             job = None
+            fingerprint = None
             try:
                 job = json.loads(record.value.decode("utf-8"))
                 maybe_debug_log(log, {
@@ -662,6 +686,12 @@ async def media_consumer_loop():
                     "due_at": job.get("due_at"),
                     "created_at": job.get("created_at"),
                 })
+                # P1: Sleep BEFORE claiming the journal entry.  If the process
+                # crashes during the delay, the offset is uncommitted and Kafka
+                # redelivers the message on restart.  Claiming first and then
+                # sleeping causes the journal to have a "processing" entry that
+                # causes a skip on restart, silently dropping the message.
+                await sleep_until_due(job)
                 fingerprint = job_fingerprint(job)
                 existing = journal_get(fingerprint)
                 if existing and existing.get("status") in {"processing", "done"}:
@@ -700,7 +730,6 @@ async def media_consumer_loop():
                     await media_consumer.commit()
                     continue
 
-                await sleep_until_due(job)
                 cleanup_paths = await dispatch_media_job(job, build_job_processing_ctx())
 
                 await media_consumer.commit()
@@ -727,6 +756,25 @@ async def media_consumer_loop():
                 if cleanup_paths:
                     cleanup_files(cleanup_paths, job.get("source_kind", "unknown"), job.get("info", {}).get("msg_id"), log)
             except Exception as e:
+                if fingerprint:
+                    failures = journal_record_failure(fingerprint, {
+                        "job_type": job.get("job_type") if isinstance(job, dict) else None,
+                        "err": e.__class__.__name__,
+                    })
+                    if failures >= SEND_JOURNAL_MAX_FAILURES:
+                        log({
+                            "ts": tstamp(),
+                            "type": "critical",
+                            "op": "media_consumer_poison_skip",
+                            "fingerprint": fingerprint,
+                            "failures": failures,
+                            "job_type": job.get("job_type") if isinstance(job, dict) else None,
+                            "chat_id": job.get("info", {}).get("chat_id") if isinstance(job, dict) else None,
+                            "msg_id": job.get("info", {}).get("msg_id") if isinstance(job, dict) else None,
+                            "grouped_id": job.get("info", {}).get("grouped_id") if isinstance(job, dict) else None,
+                            "note": "max failures exceeded; committing offset to unblock partition",
+                        })
+                        await media_consumer.commit()
                 log({
                     "ts": tstamp(),
                     "type": "err",
@@ -984,7 +1032,21 @@ async def handle_incoming_message(msg, source_kind: str):
     })
 
     if msg.media is None:
+        # P7: Dedup text events so Telethon reconnect re-deliveries do not
+        # publish a second Kafka job for the same message.
+        _text_dedup_key = f"text:{info.get('chat_id')}:{info.get('msg_id')}:{source_kind}"
+        if dedup_seen(_text_dedup_key):
+            log({
+                "ts": tstamp(),
+                "type": "info",
+                "op": "skip_duplicate_text_event",
+                "chat_id": info.get("chat_id"),
+                "msg_id": info.get("msg_id"),
+                "source_kind": source_kind,
+            })
+            return
         await publish_text_job(msg, info, routes, source_kind)
+        dedup_mark(_text_dedup_key)
         return
 
     if getattr(msg, "grouped_id", None) is not None:

@@ -1,9 +1,13 @@
+import asyncio
 from typing import Any, Dict, List
 
 from ..core.metrics import StepTimer
 from ..domain.routes import route_names
 from .snapshot import snapshot_album_messages, snapshot_media_message
 from ..core.utils import now_ts, tstamp
+
+KAFKA_SEND_RETRIES = int(__import__("os").getenv("KAFKA_SEND_RETRIES", "3"))
+KAFKA_SEND_RETRY_DELAY_SECONDS = float(__import__("os").getenv("KAFKA_SEND_RETRY_DELAY_SECONDS", "2.0"))
 
 
 def due_ts_for_text(delay_seconds: int) -> float:
@@ -14,19 +18,42 @@ def due_ts_for_media(delay_seconds: int) -> float:
     return now_ts() + delay_seconds
 
 
-async def kafka_send(topic: str, payload: dict, producer, json_bytes, log):
+async def kafka_send(topic: str, payload: dict, producer, json_bytes, log, *, retries: int = KAFKA_SEND_RETRIES, retry_delay: float = KAFKA_SEND_RETRY_DELAY_SECONDS):
+    """Send a Kafka message with bounded retry on transient broker errors (P6)."""
     timer = StepTimer()
-    await producer.send_and_wait(topic, json_bytes(payload))
-    log({
-        "ts": tstamp(),
-        "type": "perf",
-        "step": "kafka_send",
-        "topic": topic,
-        "job_type": payload.get("job_type"),
-        "chat_id": payload.get("info", {}).get("chat_id") if isinstance(payload.get("info"), dict) else None,
-        "msg_id": payload.get("info", {}).get("msg_id") if isinstance(payload.get("info"), dict) else None,
-        "ms": timer.ms(),
-    })
+    data = json_bytes(payload)
+    last_exc: Exception = RuntimeError("kafka_send: no attempts made")
+    for attempt in range(1, retries + 1):
+        try:
+            await producer.send_and_wait(topic, data)
+            log({
+                "ts": tstamp(),
+                "type": "perf",
+                "step": "kafka_send",
+                "topic": topic,
+                "job_type": payload.get("job_type"),
+                "chat_id": payload.get("info", {}).get("chat_id") if isinstance(payload.get("info"), dict) else None,
+                "msg_id": payload.get("info", {}).get("msg_id") if isinstance(payload.get("info"), dict) else None,
+                "ms": timer.ms(),
+                "attempt": attempt,
+            })
+            return
+        except Exception as exc:
+            last_exc = exc
+            log({
+                "ts": tstamp(),
+                "type": "warn",
+                "step": "kafka_send_retry",
+                "topic": topic,
+                "job_type": payload.get("job_type"),
+                "err": exc.__class__.__name__,
+                "msg": str(exc),
+                "attempt": attempt,
+                "retries": retries,
+            })
+            if attempt < retries:
+                await asyncio.sleep(retry_delay * attempt)
+    raise RuntimeError(f"kafka_send failed after {retries} attempts on topic={topic}: {last_exc}") from last_exc
 
 
 async def publish_text_job(msg, info: dict, routes: List[Dict[str, Any]], source_kind: str, *, delay_seconds: int, topic: str, producer, json_bytes, log):
@@ -143,7 +170,29 @@ async def publish_album_job(msgs: List[Any], info: dict, routes: List[Dict[str, 
 
     snapshots = await snapshot_album_messages(sorted_msgs, info, source_kind, snapshot_kwargs["spool_dir"], snapshot_kwargs["download_semaphore"], snapshot_kwargs["run_api"], log)
     if not snapshots:
-        return
+        log({
+            "ts": tstamp(),
+            "type": "err",
+            "op": "publish_album_job_no_snapshots",
+            "chat_id": info["chat_id"],
+            "grouped_id": info.get("grouped_id"),
+            "msg_ids": msg_ids,
+            "source_kind": source_kind,
+            "note": "all album snapshots failed; album dropped",
+        })
+        raise RuntimeError(f"publish_album_job: all snapshots failed chat_id={info['chat_id']} grouped_id={info.get('grouped_id')}")
+
+    if len(snapshots) < len(sorted_msgs):
+        log({
+            "ts": tstamp(),
+            "type": "warn",
+            "op": "publish_album_job_partial_snapshots",
+            "chat_id": info["chat_id"],
+            "grouped_id": info.get("grouped_id"),
+            "expected": len(sorted_msgs),
+            "got": len(snapshots),
+            "note": "partial album will be sent to targets",
+        })
 
     job = {
         "job_type": "media_album_file",
