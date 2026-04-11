@@ -62,7 +62,7 @@ DOWNLOAD_CONCURRENCY = max(1, int(os.getenv("DOWNLOAD_CONCURRENCY", "3")))
 DELETE_AFTER_SEND = os.getenv("DELETE_AFTER_SEND", "true").strip().lower() in {"1", "true", "yes", "y"}
 
 # Album gather window
-ALBUM_GATHER_SECONDS = float(os.getenv("ALBUM_GATHER_SECONDS", "1.0"))
+ALBUM_GATHER_SECONDS = float(os.getenv("ALBUM_GATHER_SECONDS", "2.5"))
 
 # Kafka
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
@@ -283,11 +283,16 @@ def job_fingerprint(job: dict) -> str:
     chat_id = info.get("chat_id") or job.get("chat_id")
     grouped_id = info.get("grouped_id")
     msg_id = info.get("msg_id") or job.get("msg_id")
-    if grouped_id is not None:
-        return f"{job_type}:{chat_id}:group:{grouped_id}:{source_kind}"
     if isinstance(job.get("msg_ids"), list) and job.get("msg_ids"):
         msg_ids = ",".join(str(x) for x in job.get("msg_ids"))
         return f"{job_type}:{chat_id}:msgs:{msg_ids}:{source_kind}"
+    if grouped_id is not None:
+        snapshot_ids = []
+        if isinstance(job.get("snapshots"), list):
+            snapshot_ids = [str(s.get("msg_id")) for s in job.get("snapshots") if isinstance(s, dict) and s.get("msg_id") is not None]
+        if snapshot_ids:
+            return f"{job_type}:{chat_id}:group:{grouped_id}:msgs:{','.join(snapshot_ids)}:{source_kind}"
+        return f"{job_type}:{chat_id}:group:{grouped_id}:msg:{msg_id}:{source_kind}"
     return f"{job_type}:{chat_id}:msg:{msg_id}:{source_kind}"
 
 
