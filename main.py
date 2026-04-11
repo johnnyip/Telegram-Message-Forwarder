@@ -359,6 +359,116 @@ async def publish_album_job(msgs: List[Any], info: dict, routes: List[Dict[str, 
     )
 
 
+async def direct_forward_large_media(msg, info: dict, routes: List[Dict[str, Any]], source_kind: str):
+    if client is None:
+        raise RuntimeError("Telethon client unavailable for direct forward")
+
+    is_edit = source_kind == "edited"
+    hdr = build_header_from_info(info, is_edit=is_edit)
+    success_count = 0
+    total_count = 0
+    try:
+        for route in routes:
+            for target in route["targets"]:
+                total_count += 1
+                extra = {
+                    "route": route["name"],
+                    "dst": target,
+                    "src_msg": info["msg_id"],
+                    "chat_id": info["chat_id"],
+                    "chat_title": info["chat_title"],
+                    "sender_id": info["sender_id"],
+                    "sender_username": info["sender_username"],
+                    "sender_display": info["sender_display"],
+                    "source_kind": source_kind,
+                    "media_size": get_media_size(msg),
+                    "media_type": media_type(msg),
+                }
+                await run_api(lambda t=target, h=hdr: client.send_message(t, h), op="send_header_before_forward_large", extra=extra)
+                await run_api(lambda t=target, m=msg: client.forward_messages(t, m, m.peer_id), op="forward_large_media", extra=extra)
+                log({"ts": tstamp(), "type": "out", "op": "forward_large_media", "status": "ok", **extra})
+                success_count += 1
+        if success_count > 0:
+            forward_cache_set(info["chat_id"], True)
+        if total_count > 0 and success_count == 0:
+            raise RuntimeError(f"direct forward media failed for all targets chat_id={info['chat_id']} msg_id={info['msg_id']}")
+    except errors.ChatForwardsRestrictedError:
+        forward_cache_set(info["chat_id"], False)
+        log({"ts": tstamp(), "type": "warn", "op": "forward_large_media", "note": "chat_forwards_restricted_fallback_to_kafka_snapshot", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
+        await publish_media_job_mod(
+            msg, info, routes, source_kind,
+            media_delay_seconds=MEDIA_DELAY_SECONDS,
+            topic=KAFKA_MEDIA_TOPIC,
+            producer=producer,
+            json_bytes=json_bytes,
+            log=log,
+            should_direct_forward_large_media=lambda *_args, **_kwargs: False,
+            snapshot_kwargs={
+                "spool_dir": SPOOL_DIR,
+                "download_semaphore": download_semaphore,
+                "run_api": run_api,
+                "media_type_fn": media_type,
+                "get_media_size_fn": get_media_size,
+                "forward_policy": FORWARD_POLICY,
+            },
+        )
+
+
+async def direct_forward_large_album(msgs: List[Any], info: dict, routes: List[Dict[str, Any]], source_kind: str):
+    if client is None:
+        raise RuntimeError("Telethon client unavailable for direct album forward")
+
+    sorted_msgs = sorted(msgs, key=lambda m: m.id)
+    is_edit = source_kind == "edited"
+    hdr = build_header_from_info(info, is_edit=is_edit)
+    success_count = 0
+    total_count = 0
+    try:
+        for route in routes:
+            for target in route["targets"]:
+                total_count += 1
+                extra = {
+                    "route": route["name"],
+                    "dst": target,
+                    "chat_id": info["chat_id"],
+                    "chat_title": info["chat_title"],
+                    "sender_id": info["sender_id"],
+                    "sender_username": info["sender_username"],
+                    "sender_display": info["sender_display"],
+                    "source_kind": source_kind,
+                    "msg_ids": [m.id for m in sorted_msgs],
+                    "grouped_id": info.get("grouped_id"),
+                }
+                await run_api(lambda t=target, h=hdr: client.send_message(t, h), op="send_header_before_forward_album", extra=extra)
+                await run_api(lambda t=target, ms=sorted_msgs: client.forward_messages(t, ms, ms[0].peer_id), op="forward_large_album", extra=extra)
+                log({"ts": tstamp(), "type": "out", "op": "forward_large_album", "status": "ok", **extra})
+                success_count += 1
+        if success_count > 0:
+            forward_cache_set(info["chat_id"], True)
+        if total_count > 0 and success_count == 0:
+            raise RuntimeError(f"direct forward album failed for all targets chat_id={info['chat_id']} grouped_id={info.get('grouped_id')}")
+    except errors.ChatForwardsRestrictedError:
+        forward_cache_set(info["chat_id"], False)
+        log({"ts": tstamp(), "type": "warn", "op": "forward_large_album", "note": "chat_forwards_restricted_fallback_to_kafka_snapshot", "chat_id": info["chat_id"], "grouped_id": info.get("grouped_id"), "msg_ids": [m.id for m in sorted_msgs]})
+        await publish_album_job_mod(
+            sorted_msgs, info, routes, source_kind,
+            media_delay_seconds=MEDIA_DELAY_SECONDS,
+            topic=KAFKA_MEDIA_TOPIC,
+            producer=producer,
+            json_bytes=json_bytes,
+            log=log,
+            should_direct_forward_large_album=lambda *_args, **_kwargs: False,
+            snapshot_kwargs={
+                "spool_dir": SPOOL_DIR,
+                "download_semaphore": download_semaphore,
+                "run_api": run_api,
+                "media_type_fn": media_type,
+                "get_media_size_fn": get_media_size,
+                "forward_policy": FORWARD_POLICY,
+            },
+        )
+
+
 TEXT_TARGET_PARALLEL = os.getenv("TEXT_TARGET_PARALLEL", "true").strip().lower() in {"1", "true", "yes", "y"}
 MEDIA_TARGET_PARALLEL = os.getenv("MEDIA_TARGET_PARALLEL", "false").strip().lower() in {"1", "true", "yes", "y"}
 BOT_UPLOAD_MAX_MB = int(os.getenv("BOT_UPLOAD_MAX_MB", "100"))
@@ -669,7 +779,10 @@ async def flush_album(source_kind: str, chat_id: int, grouped_id: int):
         "msg_noforwards": info["msg_noforwards"],
     })
 
-    await publish_album_job(msgs, info, routes, source_kind)
+    if APP_MODE == "listen" and should_direct_forward_large_album(info["chat_id"], info, msgs):
+        await direct_forward_large_album(msgs, info, routes, source_kind)
+    else:
+        await publish_album_job(msgs, info, routes, source_kind)
     dedup_mark(dedup_key_for_album(info["chat_id"], grouped_id, source_kind))
 
 
@@ -881,7 +994,10 @@ async def handle_incoming_message(msg, source_kind: str):
     _dedup_key = dedup_key_for_message(info, source_kind)
 
     async def _publish_and_mark():
-        await publish_media_job(msg, info, routes, source_kind)
+        if APP_MODE == "listen" and should_direct_forward_large_media(info, msg):
+            await direct_forward_large_media(msg, info, routes, source_kind)
+        else:
+            await publish_media_job(msg, info, routes, source_kind)
         dedup_mark(_dedup_key)
 
     spawn_bg(_publish_and_mark())
