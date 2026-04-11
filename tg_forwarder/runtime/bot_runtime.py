@@ -67,9 +67,19 @@ def _desired_topic_title(info: dict) -> str:
     return f"{display} ({sender_id})"
 
 
+def _should_use_topic(info: dict) -> bool:
+    snapshots = info.get("_album_snapshots")
+    if isinstance(snapshots, list) and snapshots:
+        return True
+    media_type = job_media_type_from_info(info)
+    return media_type in {"photo", "video"}
+
+
 async def resolve_topic_thread_id(bot, target: Any, info: dict, *, log) -> Optional[int]:
     sender_id = info.get("sender_id")
     if sender_id is None:
+        return None
+    if not _should_use_topic(info):
         return None
 
     target_chat_id = int(target)
