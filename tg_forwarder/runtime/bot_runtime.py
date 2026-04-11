@@ -6,12 +6,18 @@ from typing import Any, Callable, Optional
 from ..delivery.bot_sender import bot_send_album, bot_send_file, bot_send_text
 from ..storage.topic_mapping import get_topic_mapping, store_topic_mapping
 from ..domain.formatting import build_header_from_info
-
-
-_TOPIC_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
 from ..domain.timefmt import append_original_time, append_edited_suffix
 from ..core.utils import tstamp
 from .verbose_flags import maybe_verbose_log
+
+# Per-(target_chat_id, sender_id) lock to prevent duplicate topic creation races.
+_TOPIC_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
+
+# In-process cache of whether a target chat has forum/topics enabled.
+# A chat's forum status is effectively immutable during a process lifetime
+# (toggling requires supergroup admin action), so we cache it permanently to
+# avoid calling bot.get_chat() on every forwarded message.
+_FORUM_CHAT_CACHE: dict[int, bool] = {}
 
 
 @dataclass(frozen=True)
@@ -52,7 +58,7 @@ async def _call_with_retry(send: Callable[[], Any]) -> Any:
         raise
 
 
-async def _desired_topic_title(info: dict) -> str:
+def _desired_topic_title(info: dict) -> str:
     sender_id = info.get("sender_id")
     username = info.get("sender_username")
     display = info.get("sender_display") or info.get("sender_first_name") or "Unknown"
@@ -69,11 +75,14 @@ async def resolve_topic_thread_id(bot, target: Any, info: dict, *, log) -> Optio
     target_chat_id = int(target)
     sender_id_int = int(sender_id)
 
-    chat = await bot.get_chat(target_chat_id)
-    if not getattr(chat, "is_forum", False):
+    # Use the cached is_forum result to avoid an API call on every message.
+    if target_chat_id not in _FORUM_CHAT_CACHE:
+        chat = await bot.get_chat(target_chat_id)
+        _FORUM_CHAT_CACHE[target_chat_id] = bool(getattr(chat, "is_forum", False))
+    if not _FORUM_CHAT_CACHE[target_chat_id]:
         return None
 
-    desired_title = await _desired_topic_title(info)
+    desired_title = _desired_topic_title(info)
     lock_key = (target_chat_id, sender_id_int)
     lock = _TOPIC_LOCKS.setdefault(lock_key, asyncio.Lock())
 
