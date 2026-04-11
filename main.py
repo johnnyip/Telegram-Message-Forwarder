@@ -9,6 +9,7 @@ from telethon import TelegramClient, events, errors
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 from telegram import Bot
 from telegram.error import TelegramError
+from telegram.request import HTTPXRequest
 
 from tg_forwarder.runtime.bot_runtime import send_album_via_bot, send_file_via_bot, send_text_via_bot
 from tg_forwarder.domain.forwarding_policy import ForwardingPolicyConfig, should_direct_forward_large_album as should_direct_forward_large_album_mod, should_direct_forward_large_media as should_direct_forward_large_media_mod
@@ -56,13 +57,13 @@ DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "5"))                  # text sen
 MEDIA_DELAY_SECONDS = int(os.getenv("MEDIA_DELAY_SECONDS", "0"))      # media send delay
 
 # Concurrency
-DOWNLOAD_CONCURRENCY = max(1, int(os.getenv("DOWNLOAD_CONCURRENCY", "3")))
+DOWNLOAD_CONCURRENCY = max(1, int(os.getenv("DOWNLOAD_CONCURRENCY", "8")))
 
 # Cleanup
 DELETE_AFTER_SEND = os.getenv("DELETE_AFTER_SEND", "true").strip().lower() in {"1", "true", "yes", "y"}
 
 # Album gather window
-ALBUM_GATHER_SECONDS = float(os.getenv("ALBUM_GATHER_SECONDS", "2.5"))
+ALBUM_GATHER_SECONDS = float(os.getenv("ALBUM_GATHER_SECONDS", "3"))
 
 # Kafka
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
@@ -73,6 +74,11 @@ APP_MODE = os.getenv("APP_MODE", "listen").strip().lower()
 if APP_MODE not in {"listen", "send"}:
     raise RuntimeError("APP_MODE must be 'listen' or 'send'")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+BOT_HTTP_POOL_SIZE = max(1, int(os.getenv("BOT_HTTP_POOL_SIZE", "80")))
+BOT_POOL_TIMEOUT_SECONDS = float(os.getenv("BOT_POOL_TIMEOUT_SECONDS", "90"))
+BOT_READ_TIMEOUT_SECONDS = float(os.getenv("BOT_READ_TIMEOUT_SECONDS", "180"))
+BOT_WRITE_TIMEOUT_SECONDS = float(os.getenv("BOT_WRITE_TIMEOUT_SECONDS", "180"))
+BOT_CONNECT_TIMEOUT_SECONDS = float(os.getenv("BOT_CONNECT_TIMEOUT_SECONDS", "45"))
 
 # Large media forward threshold
 LARGE_MEDIA_FORWARD_THRESHOLD_MB = int(os.getenv("LARGE_MEDIA_FORWARD_THRESHOLD_MB", "30"))
@@ -124,7 +130,14 @@ if APP_MODE == "listen":
     client.parse_mode = "md"
 
 if TELEGRAM_BOT_TOKEN:
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    bot_request = HTTPXRequest(
+        connection_pool_size=BOT_HTTP_POOL_SIZE,
+        pool_timeout=BOT_POOL_TIMEOUT_SECONDS,
+        read_timeout=BOT_READ_TIMEOUT_SECONDS,
+        write_timeout=BOT_WRITE_TIMEOUT_SECONDS,
+        connect_timeout=BOT_CONNECT_TIMEOUT_SECONDS,
+    )
+    bot = Bot(token=TELEGRAM_BOT_TOKEN, request=bot_request)
 
 download_semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
 BACKGROUND_TASKS = set()
@@ -132,8 +145,9 @@ BACKGROUND_TASKS = set()
 producer: Optional[AIOKafkaProducer] = None
 text_consumer: Optional[AIOKafkaConsumer] = None
 media_consumer: Optional[AIOKafkaConsumer] = None
-BOT_SEND_CONCURRENCY = max(1, int(os.getenv("BOT_SEND_CONCURRENCY", "1")))
+BOT_SEND_CONCURRENCY = max(1, int(os.getenv("BOT_SEND_CONCURRENCY", "3")))
 bot_send_semaphore = asyncio.Semaphore(BOT_SEND_CONCURRENCY)
+edit_bot_semaphore = asyncio.Semaphore(1)
 
 # Pending albums:
 # (source_kind, chat_id, grouped_id) -> {"messages": {msg_id: msg}, "task": asyncio.Task, "last_update": float}
@@ -470,7 +484,7 @@ async def direct_forward_large_album(msgs: List[Any], info: dict, routes: List[D
 
 
 TEXT_TARGET_PARALLEL = os.getenv("TEXT_TARGET_PARALLEL", "true").strip().lower() in {"1", "true", "yes", "y"}
-MEDIA_TARGET_PARALLEL = os.getenv("MEDIA_TARGET_PARALLEL", "false").strip().lower() in {"1", "true", "yes", "y"}
+MEDIA_TARGET_PARALLEL = os.getenv("MEDIA_TARGET_PARALLEL", "true").strip().lower() in {"1", "true", "yes", "y"}
 BOT_UPLOAD_MAX_MB = int(os.getenv("BOT_UPLOAD_MAX_MB", "100"))
 BOT_UPLOAD_MAX_BYTES = BOT_UPLOAD_MAX_MB * 1024 * 1024
 BOT_ALBUM_MAX_TOTAL_MB = int(os.getenv("BOT_ALBUM_MAX_TOTAL_MB", "100"))
@@ -1053,18 +1067,18 @@ async def on_message_edited(event: events.MessageEdited.Event):
             return
 
         if getattr(msg, "media", None) is None:
-            edited = await edit_forwarded_text(bot, info, msg.text or msg.message or "[empty]", log)
+            edited = await edit_forwarded_text(bot, info, msg.text or msg.message or "[empty]", log, semaphore=edit_bot_semaphore)
             if not edited:
                 log({"ts": tstamp(), "type": "warn", "op": "edited_text_no_mapping_or_failed", "chat_id": info.get("chat_id"), "msg_id": info.get("msg_id")})
             return
 
         if getattr(msg, "grouped_id", None) is not None:
-            edited = await edit_forwarded_album_caption(bot, info, (msg.text or msg.message or "").strip(), log)
+            edited = await edit_forwarded_album_caption(bot, info, (msg.text or msg.message or "").strip(), log, semaphore=edit_bot_semaphore)
             if not edited:
                 log({"ts": tstamp(), "type": "warn", "op": "edited_album_no_mapping_or_failed", "chat_id": info.get("chat_id"), "grouped_id": info.get("grouped_id")})
             return
 
-        edited = await edit_forwarded_media_caption(bot, info, (msg.text or msg.message or "").strip(), log)
+        edited = await edit_forwarded_media_caption(bot, info, (msg.text or msg.message or "").strip(), log, semaphore=edit_bot_semaphore)
         if not edited:
             log({"ts": tstamp(), "type": "warn", "op": "edited_media_no_mapping_or_failed", "chat_id": info.get("chat_id"), "msg_id": info.get("msg_id")})
     except Exception as e:

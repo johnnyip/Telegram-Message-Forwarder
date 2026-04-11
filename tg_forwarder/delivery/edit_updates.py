@@ -53,7 +53,7 @@ async def _run_edit_call(call: Callable[[], Awaitable[Any]], err_log: dict, log)
     return False
 
 
-async def edit_forwarded_text(bot, info: dict, text: str, log) -> bool:
+async def edit_forwarded_text(bot, info: dict, text: str, log, semaphore=None) -> bool:
     mapping = await _get_mapping_with_retry(
         lambda: get_message_mapping(info["chat_id"], info["msg_id"]),
         {"ts": tstamp(), "type": "warn", "op": "edit_forwarded_text_missing_mapping", "chat_id": info.get("chat_id"), "msg_id": info.get("msg_id")},
@@ -79,8 +79,15 @@ async def edit_forwarded_text(bot, info: dict, text: str, log) -> bool:
             except Exception:
                 await bot.edit_message_text(chat_id=int(target), message_id=message_id, text=body)
 
+        async def _guarded_call():
+            if semaphore is None:
+                await _call()
+            else:
+                async with semaphore:
+                    await _call()
+
         success = await _run_edit_call(
-            _call,
+            _guarded_call,
             {"ts": tstamp(), "type": "err", "op": "edit_forwarded_text", "target": int(target), "message_id": message_id, "chat_id": info.get("chat_id"), "msg_id": info.get("msg_id")},
             log,
         )
@@ -90,7 +97,7 @@ async def edit_forwarded_text(bot, info: dict, text: str, log) -> bool:
     return ok
 
 
-async def edit_forwarded_media_caption(bot, info: dict, caption_text: str, log) -> bool:
+async def edit_forwarded_media_caption(bot, info: dict, caption_text: str, log, semaphore=None) -> bool:
     mapping = await _get_mapping_with_retry(
         lambda: get_message_mapping(info["chat_id"], info["msg_id"]),
         {"ts": tstamp(), "type": "warn", "op": "edit_forwarded_media_missing_mapping", "chat_id": info.get("chat_id"), "msg_id": info.get("msg_id")},
@@ -116,8 +123,15 @@ async def edit_forwarded_media_caption(bot, info: dict, caption_text: str, log) 
             except Exception:
                 await bot.edit_message_caption(chat_id=int(target), message_id=message_id, caption=caption)
 
+        async def _guarded_call():
+            if semaphore is None:
+                await _call()
+            else:
+                async with semaphore:
+                    await _call()
+
         success = await _run_edit_call(
-            _call,
+            _guarded_call,
             {"ts": tstamp(), "type": "err", "op": "edit_forwarded_media_caption", "target": int(target), "message_id": message_id, "chat_id": info.get("chat_id"), "msg_id": info.get("msg_id")},
             log,
         )
@@ -127,7 +141,7 @@ async def edit_forwarded_media_caption(bot, info: dict, caption_text: str, log) 
     return ok
 
 
-async def edit_forwarded_album_caption(bot, info: dict, caption_text: str, log) -> bool:
+async def edit_forwarded_album_caption(bot, info: dict, caption_text: str, log, semaphore=None) -> bool:
     grouped_id = info.get("grouped_id")
     if grouped_id is None:
         return False
@@ -156,8 +170,15 @@ async def edit_forwarded_album_caption(bot, info: dict, caption_text: str, log) 
             except Exception:
                 await bot.edit_message_caption(chat_id=int(target), message_id=message_id, caption=caption)
 
+        async def _guarded_call():
+            if semaphore is None:
+                await _call()
+            else:
+                async with semaphore:
+                    await _call()
+
         success = await _run_edit_call(
-            _call,
+            _guarded_call,
             {"ts": tstamp(), "type": "err", "op": "edit_forwarded_album_caption", "target": int(target), "message_id": message_id, "chat_id": info.get("chat_id"), "grouped_id": grouped_id},
             log,
         )
