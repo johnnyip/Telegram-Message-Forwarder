@@ -34,6 +34,7 @@ from tg_forwarder.domain.telegram_info import resolve_sender_info_from_message
 from tg_forwarder.storage.send_journal import journal_claim, journal_get, journal_mark, journal_record_failure, journal_is_poison, SEND_JOURNAL_MAX_FAILURES
 from tg_forwarder.core.utils import cleanup_files, cleanup_logs, cleanup_retained_files, json_bytes, log as base_log, now_ts, tstamp
 from tg_forwarder.runtime.verbose_flags import BOT_STARTUP_SMOKE_TEST
+from tg_forwarder.migrate.runner import run_migration, MIGRATE_DRY_RUN
 
 
 # ============================================================
@@ -71,8 +72,8 @@ KAFKA_TEXT_TOPIC = os.getenv("KAFKA_TEXT_TOPIC", "tg-forward-text")
 KAFKA_MEDIA_TOPIC = os.getenv("KAFKA_MEDIA_TOPIC", "tg-forward-media")
 KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP", "tg-forwarder")
 APP_MODE = os.getenv("APP_MODE", "listen").strip().lower()
-if APP_MODE not in {"listen", "send"}:
-    raise RuntimeError("APP_MODE must be 'listen' or 'send'")
+if APP_MODE not in {"listen", "send", "migrate"}:
+    raise RuntimeError("APP_MODE must be 'listen', 'send', or 'migrate'")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 BOT_HTTP_POOL_SIZE = max(1, int(os.getenv("BOT_HTTP_POOL_SIZE", "80")))
 BOT_POOL_TIMEOUT_SECONDS = float(os.getenv("BOT_POOL_TIMEOUT_SECONDS", "90"))
@@ -123,9 +124,9 @@ LOGGER = setup_logging()
 configure_telethon_logger()
 
 client: Optional[TelegramClient] = None
-if APP_MODE == "listen":
+if APP_MODE in {"listen", "migrate"}:
     if API_ID is None or not API_HASH:
-        raise RuntimeError("API_ID and API_HASH are required in APP_MODE=listen")
+        raise RuntimeError(f"API_ID and API_HASH are required in APP_MODE={APP_MODE}")
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH, base_logger="telethon")
     client.parse_mode = "md"
 
@@ -1248,6 +1249,20 @@ def print_route_summary():
             "bot_send_concurrency": BOT_SEND_CONCURRENCY,
             "has_bot_token": bool(TELEGRAM_BOT_TOKEN),
         })
+    elif APP_MODE == "migrate":
+        from tg_forwarder.migrate.runner import (
+            MIGRATE_TARGET_CHAT_ID_RAW, MIGRATE_GENERAL_THREAD_ID,
+            MIGRATE_DELAY_SECONDS, MIGRATE_MIGRATION_TOPIC_NAME,
+        )
+        from tg_forwarder.migrate.checkpoint import MIGRATE_CHECKPOINT_PATH
+        payload.update({
+            "target_chat_id": MIGRATE_TARGET_CHAT_ID_RAW,
+            "general_thread_id": MIGRATE_GENERAL_THREAD_ID,
+            "delay_seconds": MIGRATE_DELAY_SECONDS,
+            "dry_run": MIGRATE_DRY_RUN,
+            "migration_topic_name": MIGRATE_MIGRATION_TOPIC_NAME,
+            "checkpoint_path": str(MIGRATE_CHECKPOINT_PATH),
+        })
 
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
@@ -1258,6 +1273,9 @@ def print_route_summary():
 def startup_banner() -> str:
     if APP_MODE == "listen":
         return f"🚀 tg-forwarder listen up | session={SESSION_NAME} | receiver=telethon | kafka=producer"
+    if APP_MODE == "migrate":
+        dry = " [DRY RUN]" if MIGRATE_DRY_RUN else ""
+        return f"🚀 tg-forwarder migrate up | session={SESSION_NAME} | telethon=reader+forwarder{dry}"
     return "🚀 tg-forwarder send up | sender=telegram-bot | kafka=consumers"
 
 
@@ -1295,6 +1313,19 @@ async def main():
                     await client.run_until_disconnected()
                 finally:
                     LOGGER.warning("client disconnected")
+
+        elif APP_MODE == "migrate":
+            LOGGER.info("startup migrate mode reader=telethon-user forwarder=telethon-user kafka=none")
+            assert client is not None
+            async with client:
+                try:
+                    me = await client.get_me()
+                    LOGGER.info("telethon auth ok id=%s username=%s", getattr(me, "id", None), getattr(me, "username", None))
+                except Exception as e:
+                    LOGGER.warning("telethon auth probe failed err=%s msg=%s", e.__class__.__name__, str(e))
+                touch_health("migrate:running")
+                await run_migration(client, log)
+                touch_health("migrate:done")
 
         elif APP_MODE == "send":
             LOGGER.info("startup send mode sender=telegram-bot producer=false consumers=true")
