@@ -67,7 +67,7 @@ def _desired_topic_title(info: dict) -> str:
     return f"{display} ({sender_id})"
 
 
-def _should_use_topic(info: dict) -> bool:
+def _should_create_topic(info: dict) -> bool:
     snapshots = info.get("_album_snapshots")
     if isinstance(snapshots, list) and snapshots:
         return True
@@ -78,8 +78,6 @@ def _should_use_topic(info: dict) -> bool:
 async def resolve_topic_thread_id(bot, target: Any, info: dict, *, log) -> Optional[int]:
     sender_id = info.get("sender_id")
     if sender_id is None:
-        return None
-    if not _should_use_topic(info):
         return None
 
     target_chat_id = int(target)
@@ -116,6 +114,9 @@ async def resolve_topic_thread_id(bot, target: Any, info: dict, *, log) -> Optio
                 return int(thread_id)
         except Exception as exc:
             log({"ts": tstamp(), "type": "warn", "op": "resolve_topic_thread_id", "note": "topic_mapping_lookup_failed_fallback_no_topic", "err": exc.__class__.__name__, "msg": str(exc), "target": target_chat_id, "sender_id": sender_id_int})
+            return None
+
+        if not _should_create_topic(info):
             return None
 
         try:
