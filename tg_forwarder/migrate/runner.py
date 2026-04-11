@@ -38,8 +38,9 @@ import random
 import time
 from typing import Optional
 
+from telegram import Bot as _TelegramBot
+
 from telethon import errors
-from telethon.tl.functions.channels import CreateForumTopicRequest
 from telethon.tl.functions.messages import ForwardMessagesRequest
 
 from ..core.utils import tstamp
@@ -50,6 +51,8 @@ from .parser import ParsedSender, parse_sender
 
 
 # ── Config ────────────────────────────────────────────────────────────────
+
+_TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 MIGRATE_TARGET_CHAT_ID_RAW = os.getenv("MIGRATE_TARGET_CHAT_ID", "")
 MIGRATE_GENERAL_THREAD_ID = int(os.getenv("MIGRATE_GENERAL_THREAD_ID", "1"))
@@ -106,31 +109,25 @@ async def _resolve_username_to_id(client, username: str, log) -> Optional[int]:
     return None
 
 
-async def _telethon_create_topic(client, chat_id: int, title: str, log) -> Optional[int]:
-    """Create a forum topic via Telethon and return its message_thread_id."""
+async def _create_topic(chat_id: int, title: str, log) -> Optional[int]:
+    """Create a forum topic via Bot API and return its message_thread_id.
+
+    Uses python-telegram-bot (already a project dependency) because the
+    installed Telethon version does not include CreateForumTopicRequest.
+    The bot must be an admin of the group with manage_topics permission.
+    """
+    if not _TELEGRAM_BOT_TOKEN:
+        log({"ts": tstamp(), "type": "err", "op": "migrate_create_topic",
+             "chat_id": chat_id, "title": title,
+             "msg": "TELEGRAM_BOT_TOKEN not set — cannot create forum topic"})
+        return None
     try:
-        input_entity = await client.get_input_entity(chat_id)
-        result = await client(CreateForumTopicRequest(
-            channel=input_entity,
-            title=title,
-            random_id=random.randint(1, 2 ** 31),
-        ))
-        # The result is an Updates object.  The service message whose ID becomes
-        # the thread_id is the first message update that carries an 'action'.
-        thread_id: Optional[int] = None
-        for upd in getattr(result, "updates", []):
-            msg = getattr(upd, "message", None)
-            if msg is None:
-                continue
-            if getattr(msg, "action", None) is not None:
-                thread_id = msg.id
-                break
-        if thread_id:
-            log({"ts": tstamp(), "type": "out", "op": "migrate_create_topic",
-                 "chat_id": chat_id, "title": title, "thread_id": thread_id})
-        else:
-            log({"ts": tstamp(), "type": "warn", "op": "migrate_create_topic",
-                 "chat_id": chat_id, "title": title, "note": "could not parse thread_id from result"})
+        bot = _TelegramBot(token=_TELEGRAM_BOT_TOKEN)
+        async with bot:
+            forum_topic = await bot.create_forum_topic(chat_id=chat_id, name=title)
+        thread_id = forum_topic.message_thread_id
+        log({"ts": tstamp(), "type": "out", "op": "migrate_create_topic",
+             "chat_id": chat_id, "title": title, "thread_id": thread_id})
         return thread_id
     except Exception as exc:
         log({"ts": tstamp(), "type": "err", "op": "migrate_create_topic",
@@ -170,7 +167,7 @@ async def _get_or_create_topic(
         except Exception:
             pass
 
-        thread_id = await _telethon_create_topic(client, chat_id, topic_title, log)
+        thread_id = await _create_topic(chat_id, topic_title, log)
         if thread_id:
             try:
                 await store_topic_mapping(chat_id, sender_id, {
@@ -322,8 +319,8 @@ async def run_migration(client, log):
         if sender.is_unknown:
             # Shared "Migration" topic for all unidentifiable senders
             if migration_topic_id is None and not MIGRATE_DRY_RUN:
-                migration_topic_id = await _telethon_create_topic(
-                    client, chat_id, MIGRATE_MIGRATION_TOPIC_NAME, log
+                migration_topic_id = await _create_topic(
+                    chat_id, MIGRATE_MIGRATION_TOPIC_NAME, log
                 )
                 # Persist so future runs reuse the same topic
                 save_checkpoint(
@@ -352,8 +349,8 @@ async def run_migration(client, log):
             else:
                 # username exists but couldn't be resolved → Migration topic
                 if migration_topic_id is None and not MIGRATE_DRY_RUN:
-                    migration_topic_id = await _telethon_create_topic(
-                        client, chat_id, MIGRATE_MIGRATION_TOPIC_NAME, log
+                    migration_topic_id = await _create_topic(
+                        chat_id, MIGRATE_MIGRATION_TOPIC_NAME, log
                     )
                     save_checkpoint(
                         chat_id=chat_id, thread_id=thread_id,
