@@ -105,6 +105,7 @@ async def process_text_job(job: dict, ctx: JobProcessingContext) -> List[str]:
                     "message_id": result.sent_message_id,
                     "delivery_kind": getattr(result, "delivery_kind", None),
                     "route": route["name"],
+                    "message_thread_id": getattr(result, "message_thread_id", None),
                 })
 
     if total_count > 0 and success_count == 0:
@@ -147,6 +148,7 @@ async def process_media_file_job(job: dict, ctx: JobProcessingContext) -> List[s
                     "message_id": result.sent_message_id,
                     "delivery_kind": getattr(result, "delivery_kind", None),
                     "route": route["name"],
+                    "message_thread_id": getattr(result, "message_thread_id", None),
                 })
         route_wants_preserve = any(getattr(result, "preserve_local_copy", False) for result in results)
         if route_wants_preserve and not preserve_local_copy:
@@ -200,6 +202,7 @@ async def process_media_album_file_job(job: dict, ctx: JobProcessingContext) -> 
                     "message_ids": getattr(result, "sent_message_ids", None),
                     "delivery_kind": getattr(result, "delivery_kind", None),
                     "route": route["name"],
+                    "message_thread_id": getattr(result, "message_thread_id", None),
                 })
         route_wants_preserve = any(getattr(result, "preserve_local_copy", False) for result in results)
         if route_wants_preserve and not preserve_local_copy:

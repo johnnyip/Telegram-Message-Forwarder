@@ -35,14 +35,14 @@ def guess_media_kind(path: str, declared_type: Optional[str] = None) -> str:
     return "document"
 
 
-async def bot_send_text(bot: Bot, target, text: str):
+async def bot_send_text(bot: Bot, target, text: str, message_thread_id: Optional[int] = None):
     try:
-        return await bot.send_message(chat_id=target, text=text, parse_mode="Markdown")
+        return await bot.send_message(chat_id=target, text=text, parse_mode="Markdown", message_thread_id=message_thread_id)
     except Exception:
-        return await bot.send_message(chat_id=target, text=text)
+        return await bot.send_message(chat_id=target, text=text, message_thread_id=message_thread_id)
 
 
-async def bot_send_file(bot: Bot, target, file_path: str, caption: str = "", media_type: Optional[str] = None, log_fn=None):
+async def bot_send_file(bot: Bot, target, file_path: str, caption: str = "", media_type: Optional[str] = None, message_thread_id: Optional[int] = None, log_fn=None):
     media_kind = guess_media_kind(file_path, media_type)
     p = Path(file_path)
     if log_fn:
@@ -69,19 +69,19 @@ async def bot_send_file(bot: Bot, target, file_path: str, caption: str = "", med
                     "caption_len": len(caption or ""),
                 })
             if kind == "photo":
-                result = await bot.send_photo(chat_id=target, photo=fh, caption=caption, parse_mode=parse_mode)
+                result = await bot.send_photo(chat_id=target, photo=fh, caption=caption, parse_mode=parse_mode, message_thread_id=message_thread_id)
             elif kind == "video":
-                result = await bot.send_video(chat_id=target, video=fh, caption=caption, parse_mode=parse_mode)
+                result = await bot.send_video(chat_id=target, video=fh, caption=caption, parse_mode=parse_mode, message_thread_id=message_thread_id)
             elif kind == "animation":
-                result = await bot.send_animation(chat_id=target, animation=fh, caption=caption, parse_mode=parse_mode)
+                result = await bot.send_animation(chat_id=target, animation=fh, caption=caption, parse_mode=parse_mode, message_thread_id=message_thread_id)
             elif kind == "audio":
-                result = await bot.send_audio(chat_id=target, audio=fh, caption=caption, parse_mode=parse_mode)
+                result = await bot.send_audio(chat_id=target, audio=fh, caption=caption, parse_mode=parse_mode, message_thread_id=message_thread_id)
             elif kind == "voice":
-                result = await bot.send_voice(chat_id=target, voice=fh, caption=caption, parse_mode=parse_mode)
+                result = await bot.send_voice(chat_id=target, voice=fh, caption=caption, parse_mode=parse_mode, message_thread_id=message_thread_id)
             elif kind == "video_note":
-                result = await bot.send_video_note(chat_id=target, video_note=fh)
+                result = await bot.send_video_note(chat_id=target, video_note=fh, message_thread_id=message_thread_id)
             else:
-                result = await bot.send_document(chat_id=target, document=fh, caption=caption, parse_mode=parse_mode)
+                result = await bot.send_document(chat_id=target, document=fh, caption=caption, parse_mode=parse_mode, message_thread_id=message_thread_id)
             if log_fn:
                 log_fn({
                     "op": "bot_send_file_attempt_ok",
@@ -115,7 +115,7 @@ async def bot_send_file(bot: Bot, target, file_path: str, caption: str = "", med
     raise RuntimeError("bot_send_file failed without explicit exception")
 
 
-async def bot_send_album(bot: Bot, target, file_paths: List[str], caption: str = "", media_types: Optional[List[str]] = None, log_fn=None):
+async def bot_send_album(bot: Bot, target, file_paths: List[str], caption: str = "", media_types: Optional[List[str]] = None, message_thread_id: Optional[int] = None, log_fn=None):
     media = []
     handles = []
     try:
@@ -162,7 +162,7 @@ async def bot_send_album(bot: Bot, target, file_paths: List[str], caption: str =
         if log_fn:
             log_fn({"op": "bot_send_album_attempt", "target": target, "file_count": len(file_paths), "parse_mode": "Markdown" if caption else None})
         try:
-            result = await bot.send_media_group(chat_id=target, media=media)
+            result = await bot.send_media_group(chat_id=target, media=media, message_thread_id=message_thread_id)
             if log_fn:
                 log_fn({"op": "bot_send_album_attempt_ok", "target": target, "message_ids": [getattr(x, "message_id", None) for x in result]})
             return result
@@ -197,7 +197,7 @@ async def bot_send_album(bot: Bot, target, file_paths: List[str], caption: str =
                 media_plain.append(InputMediaDocument(media=fh2, caption=item_caption2))
         if log_fn:
             log_fn({"op": "bot_send_album_attempt_plain_retry", "target": target, "file_count": len(file_paths)})
-        result = await bot.send_media_group(chat_id=target, media=media_plain)
+        result = await bot.send_media_group(chat_id=target, media=media_plain, message_thread_id=message_thread_id)
         if log_fn:
             log_fn({"op": "bot_send_album_attempt_plain_retry_ok", "target": target, "message_ids": [getattr(x, "message_id", None) for x in result]})
         return result
