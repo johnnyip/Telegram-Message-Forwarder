@@ -75,11 +75,15 @@ async def resolve_topic_thread_id(bot, target: Any, info: dict, *, log) -> Optio
     target_chat_id = int(target)
     sender_id_int = int(sender_id)
 
-    # Use the cached is_forum result to avoid an API call on every message.
-    if target_chat_id not in _FORUM_CHAT_CACHE:
-        chat = await bot.get_chat(target_chat_id)
-        _FORUM_CHAT_CACHE[target_chat_id] = bool(getattr(chat, "is_forum", False))
-    if not _FORUM_CHAT_CACHE[target_chat_id]:
+    try:
+        # Use the cached is_forum result to avoid an API call on every message.
+        if target_chat_id not in _FORUM_CHAT_CACHE:
+            chat = await bot.get_chat(target_chat_id)
+            _FORUM_CHAT_CACHE[target_chat_id] = bool(getattr(chat, "is_forum", False))
+        if not _FORUM_CHAT_CACHE[target_chat_id]:
+            return None
+    except Exception as exc:
+        log({"ts": tstamp(), "type": "warn", "op": "resolve_topic_thread_id", "note": "forum_lookup_failed_fallback_no_topic", "err": exc.__class__.__name__, "msg": str(exc), "target": target_chat_id, "sender_id": sender_id_int})
         return None
 
     desired_title = _desired_topic_title(info)
@@ -87,26 +91,37 @@ async def resolve_topic_thread_id(bot, target: Any, info: dict, *, log) -> Optio
     lock = _TOPIC_LOCKS.setdefault(lock_key, asyncio.Lock())
 
     async with lock:
-        existing = await get_topic_mapping(target_chat_id, sender_id_int)
-        thread_id = existing.get("message_thread_id") if isinstance(existing, dict) else None
-        if thread_id:
-            current_title = existing.get("title")
-            if current_title != desired_title:
-                try:
-                    await bot.edit_forum_topic(chat_id=target_chat_id, message_thread_id=int(thread_id), name=desired_title)
-                    await store_topic_mapping(target_chat_id, sender_id_int, {"message_thread_id": int(thread_id), "title": desired_title})
-                    log({"ts": tstamp(), "type": "out", "op": "edit_forum_topic", "status": "ok", "target": target_chat_id, "sender_id": sender_id_int, "message_thread_id": int(thread_id), "title": desired_title})
-                except Exception as exc:
-                    log({"ts": tstamp(), "type": "warn", "op": "edit_forum_topic", "err": exc.__class__.__name__, "msg": str(exc), "target": target_chat_id, "sender_id": sender_id_int, "message_thread_id": int(thread_id), "title": desired_title})
-            return int(thread_id)
+        try:
+            existing = await get_topic_mapping(target_chat_id, sender_id_int)
+            thread_id = existing.get("message_thread_id") if isinstance(existing, dict) else None
+            if thread_id:
+                current_title = existing.get("title")
+                if current_title != desired_title:
+                    try:
+                        await bot.edit_forum_topic(chat_id=target_chat_id, message_thread_id=int(thread_id), name=desired_title)
+                        await store_topic_mapping(target_chat_id, sender_id_int, {"message_thread_id": int(thread_id), "title": desired_title})
+                        log({"ts": tstamp(), "type": "out", "op": "edit_forum_topic", "status": "ok", "target": target_chat_id, "sender_id": sender_id_int, "message_thread_id": int(thread_id), "title": desired_title})
+                    except Exception as exc:
+                        log({"ts": tstamp(), "type": "warn", "op": "edit_forum_topic", "err": exc.__class__.__name__, "msg": str(exc), "target": target_chat_id, "sender_id": sender_id_int, "message_thread_id": int(thread_id), "title": desired_title})
+                return int(thread_id)
+        except Exception as exc:
+            log({"ts": tstamp(), "type": "warn", "op": "resolve_topic_thread_id", "note": "topic_mapping_lookup_failed_fallback_no_topic", "err": exc.__class__.__name__, "msg": str(exc), "target": target_chat_id, "sender_id": sender_id_int})
+            return None
 
-        topic = await bot.create_forum_topic(chat_id=target_chat_id, name=desired_title)
-        message_thread_id = int(getattr(topic, "message_thread_id", 0) or 0)
-        if message_thread_id:
-            await store_topic_mapping(target_chat_id, sender_id_int, {"message_thread_id": message_thread_id, "title": desired_title})
-            log({"ts": tstamp(), "type": "out", "op": "create_forum_topic", "status": "ok", "target": target_chat_id, "sender_id": sender_id_int, "message_thread_id": message_thread_id, "title": desired_title})
-            return message_thread_id
-        return None
+        try:
+            topic = await bot.create_forum_topic(chat_id=target_chat_id, name=desired_title)
+            message_thread_id = int(getattr(topic, "message_thread_id", 0) or 0)
+            if message_thread_id:
+                try:
+                    await store_topic_mapping(target_chat_id, sender_id_int, {"message_thread_id": message_thread_id, "title": desired_title})
+                except Exception as exc:
+                    log({"ts": tstamp(), "type": "warn", "op": "store_topic_mapping", "note": "topic_mapping_store_failed_after_create", "err": exc.__class__.__name__, "msg": str(exc), "target": target_chat_id, "sender_id": sender_id_int, "message_thread_id": message_thread_id, "title": desired_title})
+                log({"ts": tstamp(), "type": "out", "op": "create_forum_topic", "status": "ok", "target": target_chat_id, "sender_id": sender_id_int, "message_thread_id": message_thread_id, "title": desired_title})
+                return message_thread_id
+            return None
+        except Exception as exc:
+            log({"ts": tstamp(), "type": "warn", "op": "create_forum_topic", "note": "topic_create_failed_fallback_no_topic", "err": exc.__class__.__name__, "msg": str(exc), "target": target_chat_id, "sender_id": sender_id_int, "title": desired_title})
+            return None
 
 
 async def send_text_via_bot(bot, target: Any, combined: str, info: dict, route: dict, source_kind: str, *, bot_send_semaphore, log) -> SendOutcome:
