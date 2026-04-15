@@ -1228,8 +1228,8 @@ def _render_date_separator_png(now_local: datetime) -> bytes:
     draw = ImageDraw.Draw(image)
 
     try:
-        font_big = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 92)
-        font_small = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 42)
+        font_big = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 128)
+        font_small = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 54)
     except Exception:
         font_big = ImageFont.load_default()
         font_small = ImageFont.load_default()
@@ -1244,13 +1244,13 @@ def _render_date_separator_png(now_local: datetime) -> bytes:
     tw = bbox[2] - bbox[0]
     th = bbox[3] - bbox[1]
     x = (width - tw) / 2
-    y = 78
+    y = 56
     draw.text((x, y), date_text, fill=fg, font=font_big)
 
     bbox2 = draw.textbbox((0, 0), weekday_text, font=font_small)
     tw2 = bbox2[2] - bbox2[0]
     x2 = (width - tw2) / 2
-    draw.text((x2, y + th + 18), weekday_text, fill=sub, font=font_small)
+    draw.text((x2, y + th + 24), weekday_text, fill=sub, font=font_small)
 
     out = BytesIO()
     image.save(out, format="PNG")
