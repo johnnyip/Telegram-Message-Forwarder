@@ -3,7 +3,7 @@ import os
 from typing import Any, Awaitable, Callable
 
 from ..storage.edit_mapping import get_album_mapping, get_message_mapping
-from ..domain.formatting import build_header_from_info
+from ..domain.formatting import build_header_from_info, build_topic_message_url
 from ..domain.timefmt import append_original_time, append_edited_suffix
 from ..core.utils import tstamp
 
@@ -76,12 +76,17 @@ async def edit_forwarded_text(bot, info: dict, text: str, log, semaphore=None) -
         message_id = payload.get("message_id")
         if not message_id:
             continue
+        payload_thread_id = payload.get("message_thread_id")
+        body_with_topic = body
+        topic_url = build_topic_message_url(int(target), payload_thread_id)
+        if topic_url:
+            body_with_topic = f"{body}\n[Topic]({topic_url})"
 
         async def _call():
             try:
-                await bot.edit_message_text(chat_id=int(target), message_id=message_id, text=body, parse_mode="Markdown")
+                await bot.edit_message_text(chat_id=int(target), message_id=message_id, text=body_with_topic, parse_mode="Markdown")
             except Exception:
-                await bot.edit_message_text(chat_id=int(target), message_id=message_id, text=body)
+                await bot.edit_message_text(chat_id=int(target), message_id=message_id, text=body_with_topic)
 
         async def _guarded_call():
             if semaphore is None:
@@ -120,12 +125,17 @@ async def edit_forwarded_media_caption(bot, info: dict, caption_text: str, log, 
         message_id = payload.get("message_id")
         if not message_id:
             continue
+        payload_thread_id = payload.get("message_thread_id")
+        caption_with_topic = caption
+        topic_url = build_topic_message_url(int(target), payload_thread_id)
+        if topic_url:
+            caption_with_topic = f"{caption}\n[Topic]({topic_url})"
 
         async def _call():
             try:
-                await bot.edit_message_caption(chat_id=int(target), message_id=message_id, caption=caption, parse_mode="Markdown")
+                await bot.edit_message_caption(chat_id=int(target), message_id=message_id, caption=caption_with_topic, parse_mode="Markdown")
             except Exception:
-                await bot.edit_message_caption(chat_id=int(target), message_id=message_id, caption=caption)
+                await bot.edit_message_caption(chat_id=int(target), message_id=message_id, caption=caption_with_topic)
 
         async def _guarded_call():
             if semaphore is None:
@@ -167,12 +177,17 @@ async def edit_forwarded_album_caption(bot, info: dict, caption_text: str, log, 
         message_id = payload.get("message_id")
         if not message_id:
             continue
+        payload_thread_id = payload.get("message_thread_id")
+        caption_with_topic = caption
+        topic_url = build_topic_message_url(int(target), payload_thread_id)
+        if topic_url:
+            caption_with_topic = f"{caption}\n[Topic]({topic_url})"
 
         async def _call():
             try:
-                await bot.edit_message_caption(chat_id=int(target), message_id=message_id, caption=caption, parse_mode="Markdown")
+                await bot.edit_message_caption(chat_id=int(target), message_id=message_id, caption=caption_with_topic, parse_mode="Markdown")
             except Exception:
-                await bot.edit_message_caption(chat_id=int(target), message_id=message_id, caption=caption)
+                await bot.edit_message_caption(chat_id=int(target), message_id=message_id, caption=caption_with_topic)
 
         async def _guarded_call():
             if semaphore is None:

@@ -3,6 +3,18 @@ from typing import Any, Optional
 from ..core.utils import safe_str
 
 
+def build_topic_message_url(target_chat_id: Any, message_thread_id: Optional[int]) -> Optional[str]:
+    if not message_thread_id:
+        return None
+    try:
+        s = str(int(target_chat_id))
+    except Exception:
+        return None
+    if s.startswith("-100"):
+        return f"https://t.me/c/{s[4:]}/{int(message_thread_id)}"
+    return None
+
+
 def md_code(value: Any) -> str:
     s = str(value)
     s = s.replace("\\", "\\\\").replace("`", "\\`")
@@ -99,6 +111,7 @@ def should_ignore(info: dict, ignore_users: set, ignore_ids: set) -> bool:
 __all__ = [
     "build_chat_message_url",
     "build_header_from_info",
+    "build_topic_message_url",
     "escape_md_link_text",
     "format_copyable_identity_lines",
     "md_code",
