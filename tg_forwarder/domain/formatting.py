@@ -3,7 +3,7 @@ from typing import Any, Optional
 from ..core.utils import safe_str
 
 
-def build_topic_message_url(target_chat_id: Any, message_thread_id: Optional[int]) -> Optional[str]:
+def build_topic_message_url(target_chat_id: Any, message_thread_id: Optional[int], message_id: Optional[int] = None) -> Optional[str]:
     if not message_thread_id:
         return None
     try:
@@ -11,6 +11,8 @@ def build_topic_message_url(target_chat_id: Any, message_thread_id: Optional[int
     except Exception:
         return None
     if s.startswith("-100"):
+        if message_id:
+            return f"https://t.me/c/{s[4:]}/{int(message_thread_id)}/{int(message_id)}"
         return f"https://t.me/c/{s[4:]}/{int(message_thread_id)}"
     return None
 

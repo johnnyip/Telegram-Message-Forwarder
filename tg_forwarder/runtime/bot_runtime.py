@@ -162,7 +162,7 @@ async def resolve_topic_thread_id(bot, target: Any, info: dict, *, log) -> Optio
 
 async def _append_topic_link(text: str, target: Any, thread_id: Optional[int]) -> str:
     if thread_id:
-        topic_url = build_topic_message_url(target, thread_id)
+        topic_url = build_topic_message_url(target, thread_id, 1)
         if topic_url:
             return f"{text}\n[Topic]({topic_url})"
     return text

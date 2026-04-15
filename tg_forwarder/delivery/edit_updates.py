@@ -78,7 +78,7 @@ async def edit_forwarded_text(bot, info: dict, text: str, log, semaphore=None) -
             continue
         payload_thread_id = payload.get("message_thread_id")
         body_with_topic = body
-        topic_url = build_topic_message_url(int(target), payload_thread_id)
+        topic_url = build_topic_message_url(int(target), payload_thread_id, 1)
         if topic_url:
             body_with_topic = f"{body}\n[Topic]({topic_url})"
 
@@ -127,7 +127,7 @@ async def edit_forwarded_media_caption(bot, info: dict, caption_text: str, log, 
             continue
         payload_thread_id = payload.get("message_thread_id")
         caption_with_topic = caption
-        topic_url = build_topic_message_url(int(target), payload_thread_id)
+        topic_url = build_topic_message_url(int(target), payload_thread_id, 1)
         if topic_url:
             caption_with_topic = f"{caption}\n[Topic]({topic_url})"
 
@@ -179,7 +179,7 @@ async def edit_forwarded_album_caption(bot, info: dict, caption_text: str, log, 
             continue
         payload_thread_id = payload.get("message_thread_id")
         caption_with_topic = caption
-        topic_url = build_topic_message_url(int(target), payload_thread_id)
+        topic_url = build_topic_message_url(int(target), payload_thread_id, 1)
         if topic_url:
             caption_with_topic = f"{caption}\n[Topic]({topic_url})"
 
