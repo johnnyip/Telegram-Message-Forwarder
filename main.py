@@ -3,11 +3,14 @@ import asyncio
 from pathlib import Path
 import json
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from io import BytesIO
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, errors
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
-from telegram import Bot
+from telegram import Bot, InputFile
 from telegram.error import TelegramError
 from telegram.request import HTTPXRequest
 
@@ -20,6 +23,7 @@ from tg_forwarder.storage.dedup_cache import dedup_mark, dedup_seen
 from tg_forwarder.storage.edit_mapping import enabled as edit_mapping_enabled, get_redis
 from tg_forwarder.delivery.edit_updates import edit_forwarded_album_caption, edit_forwarded_media_caption, edit_forwarded_text
 from tg_forwarder.domain.formatting import build_header_from_info, should_ignore
+from tg_forwarder.runtime.bot_runtime import resolve_topic_thread_id
 from tg_forwarder.storage.forward_cache import forward_cache_get, forward_cache_set
 from tg_forwarder.processing.job_processing import JobProcessingContext, dispatch_media_job, process_text_job as process_text_job_mod
 from tg_forwarder.processing.kafka_jobs import publish_album_job as publish_album_job_mod, publish_media_job as publish_media_job_mod, publish_text_job as publish_text_job_mod
@@ -149,6 +153,8 @@ media_consumer: Optional[AIOKafkaConsumer] = None
 BOT_SEND_CONCURRENCY = max(1, int(os.getenv("BOT_SEND_CONCURRENCY", "3")))
 bot_send_semaphore = asyncio.Semaphore(BOT_SEND_CONCURRENCY)
 edit_bot_semaphore = asyncio.Semaphore(1)
+DATE_SEPARATOR_TIMEZONE = os.getenv("DATE_SEPARATOR_TIMEZONE", os.getenv("TZ", "Asia/Hong_Kong")).strip() or "Asia/Hong_Kong"
+DATE_SEPARATOR_ENABLED = os.getenv("DATE_SEPARATOR_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y"}
 
 # Pending albums:
 # (source_kind, chat_id, grouped_id) -> {"messages": {msg_id: msg}, "task": asyncio.Task, "last_update": float}
@@ -1206,6 +1212,94 @@ async def shutdown_kafka():
 # Startup info
 # ============================================================
 
+def _render_date_separator_png(now_local: datetime) -> bytes:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception as exc:
+        raise RuntimeError(f"Pillow required for date separator image: {exc}")
+
+    width, height = 1600, 320
+    bg = (245, 247, 250)
+    fg = (32, 33, 36)
+    sub = (95, 99, 104)
+    line = (210, 214, 220)
+
+    image = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(image)
+
+    try:
+        font_big = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 92)
+        font_small = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 42)
+    except Exception:
+        font_big = ImageFont.load_default()
+        font_small = ImageFont.load_default()
+
+    date_text = now_local.strftime("%Y-%m-%d")
+    weekday_text = now_local.strftime("%A")
+
+    draw.line((80, 160, 520, 160), fill=line, width=4)
+    draw.line((1080, 160, 1520, 160), fill=line, width=4)
+
+    bbox = draw.textbbox((0, 0), date_text, font=font_big)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    x = (width - tw) / 2
+    y = 78
+    draw.text((x, y), date_text, fill=fg, font=font_big)
+
+    bbox2 = draw.textbbox((0, 0), weekday_text, font=font_small)
+    tw2 = bbox2[2] - bbox2[0]
+    x2 = (width - tw2) / 2
+    draw.text((x2, y + th + 18), weekday_text, fill=sub, font=font_small)
+
+    out = BytesIO()
+    image.save(out, format="PNG")
+    return out.getvalue()
+
+
+async def send_daily_date_separator(bot: Bot):
+    tz = ZoneInfo(DATE_SEPARATOR_TIMEZONE)
+    now_local = datetime.now(tz)
+    image_bytes = _render_date_separator_png(now_local)
+    filename = f"date-separator-{now_local.strftime('%Y-%m-%d')}.png"
+
+    seen_targets = set()
+    for route in ROUTES:
+        for target in route["targets"]:
+            if target in seen_targets:
+                continue
+            seen_targets.add(target)
+            thread_id = None
+            try:
+                chat = await bot.get_chat(int(target))
+                if getattr(chat, "is_forum", False):
+                    thread_id = None
+            except Exception as exc:
+                log({"ts": tstamp(), "type": "warn", "op": "date_separator_get_chat_failed", "target": target, "err": exc.__class__.__name__, "msg": str(exc)})
+            try:
+                async with bot_send_semaphore:
+                    await bot.send_photo(chat_id=int(target), photo=InputFile(BytesIO(image_bytes), filename=filename), caption="", message_thread_id=thread_id)
+                log({"ts": tstamp(), "type": "out", "op": "date_separator_send", "status": "ok", "target": int(target), "message_thread_id": thread_id, "date": now_local.strftime("%Y-%m-%d")})
+            except Exception as exc:
+                log({"ts": tstamp(), "type": "err", "op": "date_separator_send", "target": int(target), "message_thread_id": thread_id, "err": exc.__class__.__name__, "msg": str(exc), "date": now_local.strftime("%Y-%m-%d")})
+
+
+async def daily_date_separator_loop(bot: Bot):
+    tz = ZoneInfo(DATE_SEPARATOR_TIMEZONE)
+    last_sent_date = None
+    while True:
+        now_local = datetime.now(tz)
+        next_midnight = (now_local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        sleep_seconds = max(1.0, (next_midnight - now_local).total_seconds())
+        await asyncio.sleep(sleep_seconds)
+        send_now = datetime.now(tz)
+        date_key = send_now.strftime("%Y-%m-%d")
+        if last_sent_date == date_key:
+            continue
+        await send_daily_date_separator(bot)
+        last_sent_date = date_key
+
+
 def print_route_summary():
     summary = []
     for route in ROUTES:
@@ -1352,6 +1446,8 @@ async def main():
                 asyncio.create_task(text_consumer_loop()),
                 asyncio.create_task(media_consumer_loop()),
             ]
+            if DATE_SEPARATOR_ENABLED:
+                consumer_tasks.append(asyncio.create_task(daily_date_separator_loop(bot)))
             await asyncio.gather(*consumer_tasks)
     finally:
         for t in consumer_tasks:
