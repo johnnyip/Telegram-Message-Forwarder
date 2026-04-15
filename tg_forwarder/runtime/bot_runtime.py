@@ -193,13 +193,11 @@ async def send_text_via_bot(bot, target: Any, combined: str, info: dict, route: 
         general_sent = None
         topic_sent = None
         async with bot_send_semaphore:
-            general_sent = await _call_with_retry(lambda: bot_send_text(bot, target, combined, message_thread_id=None))
             if thread_id:
-                combined_with_topic = await _append_topic_link(combined, target, thread_id)
-                topic_sent = await _call_with_retry(lambda: bot_send_text(bot, target, combined_with_topic, message_thread_id=thread_id))
+                topic_sent = await _call_with_retry(lambda: bot_send_text(bot, target, combined, message_thread_id=thread_id))
                 if topic_sent and getattr(topic_sent, "message_id", None):
                     combined = await _append_topic_link(combined, target, thread_id, getattr(topic_sent, "message_id", None))
-                    general_sent = await _call_with_retry(lambda: bot_send_text(bot, target, combined, message_thread_id=None))
+            general_sent = await _call_with_retry(lambda: bot_send_text(bot, target, combined, message_thread_id=None))
         final_general_id = getattr(general_sent, "message_id", None)
         final_topic_id = getattr(topic_sent, "message_id", None)
         log({"ts": tstamp(), "type": "out", "op": "send_text", "status": "ok", **extra, "sent_message_id": final_general_id, "message_thread_id": thread_id, "fanout_general": True, "fanout_topic": bool(thread_id), "topic_message_id": final_topic_id})
@@ -242,14 +240,12 @@ async def send_file_via_bot(bot, target: Any, fpath: Path, caption: str, info: d
         log({"ts": tstamp(), "type": "warn", "op": "send_file_skip_too_large", **extra, "target": target, "media_kind": media_kind, "file_size": file_size, "upload_max_bytes": upload_max_bytes})
         try:
             async with bot_send_semaphore:
-                general_sent = await _call_with_retry(lambda: bot_send_text(bot, target, notice, message_thread_id=None))
                 topic_sent = None
                 if thread_id:
-                    topic_notice = await _append_topic_link(notice, target, thread_id)
-                    topic_sent = await _call_with_retry(lambda: bot_send_text(bot, target, topic_notice, message_thread_id=thread_id))
+                    topic_sent = await _call_with_retry(lambda: bot_send_text(bot, target, notice, message_thread_id=thread_id))
                     if topic_sent and getattr(topic_sent, "message_id", None):
-                        general_notice = await _append_topic_link(notice, target, thread_id, getattr(topic_sent, "message_id", None))
-                        general_sent = await _call_with_retry(lambda: bot_send_text(bot, target, general_notice, message_thread_id=None))
+                        notice = await _append_topic_link(notice, target, thread_id, getattr(topic_sent, "message_id", None))
+                general_sent = await _call_with_retry(lambda: bot_send_text(bot, target, notice, message_thread_id=None))
             log({"ts": tstamp(), "type": "out", "op": "send_file_skip_notice", "status": "ok", **extra, "target": target, "file_size": file_size, "upload_max_bytes": upload_max_bytes, "preserve_local_copy": True, "sent_message_id": getattr(general_sent, "message_id", None), "topic_message_id": getattr(topic_sent, "message_id", None)})
             return SendOutcome(True, preserve_local_copy=True, sent_message_id=getattr(general_sent, "message_id", None), delivery_kind="file_skip_notice", message_thread_id=thread_id, general_message_id=getattr(general_sent, "message_id", None), topic_message_id=getattr(topic_sent, "message_id", None))
         except Exception as exc:
@@ -258,6 +254,21 @@ async def send_file_via_bot(bot, target: Any, fpath: Path, caption: str, info: d
 
     try:
         async with bot_send_semaphore:
+            topic_sent = None
+            if thread_id:
+                topic_sent = await _call_with_retry(
+                    lambda: bot_send_file(
+                        bot,
+                        target,
+                        str(fpath),
+                        caption,
+                        media_type=media_kind,
+                        message_thread_id=thread_id,
+                        log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "topic_copy": True}),
+                    )
+                )
+                if topic_sent and getattr(topic_sent, "message_id", None):
+                    caption = await _append_topic_link(caption, target, thread_id, getattr(topic_sent, "message_id", None))
             general_sent = await _call_with_retry(
                 lambda: bot_send_file(
                     bot,
@@ -269,33 +280,6 @@ async def send_file_via_bot(bot, target: Any, fpath: Path, caption: str, info: d
                     log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload}),
                 )
             )
-            topic_sent = None
-            if thread_id:
-                topic_caption = await _append_topic_link(caption, target, thread_id)
-                topic_sent = await _call_with_retry(
-                    lambda: bot_send_file(
-                        bot,
-                        target,
-                        str(fpath),
-                        topic_caption,
-                        media_type=media_kind,
-                        message_thread_id=thread_id,
-                        log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "topic_copy": True}),
-                    )
-                )
-                if topic_sent and getattr(topic_sent, "message_id", None):
-                    general_caption = await _append_topic_link(caption, target, thread_id, getattr(topic_sent, "message_id", None))
-                    general_sent = await _call_with_retry(
-                        lambda: bot_send_file(
-                            bot,
-                            target,
-                            str(fpath),
-                            general_caption,
-                            media_type=media_kind,
-                            message_thread_id=None,
-                            log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "general_resend": True}),
-                        )
-                    )
         log({"ts": tstamp(), "type": "out", "op": "send_file", "status": "ok", **extra, "media_kind": media_kind, "sent_message_id": getattr(general_sent, "message_id", None), "message_thread_id": thread_id, "topic_message_id": getattr(topic_sent, "message_id", None)})
         return SendOutcome(True, sent_message_id=getattr(general_sent, "message_id", None), delivery_kind="file", message_thread_id=thread_id, general_message_id=getattr(general_sent, "message_id", None), topic_message_id=getattr(topic_sent, "message_id", None))
     except Exception as exc:
@@ -329,6 +313,23 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
         if has_large_video:
             raise RuntimeError(f"album_too_large_for_media_group total_size={total_size} threshold={album_max_total_bytes}")
         async with bot_send_semaphore:
+            topic_sent = None
+            if thread_id:
+                topic_sent = await _call_with_retry(
+                    lambda: bot_send_album(
+                        bot,
+                        target,
+                        files,
+                        caption,
+                        media_types=media_types,
+                        message_thread_id=thread_id,
+                        log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "topic_copy": True}),
+                    )
+                )
+                topic_ids = [getattr(x, "message_id", None) for x in (topic_sent or [])]
+                topic_first_id = topic_ids[0] if topic_ids else None
+                if topic_first_id:
+                    caption = await _append_topic_link(caption, target, thread_id, topic_first_id)
             general_sent = await _call_with_retry(
                 lambda: bot_send_album(
                     bot,
@@ -340,35 +341,6 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
                     log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload}),
                 )
             )
-            topic_sent = None
-            if thread_id:
-                topic_caption = await _append_topic_link(caption, target, thread_id)
-                topic_sent = await _call_with_retry(
-                    lambda: bot_send_album(
-                        bot,
-                        target,
-                        files,
-                        topic_caption,
-                        media_types=media_types,
-                        message_thread_id=thread_id,
-                        log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "topic_copy": True}),
-                    )
-                )
-                topic_ids = [getattr(x, "message_id", None) for x in (topic_sent or [])]
-                topic_first_id = topic_ids[0] if topic_ids else None
-                if topic_first_id:
-                    general_caption = await _append_topic_link(caption, target, thread_id, topic_first_id)
-                    general_sent = await _call_with_retry(
-                        lambda: bot_send_album(
-                            bot,
-                            target,
-                            files,
-                            general_caption,
-                            media_types=media_types,
-                            message_thread_id=None,
-                            log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "general_resend": True}),
-                        )
-                    )
         general_ids = [getattr(x, "message_id", None) for x in (general_sent or [])]
         topic_ids = [getattr(x, "message_id", None) for x in (topic_sent or [])]
         log({"ts": tstamp(), "type": "out", "op": "send_album", "status": "ok", **extra, "total_size": total_size, "sent_message_ids": general_ids, "message_thread_id": thread_id, "topic_message_ids": topic_ids})
@@ -412,24 +384,13 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
                     )
                     notice = append_original_time(notice, info.get("msg_date"))
                     async with bot_send_semaphore:
-                        sent = await _call_with_retry(lambda n=notice: bot_send_text(bot, target, n, message_thread_id=None))
                         if thread_id:
                             await _call_with_retry(lambda n=notice: bot_send_text(bot, target, n, message_thread_id=thread_id))
+                        sent = await _call_with_retry(lambda n=notice: bot_send_text(bot, target, n, message_thread_id=None))
                     log({"ts": tstamp(), "type": "out", "op": "send_album_single_skip_notice", "status": "ok", "file": single, "target": target, "media_type": single_type, "preserve_local_copy": True, "sent_message_id": getattr(sent, "message_id", None), **extra})
                     preserve_local_copy = True
                 else:
                     async with bot_send_semaphore:
-                        sent = await _call_with_retry(
-                            lambda sp=single, sc=single_caption, st=single_type: bot_send_file(
-                                bot,
-                                target,
-                                sp,
-                                sc,
-                                media_type=st,
-                                message_thread_id=None,
-                                log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "fallback_single": True, "file": sp, "media_type": st}),
-                            )
-                        )
                         if thread_id:
                             await _call_with_retry(
                                 lambda sp=single, sc=single_caption, st=single_type: bot_send_file(
@@ -442,6 +403,17 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
                                     log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "fallback_single": True, "topic_copy": True, "file": sp, "media_type": st}),
                                 )
                             )
+                        sent = await _call_with_retry(
+                            lambda sp=single, sc=single_caption, st=single_type: bot_send_file(
+                                bot,
+                                target,
+                                sp,
+                                sc,
+                                media_type=st,
+                                message_thread_id=None,
+                                log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "fallback_single": True, "file": sp, "media_type": st}),
+                            )
+                        )
                     log({"ts": tstamp(), "type": "out", "op": "send_album_single_fallback", "status": "ok", "file": single, "target": target, "media_type": single_type, "sent_message_id": getattr(sent, "message_id", None), **extra})
                 if getattr(sent, "message_id", None):
                     fallback_message_ids.append(getattr(sent, "message_id", None))
