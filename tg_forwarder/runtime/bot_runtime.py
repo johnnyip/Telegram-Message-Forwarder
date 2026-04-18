@@ -187,21 +187,13 @@ async def send_text_via_bot(bot, target: Any, combined: str, info: dict, route: 
         "sender_display": info["sender_display"],
         "source_kind": source_kind,
     }
-    thread_id = await resolve_topic_thread_id(bot, target, info, log=log)
-    maybe_verbose_log(log, {"ts": tstamp(), "type": "info", "op": "send_text_attempt", **extra, "target": target, "text_preview": combined[:200], "message_thread_id": thread_id})
+    maybe_verbose_log(log, {"ts": tstamp(), "type": "info", "op": "send_text_attempt", **extra, "target": target, "text_preview": combined[:200], "message_thread_id": None, "topic_delivery": False})
     try:
-        general_sent = None
-        topic_sent = None
         async with bot_send_semaphore:
-            if thread_id:
-                topic_sent = await _call_with_retry(lambda: bot_send_text(bot, target, combined, message_thread_id=thread_id))
-                if topic_sent and getattr(topic_sent, "message_id", None):
-                    combined = await _append_topic_link(combined, target, thread_id, getattr(topic_sent, "message_id", None))
             general_sent = await _call_with_retry(lambda: bot_send_text(bot, target, combined, message_thread_id=None))
         final_general_id = getattr(general_sent, "message_id", None)
-        final_topic_id = getattr(topic_sent, "message_id", None)
-        log({"ts": tstamp(), "type": "out", "op": "send_text", "status": "ok", **extra, "sent_message_id": final_general_id, "message_thread_id": thread_id, "fanout_general": True, "fanout_topic": bool(thread_id), "topic_message_id": final_topic_id})
-        return SendOutcome(True, sent_message_id=final_general_id, delivery_kind="text", message_thread_id=thread_id, general_message_id=final_general_id, topic_message_id=final_topic_id)
+        log({"ts": tstamp(), "type": "out", "op": "send_text", "status": "ok", **extra, "sent_message_id": final_general_id, "message_thread_id": None, "fanout_general": True, "fanout_topic": False, "topic_message_id": None})
+        return SendOutcome(True, sent_message_id=final_general_id, delivery_kind="text", message_thread_id=None, general_message_id=final_general_id, topic_message_id=None)
     except Exception as exc:
         log({"ts": tstamp(), "type": "err", "op": "send_text", "err": exc.__class__.__name__, "msg": str(exc), **extra, "target": target, "text_preview": combined[:200], "text_len": len(combined)})
         return SendOutcome(False)
