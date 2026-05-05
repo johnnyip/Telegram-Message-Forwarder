@@ -45,6 +45,7 @@ from telethon.tl.functions.messages import ForwardMessagesRequest
 
 from ..core.utils import tstamp
 from ..domain.media import media_type
+from ..forum_topics import find_latest_topic_for_sender
 from ..storage.edit_mapping import get_topic_mapping, store_topic_mapping
 from .checkpoint import load_checkpoint, save_checkpoint, MIGRATE_CHECKPOINT_PATH
 from .parser import ParsedSender, parse_sender
@@ -152,6 +153,26 @@ async def _get_or_create_topic(
             return int(thread_id)
     except Exception as exc:
         log({"ts": tstamp(), "type": "warn", "op": "migrate_topic_lookup",
+             "chat_id": chat_id, "sender_id": sender_id,
+             "err": exc.__class__.__name__, "msg": str(exc)})
+
+    # 1.5. Redis miss: scan existing Telegram forum topics before creating a
+    # fresh one, so cache loss / mapping drift does not immediately create a
+    # duplicate topic for the same sender.
+    try:
+        discovered = await find_latest_topic_for_sender(client, chat_id, sender_id)
+        discovered_id = int(getattr(discovered, "id", 0) or 0) if discovered else 0
+        if discovered_id:
+            await store_topic_mapping(chat_id, sender_id, {
+                "message_thread_id": discovered_id,
+                "title": getattr(discovered, "title", topic_title),
+            })
+            log({"ts": tstamp(), "type": "info", "op": "migrate_topic_discovered",
+                 "chat_id": chat_id, "sender_id": sender_id,
+                 "thread_id": discovered_id, "title": getattr(discovered, "title", topic_title)})
+            return discovered_id
+    except Exception as exc:
+        log({"ts": tstamp(), "type": "warn", "op": "migrate_topic_discovery",
              "chat_id": chat_id, "sender_id": sender_id,
              "err": exc.__class__.__name__, "msg": str(exc)})
 

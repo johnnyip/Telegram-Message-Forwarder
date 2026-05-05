@@ -130,12 +130,13 @@ async def store_topic_mapping(target_chat_id: int, sender_id: int, payload: Dict
     redis = await get_redis()
     if redis is None:
         return
-    # P4: topic mappings now have a TTL so stale entries eventually expire.
-    await redis.set(
-        _topic_key(target_chat_id, sender_id),
-        json.dumps(payload, ensure_ascii=False),
-        ex=TOPIC_MAPPING_TTL_SECONDS,
-    )
+    value = json.dumps(payload, ensure_ascii=False)
+    # P4: topic mappings are long-lived. When TTL <= 0, treat that as
+    # persistent/no-expiry so reboot-safe deployments can keep topic affinity.
+    if TOPIC_MAPPING_TTL_SECONDS <= 0:
+        await redis.set(_topic_key(target_chat_id, sender_id), value)
+        return
+    await redis.set(_topic_key(target_chat_id, sender_id), value, ex=TOPIC_MAPPING_TTL_SECONDS)
 
 
 async def acquire_topic_lock(target_chat_id: int, sender_id: int, *, ttl: int = 30) -> Optional[str]:

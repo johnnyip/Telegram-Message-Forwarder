@@ -20,7 +20,7 @@ from tg_forwarder.domain.file_policy import is_stale_file
 from tg_forwarder.runtime.healthcheck import default_health_path, write_health_file
 from tg_forwarder.runtime.debug_flags import configure_telethon_logger, maybe_debug_log
 from tg_forwarder.storage.dedup_cache import dedup_mark, dedup_seen
-from tg_forwarder.storage.edit_mapping import enabled as edit_mapping_enabled, get_redis
+from tg_forwarder.storage.edit_mapping import enabled as edit_mapping_enabled, get_redis, get_topic_mapping, store_topic_mapping
 from tg_forwarder.delivery.edit_updates import edit_forwarded_album_caption, edit_forwarded_media_caption, edit_forwarded_text
 from tg_forwarder.domain.formatting import build_header_from_info, should_ignore
 from tg_forwarder.runtime.bot_runtime import resolve_topic_thread_id
@@ -36,6 +36,7 @@ from tg_forwarder.delivery.senders import fetch_message_by_id as fetch_message_b
 from tg_forwarder.processing.snapshot import snapshot_album_messages as snapshot_album_messages_mod, snapshot_media_message as snapshot_media_message_mod
 from tg_forwarder.domain.telegram_info import resolve_sender_info_from_message
 from tg_forwarder.storage.send_journal import journal_claim, journal_get, journal_mark, journal_record_failure, journal_is_poison, SEND_JOURNAL_MAX_FAILURES
+from tg_forwarder.forum_topics import find_latest_topic_for_sender
 from tg_forwarder.core.utils import cleanup_files, cleanup_logs, cleanup_retained_files, json_bytes, log as base_log, now_ts, tstamp
 from tg_forwarder.runtime.verbose_flags import BOT_STARTUP_SMOKE_TEST
 # migrate imports are lazy — loaded only when APP_MODE=migrate
@@ -76,8 +77,8 @@ KAFKA_TEXT_TOPIC = os.getenv("KAFKA_TEXT_TOPIC", "tg-forward-text")
 KAFKA_MEDIA_TOPIC = os.getenv("KAFKA_MEDIA_TOPIC", "tg-forward-media")
 KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP", "tg-forwarder")
 APP_MODE = os.getenv("APP_MODE", "listen").strip().lower()
-if APP_MODE not in {"listen", "send", "migrate"}:
-    raise RuntimeError("APP_MODE must be 'listen', 'send', or 'migrate'")
+if APP_MODE not in {"listen", "send", "migrate", "reconcile"}:
+    raise RuntimeError("APP_MODE must be 'listen', 'send', 'migrate', or 'reconcile'")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 BOT_HTTP_POOL_SIZE = max(1, int(os.getenv("BOT_HTTP_POOL_SIZE", "80")))
 BOT_POOL_TIMEOUT_SECONDS = float(os.getenv("BOT_POOL_TIMEOUT_SECONDS", "90"))
@@ -128,7 +129,7 @@ LOGGER = setup_logging()
 configure_telethon_logger()
 
 client: Optional[TelegramClient] = None
-if APP_MODE in {"listen", "migrate"}:
+if APP_MODE in {"listen", "migrate", "reconcile"}:
     if API_ID is None or not API_HASH:
         raise RuntimeError(f"API_ID and API_HASH are required in APP_MODE={APP_MODE}")
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH, base_logger="telethon")
@@ -333,13 +334,53 @@ async def snapshot_album_messages(msgs: List[Any], info: dict, source_kind: str)
 # Kafka producer side
 # ============================================================
 
+async def _enrich_topic_hints(info: dict, routes: List[Dict[str, Any]]) -> dict:
+    if client is None:
+        return info
+    sender_id = info.get("sender_id")
+    if sender_id is None:
+        return info
+    hints = dict(info.get("_resolved_topic_threads") or {})
+    for route in routes:
+        for target in route.get("targets", []):
+            target_chat_id = int(target)
+            if str(target_chat_id) in hints:
+                continue
+            try:
+                existing = await get_topic_mapping(target_chat_id, int(sender_id))
+                existing_thread = existing.get("message_thread_id") if isinstance(existing, dict) else None
+                if existing_thread:
+                    hints[str(target_chat_id)] = int(existing_thread)
+                    continue
+            except Exception as exc:
+                log({"ts": tstamp(), "type": "warn", "op": "prefetch_topic_mapping", "target": target_chat_id, "sender_id": int(sender_id), "err": exc.__class__.__name__, "msg": str(exc)})
+            try:
+                discovered = await find_latest_topic_for_sender(client, target_chat_id, int(sender_id))
+                discovered_id = int(getattr(discovered, "id", 0) or 0) if discovered else 0
+                if discovered_id:
+                    hints[str(target_chat_id)] = discovered_id
+                    await store_topic_mapping(target_chat_id, int(sender_id), {
+                        "message_thread_id": discovered_id,
+                        "title": getattr(discovered, "title", None),
+                    })
+            except Exception as exc:
+                log({"ts": tstamp(), "type": "warn", "op": "prefetch_topic_discovery", "target": target_chat_id, "sender_id": int(sender_id), "err": exc.__class__.__name__, "msg": str(exc)})
+    if not hints:
+        return info
+    enriched = dict(info)
+    enriched["_resolved_topic_threads"] = hints
+    return enriched
+
+
 async def publish_text_job(msg, info: dict, routes: List[Dict[str, Any]], source_kind: str):
     assert producer is not None
+    info = await _enrich_topic_hints(info, routes)
     await publish_text_job_mod(msg, info, routes, source_kind, delay_seconds=DELAY_SECONDS, topic=KAFKA_TEXT_TOPIC, producer=producer, json_bytes=json_bytes, log=log)
 
 
 async def publish_media_job(msg, info: dict, routes: List[Dict[str, Any]], source_kind: str):
     assert producer is not None
+    info = await _enrich_topic_hints(info, routes)
     await publish_media_job_mod(
         msg, info, routes, source_kind,
         media_delay_seconds=MEDIA_DELAY_SECONDS,
@@ -361,6 +402,7 @@ async def publish_media_job(msg, info: dict, routes: List[Dict[str, Any]], sourc
 
 async def publish_album_job(msgs: List[Any], info: dict, routes: List[Dict[str, Any]], source_kind: str):
     assert producer is not None
+    info = await _enrich_topic_hints(info, routes)
     await publish_album_job_mod(
         msgs, info, routes, source_kind,
         media_delay_seconds=MEDIA_DELAY_SECONDS,
@@ -1371,6 +1413,10 @@ def startup_banner() -> str:
         _dry = os.getenv("MIGRATE_DRY_RUN", "false").strip().lower() in {"1", "true", "yes", "y"}
         dry = " [DRY RUN]" if _dry else ""
         return f"🚀 tg-forwarder migrate up | session={SESSION_NAME} | telethon=reader+forwarder{dry}"
+    if APP_MODE == "reconcile":
+        _dry = os.getenv("RECONCILE_DRY_RUN", "false").strip().lower() in {"1", "true", "yes", "y"}
+        dry = " [DRY RUN]" if _dry else ""
+        return f"🚀 tg-forwarder reconcile up | session={SESSION_NAME} | telethon=topic-repair{dry}"
     return "🚀 tg-forwarder send up | sender=telegram-bot | kafka=consumers"
 
 
@@ -1449,6 +1495,20 @@ async def main():
             if DATE_SEPARATOR_ENABLED:
                 consumer_tasks.append(asyncio.create_task(daily_date_separator_loop(bot)))
             await asyncio.gather(*consumer_tasks)
+
+        elif APP_MODE == "reconcile":
+            LOGGER.info("startup reconcile mode reader=telethon-user repair=forum-topics kafka=none")
+            assert client is not None
+            async with client:
+                try:
+                    me = await client.get_me()
+                    LOGGER.info("telethon auth ok id=%s username=%s", getattr(me, "id", None), getattr(me, "username", None))
+                except Exception as e:
+                    LOGGER.warning("telethon auth probe failed err=%s msg=%s", e.__class__.__name__, str(e))
+                touch_health("reconcile:running")
+                from tg_forwarder.reconcile_topics import run_topic_reconcile
+                await run_topic_reconcile(client, log)
+                touch_health("reconcile:done")
     finally:
         for t in consumer_tasks:
             if not t.done():
