@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import random
@@ -5,6 +6,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from telethon import errors
 from telethon.tl.functions.messages import DeleteTopicHistoryRequest, EditForumTopicRequest, ForwardMessagesRequest
 
 from .core.utils import tstamp
@@ -12,6 +14,7 @@ from .forum_topics import iter_forum_topics, parse_sender_id_from_topic_title, p
 from .storage.edit_mapping import store_topic_mapping
 
 RECONCILE_TARGET_CHAT_ID_RAW = os.getenv("RECONCILE_TARGET_CHAT_ID", "")
+RECONCILE_TARGET_CHAT_IDS_RAW = os.getenv("RECONCILE_TARGET_CHAT_IDS", "")
 RECONCILE_DRY_RUN = os.getenv("RECONCILE_DRY_RUN", "false").strip().lower() in {"1", "true", "yes", "y"}
 RECONCILE_DELETE_OLD = os.getenv("RECONCILE_DELETE_OLD", "true").strip().lower() in {"1", "true", "yes", "y"}
 RECONCILE_CLOSE_OLD = os.getenv("RECONCILE_CLOSE_OLD", "true").strip().lower() in {"1", "true", "yes", "y"}
@@ -20,6 +23,26 @@ RECONCILE_STATE_PATH = Path(os.getenv("RECONCILE_STATE_PATH", "/app/downloads/re
 RECONCILE_AUDIT_MESSAGE = os.getenv("RECONCILE_AUDIT_MESSAGE", "true").strip().lower() in {"1", "true", "yes", "y"}
 RECONCILE_ONLY_SENDER_ID_RAW = os.getenv("RECONCILE_ONLY_SENDER_ID", "").strip()
 RECONCILE_ONLY_SENDER_ID = int(RECONCILE_ONLY_SENDER_ID_RAW) if RECONCILE_ONLY_SENDER_ID_RAW.isdigit() else None
+RECONCILE_FORWARD_DELAY_SECONDS = max(0.0, float(os.getenv("RECONCILE_FORWARD_DELAY_SECONDS", "0.5")))
+RECONCILE_FLOODWAIT_PADDING_SECONDS = max(0.0, float(os.getenv("RECONCILE_FLOODWAIT_PADDING_SECONDS", "3")))
+
+
+def _parse_target_chat_ids() -> List[int]:
+    raw_values = []
+    if RECONCILE_TARGET_CHAT_IDS_RAW.strip():
+        raw_values.extend(RECONCILE_TARGET_CHAT_IDS_RAW.split(","))
+    if RECONCILE_TARGET_CHAT_ID_RAW.strip():
+        raw_values.append(RECONCILE_TARGET_CHAT_ID_RAW.strip())
+
+    chat_ids: List[int] = []
+    for raw in raw_values:
+        value = raw.strip()
+        if not value:
+            continue
+        chat_ids.append(int(value))
+    if not chat_ids:
+        raise RuntimeError("RECONCILE_TARGET_CHAT_ID or RECONCILE_TARGET_CHAT_IDS env var is required in APP_MODE=reconcile")
+    return chat_ids
 
 
 def _load_state() -> Dict[str, Any]:
@@ -52,24 +75,36 @@ async def _iter_user_messages(client, chat_id: int, topic_id: int):
         yield msg
 
 
-async def _forward_batch(client, input_peer, msg_ids: List[int], target_topic_id: int) -> List[int]:
+async def _forward_batch(client, input_peer, msg_ids: List[int], target_topic_id: int, log, extra: Dict[str, Any]) -> List[int]:
     if not msg_ids:
         return []
-    result = await client(ForwardMessagesRequest(
-        from_peer=input_peer,
-        id=[int(mid) for mid in msg_ids],
-        to_peer=input_peer,
-        top_msg_id=int(target_topic_id),
-        random_id=[random.randint(0, 2 ** 63) for _ in msg_ids],
-        silent=True,
-    ))
-    updates = list(getattr(result, "updates", []) or [])
-    new_ids: List[int] = []
-    for update in updates:
-        mid = getattr(update, "id", None)
-        if isinstance(mid, int):
-            new_ids.append(mid)
-    return new_ids
+    while True:
+        try:
+            result = await client(ForwardMessagesRequest(
+                from_peer=input_peer,
+                id=[int(mid) for mid in msg_ids],
+                to_peer=input_peer,
+                top_msg_id=int(target_topic_id),
+                random_id=[random.randint(0, 2 ** 63) for _ in msg_ids],
+                silent=True,
+            ))
+            updates = list(getattr(result, "updates", []) or [])
+            new_ids: List[int] = []
+            for update in updates:
+                mid = getattr(update, "id", None)
+                if isinstance(mid, int):
+                    new_ids.append(mid)
+            return new_ids
+        except errors.FloodWaitError as exc:
+            wait_seconds = float(getattr(exc, "seconds", 0) or 0) + RECONCILE_FLOODWAIT_PADDING_SECONDS
+            log({
+                "ts": tstamp(),
+                "type": "warn",
+                "op": "topic_reconcile_flood_wait",
+                "wait_seconds": wait_seconds,
+                **extra,
+            })
+            await asyncio.sleep(wait_seconds)
 
 
 def _build_forward_batches(pending: List[Any], batch_size: int) -> List[List[int]]:
@@ -136,13 +171,21 @@ async def _move_topic_messages(client, chat_id: int, old_topic: Any, latest_topi
     input_peer = await client.get_input_entity(chat_id)
 
     for batch_ids in _build_forward_batches(pending, RECONCILE_BATCH_SIZE):
+        extra = {
+            "chat_id": chat_id,
+            "source_topic_id": old_topic_id,
+            "target_topic_id": latest_topic_id,
+            "batch_size": len(batch_ids),
+        }
         try:
-            new_ids = await _forward_batch(client, input_peer, batch_ids, latest_topic_id)
+            new_ids = await _forward_batch(client, input_peer, batch_ids, latest_topic_id, log, extra)
             if len(new_ids) != len(batch_ids):
                 raise RuntimeError(f"forwarded_count_mismatch expected={len(batch_ids)} got={len(new_ids)}")
             for src_id in batch_ids:
                 moved[str(src_id)] = {"moved_at": tstamp()}
             _save_state(state)
+            if RECONCILE_FORWARD_DELAY_SECONDS > 0:
+                await asyncio.sleep(RECONCILE_FORWARD_DELAY_SECONDS)
         except Exception as exc:
             entry["status"] = "move_failed"
             entry["last_error"] = {"err": exc.__class__.__name__, "msg": str(exc), "batch_ids": batch_ids}
@@ -218,13 +261,7 @@ async def _close_and_delete_old_topic(client, chat_id: int, old_topic: Any, late
     })
 
 
-async def run_topic_reconcile(client, log):
-    if not RECONCILE_TARGET_CHAT_ID_RAW:
-        raise RuntimeError("RECONCILE_TARGET_CHAT_ID env var is required in APP_MODE=reconcile")
-
-    chat_id = int(RECONCILE_TARGET_CHAT_ID_RAW.strip())
-    state = _load_state()
-
+async def _run_topic_reconcile_for_chat(client, chat_id: int, log, state: Dict[str, Any]) -> None:
     all_topics = []
     async for topic in iter_forum_topics(client, chat_id):
         all_topics.append(topic)
@@ -279,3 +316,9 @@ async def run_topic_reconcile(client, log):
             await _close_and_delete_old_topic(client, chat_id, old_topic, latest_topic, sender_id, int(result.get("source_count", 0)), log, state)
 
     log({"ts": tstamp(), "type": "out", "op": "topic_reconcile_done", "chat_id": chat_id})
+
+
+async def run_topic_reconcile(client, log):
+    state = _load_state()
+    for chat_id in _parse_target_chat_ids():
+        await _run_topic_reconcile_for_chat(client, chat_id, log, state)
