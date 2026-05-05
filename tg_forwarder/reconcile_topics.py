@@ -78,7 +78,14 @@ def _build_forward_batches(pending: List[Any], batch_size: int) -> List[List[int
     current_group = None
     for msg in pending:
         grouped_id = getattr(msg, "grouped_id", None)
-        if current and len(current) >= batch_size and grouped_id != current_group:
+        should_split = False
+        if current and len(current) >= batch_size:
+            # Keep album/media-group messages together when we are still inside
+            # the same grouped_id, but split ordinary (grouped_id=None) traffic
+            # as soon as the batch reaches the limit.
+            if grouped_id is None or current_group is None or grouped_id != current_group:
+                should_split = True
+        if should_split:
             batches.append(current)
             current = []
             current_group = None
