@@ -12,6 +12,8 @@ EDIT_MAPPING_TTL_SECONDS = int(os.getenv("EDIT_MAPPING_TTL_SECONDS", "86400"))
 TOPIC_MAPPING_TTL_SECONDS = int(os.getenv("TOPIC_MAPPING_TTL_SECONDS", str(90 * 24 * 3600)))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 REDIS_PREFIX = os.getenv("REDIS_PREFIX", "tgfwd")
+REDIS_USERNAME = os.getenv("REDIS_USERNAME", "").strip()
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
 
 _redis: Optional[Redis] = None
 
@@ -50,7 +52,17 @@ async def get_redis() -> Optional[Redis]:
     if not enabled():
         return None
     if _redis is None:
-        _redis = Redis(host=REDIS_HOSTNAME, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
+        kwargs = {
+            "host": REDIS_HOSTNAME,
+            "port": REDIS_PORT,
+            "db": REDIS_DB,
+            "decode_responses": True,
+        }
+        if REDIS_USERNAME:
+            kwargs["username"] = REDIS_USERNAME
+        if REDIS_PASSWORD:
+            kwargs["password"] = REDIS_PASSWORD
+        _redis = Redis(**kwargs)
     return _redis
 
 
@@ -171,6 +183,8 @@ __all__ = [
     "REDIS_HOSTNAME",
     "REDIS_PORT",
     "REDIS_PREFIX",
+    "REDIS_USERNAME",
+    "REDIS_PASSWORD",
     "acquire_topic_lock",
     "enabled",
     "get_album_mapping",
