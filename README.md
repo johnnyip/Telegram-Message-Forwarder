@@ -57,6 +57,7 @@ Direct-forward Kafka jobs are therefore disabled by default; `ENABLE_DIRECT_FORW
 - `FORWARD_POLICY`
 - `FORWARDABLE_SOURCE_CHATS`
 - `NONFORWARDABLE_SOURCE_CHATS`
+- `FORUM_TOPIC_DELIVERY_MODE`
 - `SKIP_MESSAGE_TYPES`
 - `LOG_LEVEL`
 - `ENABLE_DEBUG_LOGS`
@@ -103,6 +104,17 @@ Listen mode can drop selected message types before they ever become Kafka jobs:
 - `SKIP_MESSAGE_TYPES=text,image`
 
 `image` applies to Telegram photos only. Videos, documents, audio, and other media continue normally.
+
+## Forum topic delivery mode
+
+When a target chat is a forum/topic-enabled Telegram group:
+
+- `FORUM_TOPIC_DELIVERY_MODE=mirror`
+  - current default
+  - send to the sender's individual topic and also keep the general-copy behavior
+- `FORUM_TOPIC_DELIVERY_MODE=topic_only`
+  - if a sender-specific topic is available, send only to that topic
+  - if no topic can be resolved/created, fall back to general delivery
 
 ## Bot media policy
 Default behavior is to **keep the original format as much as possible**:
