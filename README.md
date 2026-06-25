@@ -48,10 +48,16 @@ Direct-forward Kafka jobs are therefore disabled by default; `ENABLE_DIRECT_FORW
 - `KAFKA_TEXT_TOPIC`
 - `KAFKA_MEDIA_TOPIC`
 - `KAFKA_CONSUMER_GROUP`
+- `KAFKA_PRODUCER_COMPRESSION_TYPE`
+- `KAFKA_PRODUCER_LINGER_MS`
+- `KAFKA_PRODUCER_MAX_BATCH_SIZE`
+- `KAFKA_CONSUMER_COMMIT_EVERY`
+- `KAFKA_CONSUMER_COMMIT_INTERVAL_SECONDS`
 - `LARGE_MEDIA_FORWARD_THRESHOLD_MB`
 - `FORWARD_POLICY`
 - `FORWARDABLE_SOURCE_CHATS`
 - `NONFORWARDABLE_SOURCE_CHATS`
+- `SKIP_MESSAGE_TYPES`
 - `LOG_LEVEL`
 - `ENABLE_DEBUG_LOGS`
 - `TELETHON_DEBUG`
@@ -75,6 +81,28 @@ Direct-forward Kafka jobs are therefore disabled by default; `ENABLE_DIRECT_FORW
 - `BOT_SEND_CONCURRENCY`
 - `HEALTH_FILE`
 - `STALE_FILE_HOURS`
+
+## Kafka write-reduction knobs
+
+- Producer defaults now favor lower broker churn:
+  - `KAFKA_PRODUCER_COMPRESSION_TYPE=gzip`
+  - `KAFKA_PRODUCER_LINGER_MS=50`
+  - `KAFKA_PRODUCER_MAX_BATCH_SIZE=131072`
+- Send-mode consumers still use manual commits, but offsets are now batched by default:
+  - `KAFKA_CONSUMER_COMMIT_EVERY=100`
+  - `KAFKA_CONSUMER_COMMIT_INTERVAL_SECONDS=5`
+- To disable producer compression explicitly, set:
+  - `KAFKA_PRODUCER_COMPRESSION_TYPE=none`
+
+## Selective skip mode
+
+Listen mode can drop selected message types before they ever become Kafka jobs:
+
+- `SKIP_MESSAGE_TYPES=text`
+- `SKIP_MESSAGE_TYPES=image`
+- `SKIP_MESSAGE_TYPES=text,image`
+
+`image` applies to Telegram photos only. Videos, documents, audio, and other media continue normally.
 
 ## Bot media policy
 Default behavior is to **keep the original format as much as possible**:

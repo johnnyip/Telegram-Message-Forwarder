@@ -10,6 +10,7 @@ from io import BytesIO
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, errors
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
+from aiokafka.structs import TopicPartition
 from telegram import Bot, InputFile
 from telegram.error import TelegramError
 from telegram.request import HTTPXRequest
@@ -29,7 +30,7 @@ from tg_forwarder.processing.job_processing import JobProcessingContext, dispatc
 from tg_forwarder.processing.kafka_jobs import publish_album_job as publish_album_job_mod, publish_media_job as publish_media_job_mod, publish_text_job as publish_text_job_mod
 from tg_forwarder.runtime.lag_stats import lag_record, lag_summary
 from tg_forwarder.runtime.logging_setup import setup_logging
-from tg_forwarder.domain.media import get_media_size, media_type
+from tg_forwarder.domain.media import get_media_size, media_type, skip_message_kind
 from tg_forwarder.core.metrics import StepTimer
 from tg_forwarder.domain.routes import find_matching_routes, load_routes
 from tg_forwarder.delivery.senders import fetch_message_by_id as fetch_message_by_id_mod, fetch_messages_by_ids as fetch_messages_by_ids_mod, send_album_to_target as send_album_to_target_mod, send_file_to_target as send_file_to_target_mod, send_text_to_target as send_text_to_target_mod
@@ -76,6 +77,13 @@ KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 KAFKA_TEXT_TOPIC = os.getenv("KAFKA_TEXT_TOPIC", "tg-forward-text")
 KAFKA_MEDIA_TOPIC = os.getenv("KAFKA_MEDIA_TOPIC", "tg-forward-media")
 KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP", "tg-forwarder")
+KAFKA_PRODUCER_COMPRESSION_TYPE = (os.getenv("KAFKA_PRODUCER_COMPRESSION_TYPE", "gzip").strip().lower() or "gzip")
+if KAFKA_PRODUCER_COMPRESSION_TYPE in {"0", "false", "none", "off"}:
+    KAFKA_PRODUCER_COMPRESSION_TYPE = None
+KAFKA_PRODUCER_LINGER_MS = max(0, int(os.getenv("KAFKA_PRODUCER_LINGER_MS", "50")))
+KAFKA_PRODUCER_MAX_BATCH_SIZE = max(16384, int(os.getenv("KAFKA_PRODUCER_MAX_BATCH_SIZE", "131072")))
+KAFKA_CONSUMER_COMMIT_EVERY = max(1, int(os.getenv("KAFKA_CONSUMER_COMMIT_EVERY", "100")))
+KAFKA_CONSUMER_COMMIT_INTERVAL_SECONDS = max(0.0, float(os.getenv("KAFKA_CONSUMER_COMMIT_INTERVAL_SECONDS", "5")))
 APP_MODE = os.getenv("APP_MODE", "listen").strip().lower()
 if APP_MODE not in {"listen", "send", "migrate", "reconcile"}:
     raise RuntimeError("APP_MODE must be 'listen', 'send', 'migrate', or 'reconcile'")
@@ -107,6 +115,11 @@ IGNORE_IDS = {
     int(x.strip())
     for x in os.getenv("IGNORE_IDS", "").split(",")
     if x.strip() and x.strip().lstrip("-").isdigit()
+}
+SKIP_MESSAGE_TYPES = {
+    x.strip().lower()
+    for x in os.getenv("SKIP_MESSAGE_TYPES", "").split(",")
+    if x.strip()
 }
 
 # Optional allowlist / denylist
@@ -296,6 +309,10 @@ def dedup_key_for_message(info: dict, source_kind: str) -> str:
 
 def dedup_key_for_album(chat_id: int, grouped_id: int, source_kind: str) -> str:
     return f"album:{chat_id}:{grouped_id}:{source_kind}"
+
+
+def should_skip_message(msg) -> Optional[str]:
+    return skip_message_kind(msg, SKIP_MESSAGE_TYPES)
 
 
 def job_fingerprint(job: dict) -> str:
@@ -615,12 +632,48 @@ async def sleep_until_due(job: dict):
         await asyncio.sleep(delay)
 
 
+class OffsetCommitBatcher:
+    def __init__(self, consumer: AIOKafkaConsumer, consumer_name: str):
+        self.consumer = consumer
+        self.consumer_name = consumer_name
+        self.pending_offsets: Dict[TopicPartition, int] = {}
+        self.pending_records = 0
+        self.last_commit_at = now_ts()
+
+    def mark_processed(self, record) -> None:
+        tp = TopicPartition(record.topic, record.partition)
+        self.pending_offsets[tp] = record.offset + 1
+        self.pending_records += 1
+
+    async def maybe_commit(self, *, force: bool = False, reason: str = "periodic") -> None:
+        if not self.pending_offsets:
+            return
+        elapsed = now_ts() - self.last_commit_at
+        if not force and self.pending_records < KAFKA_CONSUMER_COMMIT_EVERY and elapsed < KAFKA_CONSUMER_COMMIT_INTERVAL_SECONDS:
+            return
+        offsets = dict(self.pending_offsets)
+        await self.consumer.commit(offsets)
+        log({
+            "ts": tstamp(),
+            "type": "perf",
+            "step": "kafka_commit",
+            "consumer": self.consumer_name,
+            "reason": reason,
+            "records": self.pending_records,
+            "partitions": len(offsets),
+        })
+        self.pending_offsets.clear()
+        self.pending_records = 0
+        self.last_commit_at = now_ts()
+
+
 def touch_health(status: str = "ok"):
     write_health_file(default_health_path(), status)
 
 
 async def text_consumer_loop():
     assert text_consumer is not None
+    commit_batcher = OffsetCommitBatcher(text_consumer, "text")
     await text_consumer.start()
     try:
         async for record in text_consumer:
@@ -643,7 +696,8 @@ async def text_consumer_loop():
                         "msg_id": job.get("info", {}).get("msg_id"),
                         "journal_status": existing.get("status"),
                     })
-                    await text_consumer.commit()
+                    commit_batcher.mark_processed(record)
+                    await commit_batcher.maybe_commit(reason="journal_skip")
                     continue
 
                 claimed = journal_claim(fingerprint, {
@@ -662,11 +716,13 @@ async def text_consumer_loop():
                         "chat_id": job.get("info", {}).get("chat_id"),
                         "msg_id": job.get("info", {}).get("msg_id"),
                     })
-                    await text_consumer.commit()
+                    commit_batcher.mark_processed(record)
+                    await commit_batcher.maybe_commit(reason="claim_skip")
                     continue
 
                 cleanup_paths = await process_text_job_mod(job, build_job_processing_ctx())
-                await text_consumer.commit()
+                commit_batcher.mark_processed(record)
+                await commit_batcher.maybe_commit(reason="processed")
                 journal_mark(fingerprint, {
                     "status": "done",
                     "job_type": job.get("job_type"),
@@ -700,7 +756,8 @@ async def text_consumer_loop():
                             "msg_id": job.get("info", {}).get("msg_id") if isinstance(job, dict) else None,
                             "note": "max failures exceeded; committing offset to unblock partition",
                         })
-                        await text_consumer.commit()
+                        commit_batcher.mark_processed(record)
+                        await commit_batcher.maybe_commit(force=True, reason="poison_skip")
                 log({
                     "ts": tstamp(),
                     "type": "err",
@@ -710,11 +767,22 @@ async def text_consumer_loop():
                     "job_type": job.get("job_type") if isinstance(job, dict) else None,
                 })
     finally:
+        try:
+            await commit_batcher.maybe_commit(force=True, reason="shutdown")
+        except Exception as e:
+            log({
+                "ts": tstamp(),
+                "type": "err",
+                "op": "text_consumer_flush_commit",
+                "err": e.__class__.__name__,
+                "msg": str(e),
+            })
         await text_consumer.stop()
 
 
 async def media_consumer_loop():
     assert media_consumer is not None
+    commit_batcher = OffsetCommitBatcher(media_consumer, "media")
     await media_consumer.start()
     try:
         async for record in media_consumer:
@@ -755,7 +823,8 @@ async def media_consumer_loop():
                         "grouped_id": job.get("info", {}).get("grouped_id") if isinstance(job.get("info"), dict) else None,
                         "journal_status": existing.get("status"),
                     })
-                    await media_consumer.commit()
+                    commit_batcher.mark_processed(record)
+                    await commit_batcher.maybe_commit(reason="journal_skip")
                     continue
 
                 claimed = journal_claim(fingerprint, {
@@ -776,12 +845,14 @@ async def media_consumer_loop():
                         "msg_id": job.get("info", {}).get("msg_id") if isinstance(job.get("info"), dict) else None,
                         "grouped_id": job.get("info", {}).get("grouped_id") if isinstance(job.get("info"), dict) else None,
                     })
-                    await media_consumer.commit()
+                    commit_batcher.mark_processed(record)
+                    await commit_batcher.maybe_commit(reason="claim_skip")
                     continue
 
                 cleanup_paths = await dispatch_media_job(job, build_job_processing_ctx())
 
-                await media_consumer.commit()
+                commit_batcher.mark_processed(record)
+                await commit_batcher.maybe_commit(reason="processed")
                 journal_mark(fingerprint, {
                     "status": "done",
                     "job_type": job.get("job_type"),
@@ -823,7 +894,8 @@ async def media_consumer_loop():
                             "grouped_id": job.get("info", {}).get("grouped_id") if isinstance(job, dict) else None,
                             "note": "max failures exceeded; committing offset to unblock partition",
                         })
-                        await media_consumer.commit()
+                        commit_batcher.mark_processed(record)
+                        await commit_batcher.maybe_commit(force=True, reason="poison_skip")
                 log({
                     "ts": tstamp(),
                     "type": "err",
@@ -833,6 +905,16 @@ async def media_consumer_loop():
                     "job_type": job.get("job_type") if isinstance(job, dict) else None,
                 })
     finally:
+        try:
+            await commit_batcher.maybe_commit(force=True, reason="shutdown")
+        except Exception as e:
+            log({
+                "ts": tstamp(),
+                "type": "err",
+                "op": "media_consumer_flush_commit",
+                "err": e.__class__.__name__,
+                "msg": str(e),
+            })
         await media_consumer.stop()
 
 
@@ -1080,6 +1162,20 @@ async def handle_incoming_message(msg, source_kind: str):
         "reply_to_msg_id": info["reply_to_msg_id"],
     })
 
+    skip_kind = should_skip_message(msg)
+    if skip_kind:
+        log({
+            "ts": tstamp(),
+            "type": "info",
+            "op": "skip_message_by_type",
+            "skip_kind": skip_kind,
+            "chat_id": info["chat_id"],
+            "msg_id": info["msg_id"],
+            "grouped_id": info["grouped_id"],
+            "source_kind": source_kind,
+        })
+        return
+
     if msg.media is None:
         # P7: Dedup text events so Telethon reconnect re-deliveries do not
         # publish a second Kafka job for the same message.
@@ -1217,6 +1313,9 @@ async def startup_kafka_producer():
     global producer
     producer = AIOKafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        compression_type=KAFKA_PRODUCER_COMPRESSION_TYPE,
+        linger_ms=KAFKA_PRODUCER_LINGER_MS,
+        max_batch_size=KAFKA_PRODUCER_MAX_BATCH_SIZE,
     )
     await producer.start()
 
@@ -1358,11 +1457,17 @@ def print_route_summary():
         "kafka_text_topic": KAFKA_TEXT_TOPIC,
         "kafka_media_topic": KAFKA_MEDIA_TOPIC,
         "kafka_consumer_group": KAFKA_CONSUMER_GROUP,
+        "kafka_producer_compression_type": KAFKA_PRODUCER_COMPRESSION_TYPE or "none",
+        "kafka_producer_linger_ms": KAFKA_PRODUCER_LINGER_MS,
+        "kafka_producer_max_batch_size": KAFKA_PRODUCER_MAX_BATCH_SIZE,
+        "kafka_consumer_commit_every": KAFKA_CONSUMER_COMMIT_EVERY,
+        "kafka_consumer_commit_interval_seconds": KAFKA_CONSUMER_COMMIT_INTERVAL_SECONDS,
         "text_delay_seconds": DELAY_SECONDS,
         "media_delay_seconds": MEDIA_DELAY_SECONDS,
         "delete_after_send": DELETE_AFTER_SEND,
         "ignore_users": sorted(list(IGNORE_USERS)),
         "ignore_ids": sorted(list(IGNORE_IDS)),
+        "skip_message_types": sorted(list(SKIP_MESSAGE_TYPES)),
         "routes": summary,
     }
 

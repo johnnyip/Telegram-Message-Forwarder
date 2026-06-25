@@ -28,6 +28,16 @@ def get_media_size(msg) -> Optional[int]:
     return None
 
 
+def skip_message_kind(msg, skip_types) -> Optional[str]:
+    kind = media_type(msg)
+    normalized = {str(item).strip().lower() for item in (skip_types or set()) if str(item).strip()}
+    if kind == "text" and "text" in normalized:
+        return "text"
+    if kind == "photo" and normalized.intersection({"image", "images", "photo", "photos"}):
+        return "image"
+    return None
+
+
 def build_filename_from_message(msg, sender_display="unknown"):
     safe_sender = sanitize_filename_part(sender_display)
     ext = ""
@@ -46,4 +56,5 @@ __all__ = [
     "build_filename_from_message",
     "get_media_size",
     "media_type",
+    "skip_message_kind",
 ]
