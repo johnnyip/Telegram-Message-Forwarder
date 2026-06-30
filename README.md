@@ -76,12 +76,17 @@ Direct-forward Kafka jobs are therefore disabled by default; `ENABLE_DIRECT_FORW
 ### Send-only
 - `APP_MODE=send`
 - `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_BOT_API_BASE`
+- `TELEGRAM_BOT_API_FILE_BASE`
+- `TELEGRAM_BOT_LOCAL_MODE`
 - `TEXT_TARGET_PARALLEL`
 - `MEDIA_TARGET_PARALLEL`
 - `BOT_SEND_AS_DOCUMENT`
 - `BOT_SEND_CONCURRENCY`
 - `HEALTH_FILE`
 - `STALE_FILE_HOURS`
+- `BOT_UPLOAD_MAX_MB`
+- `BOT_ALBUM_MAX_TOTAL_MB`
 
 ## Kafka write-reduction knobs
 
@@ -129,6 +134,18 @@ Optional override:
 - `BOT_SEND_AS_DOCUMENT=true`
   - forces most non-audio media to be sent as document
   - useful only when you explicitly want to avoid Telegram media compression / preview behavior
+
+## Bot upload limits
+
+- Official cloud Bot API (`https://api.telegram.org`) now defaults to `BOT_UPLOAD_MAX_MB=50`
+- This avoids pointless `sendVideo` / `sendDocument` retries that end in `413 Request Entity Too Large`
+- If you run a local Bot API server, set:
+  - `TELEGRAM_BOT_LOCAL_MODE=true`
+  - optionally `TELEGRAM_BOT_API_BASE` / `TELEGRAM_BOT_API_FILE_BASE`
+- Local-mode default upload threshold becomes `2000MB`
+- You can still override either path explicitly with:
+  - `BOT_UPLOAD_MAX_MB`
+  - `BOT_ALBUM_MAX_TOTAL_MB`
 
 ## Reliability improvements
 

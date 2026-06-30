@@ -33,6 +33,7 @@ from tg_forwarder.runtime.logging_setup import setup_logging
 from tg_forwarder.domain.media import get_media_size, media_type, skip_message_kind
 from tg_forwarder.core.metrics import StepTimer
 from tg_forwarder.domain.routes import find_matching_routes, load_routes
+from tg_forwarder.runtime.bot_limits import env_flag, resolve_bot_album_max_total_mb, resolve_bot_upload_max_mb
 from tg_forwarder.delivery.senders import fetch_message_by_id as fetch_message_by_id_mod, fetch_messages_by_ids as fetch_messages_by_ids_mod, send_album_to_target as send_album_to_target_mod, send_file_to_target as send_file_to_target_mod, send_text_to_target as send_text_to_target_mod
 from tg_forwarder.processing.snapshot import snapshot_album_messages as snapshot_album_messages_mod, snapshot_media_message as snapshot_media_message_mod
 from tg_forwarder.domain.telegram_info import resolve_sender_info_from_message
@@ -93,6 +94,9 @@ BOT_POOL_TIMEOUT_SECONDS = float(os.getenv("BOT_POOL_TIMEOUT_SECONDS", "90"))
 BOT_READ_TIMEOUT_SECONDS = float(os.getenv("BOT_READ_TIMEOUT_SECONDS", "180"))
 BOT_WRITE_TIMEOUT_SECONDS = float(os.getenv("BOT_WRITE_TIMEOUT_SECONDS", "180"))
 BOT_CONNECT_TIMEOUT_SECONDS = float(os.getenv("BOT_CONNECT_TIMEOUT_SECONDS", "45"))
+TELEGRAM_BOT_API_BASE = os.getenv("TELEGRAM_BOT_API_BASE", "https://api.telegram.org/bot").strip() or "https://api.telegram.org/bot"
+TELEGRAM_BOT_API_FILE_BASE = os.getenv("TELEGRAM_BOT_API_FILE_BASE", "https://api.telegram.org/file/bot").strip() or "https://api.telegram.org/file/bot"
+TELEGRAM_BOT_LOCAL_MODE = env_flag("TELEGRAM_BOT_LOCAL_MODE", False)
 
 # Large media forward threshold
 LARGE_MEDIA_FORWARD_THRESHOLD_MB = int(os.getenv("LARGE_MEDIA_FORWARD_THRESHOLD_MB", "30"))
@@ -156,7 +160,13 @@ if TELEGRAM_BOT_TOKEN:
         write_timeout=BOT_WRITE_TIMEOUT_SECONDS,
         connect_timeout=BOT_CONNECT_TIMEOUT_SECONDS,
     )
-    bot = Bot(token=TELEGRAM_BOT_TOKEN, request=bot_request)
+    bot = Bot(
+        token=TELEGRAM_BOT_TOKEN,
+        request=bot_request,
+        base_url=TELEGRAM_BOT_API_BASE,
+        base_file_url=TELEGRAM_BOT_API_FILE_BASE,
+        local_mode=TELEGRAM_BOT_LOCAL_MODE,
+    )
 
 download_semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
 BACKGROUND_TASKS = set()
@@ -551,9 +561,9 @@ async def direct_forward_large_album(msgs: List[Any], info: dict, routes: List[D
 
 TEXT_TARGET_PARALLEL = os.getenv("TEXT_TARGET_PARALLEL", "true").strip().lower() in {"1", "true", "yes", "y"}
 MEDIA_TARGET_PARALLEL = os.getenv("MEDIA_TARGET_PARALLEL", "true").strip().lower() in {"1", "true", "yes", "y"}
-BOT_UPLOAD_MAX_MB = int(os.getenv("BOT_UPLOAD_MAX_MB", "100"))
+BOT_UPLOAD_MAX_MB = resolve_bot_upload_max_mb(TELEGRAM_BOT_API_BASE, bot_local_mode=TELEGRAM_BOT_LOCAL_MODE)
 BOT_UPLOAD_MAX_BYTES = BOT_UPLOAD_MAX_MB * 1024 * 1024
-BOT_ALBUM_MAX_TOTAL_MB = int(os.getenv("BOT_ALBUM_MAX_TOTAL_MB", "100"))
+BOT_ALBUM_MAX_TOTAL_MB = resolve_bot_album_max_total_mb(TELEGRAM_BOT_API_BASE, bot_local_mode=TELEGRAM_BOT_LOCAL_MODE)
 BOT_ALBUM_MAX_TOTAL_BYTES = BOT_ALBUM_MAX_TOTAL_MB * 1024 * 1024
 
 
