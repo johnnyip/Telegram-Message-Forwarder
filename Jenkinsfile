@@ -17,5 +17,5 @@ pipeline {
       ''' } }
     }
   }
-  post { failure { mail to: 'johnny@johnnyip.com', subject: "FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}", body: "TG Message Forwarder Pipeline failed.\n\nJob: ${env.JOB_NAME}\nBuild: #${env.BUILD_NUMBER}\nBranch: ${env.SOURCE_BRANCH ?: env.GIT_BRANCH ?: 'unknown'}\nCommit: ${env.GIT_COMMIT ?: 'unknown'}\nConsole: ${env.BUILD_URL}console\n" }; always { sh 'docker logout >/dev/null 2>&1 || true; docker image rm "$IMAGE:ci-$BUILD_NUMBER" 2>/dev/null || true'; cleanWs deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true } }
+  post { always { step([$class: 'Mailer', recipients: 'johnny@johnnyip.com', notifyEveryUnstableBuild: false, sendToIndividuals: false]); sh 'docker logout >/dev/null 2>&1 || true; docker image rm "$IMAGE:ci-$BUILD_NUMBER" 2>/dev/null || true'; cleanWs deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true } }
 }
