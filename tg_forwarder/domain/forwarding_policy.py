@@ -1,5 +1,25 @@
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Dict, Iterable, List, Set
+
+from .media import skip_message_kind
+from .formatting import should_ignore
+from .routes import find_matching_routes
+
+
+def should_process_edit_update(
+    info: dict,
+    msg: Any,
+    routes: List[Dict[str, Any]],
+    skip_types: Set[str],
+    ignore_users: Set[str],
+    ignore_ids: Set[int],
+) -> bool:
+    """Whether an edited source message can have a forwarded edit mapping."""
+    return (
+        bool(find_matching_routes(info.get("chat_id"), routes))
+        and not should_ignore(info, ignore_users, ignore_ids)
+        and skip_message_kind(msg, skip_types) is None
+    )
 
 
 def message_or_chat_blocks_forward(info: dict) -> bool:
@@ -67,6 +87,7 @@ __all__ = [
     "ForwardingPolicyConfig",
     "can_attempt_large_forward",
     "message_or_chat_blocks_forward",
+    "should_process_edit_update",
     "should_direct_forward_large_album",
     "should_direct_forward_large_media",
 ]

@@ -16,7 +16,7 @@ from telegram.error import TelegramError
 from telegram.request import HTTPXRequest
 
 from tg_forwarder.runtime.bot_runtime import send_album_via_bot, send_file_via_bot, send_text_via_bot
-from tg_forwarder.domain.forwarding_policy import ForwardingPolicyConfig, should_direct_forward_large_album as should_direct_forward_large_album_mod, should_direct_forward_large_media as should_direct_forward_large_media_mod
+from tg_forwarder.domain.forwarding_policy import ForwardingPolicyConfig, should_direct_forward_large_album as should_direct_forward_large_album_mod, should_direct_forward_large_media as should_direct_forward_large_media_mod, should_process_edit_update
 from tg_forwarder.domain.file_policy import is_stale_file
 from tg_forwarder.runtime.healthcheck import default_health_path, write_health_file
 from tg_forwarder.runtime.debug_flags import configure_telethon_logger, maybe_debug_log
@@ -1270,6 +1270,12 @@ async def on_message_edited(event: events.MessageEdited.Event):
                 })
                 return
             await handle_incoming_message(msg, source_kind="edited")
+            return
+
+        # Match new-message route, ignore, and message-type policy before edit
+        # mapping lookup. Messages excluded on initial receive cannot have a
+        # mapping, so retries only create unnecessary delay and log noise.
+        if not should_process_edit_update(info, msg, ROUTES, SKIP_MESSAGE_TYPES, IGNORE_USERS, IGNORE_IDS):
             return
 
         redis = await get_redis()
