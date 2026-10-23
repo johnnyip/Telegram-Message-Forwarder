@@ -1,6 +1,7 @@
 import asyncio
 import os
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -60,8 +61,10 @@ async def _call_with_retry(send: Callable[[], Any]) -> Any:
         return await send()
     except Exception as exc:
         retry_after = getattr(exc, "retry_after", None)
-        if retry_after:
-            await asyncio.sleep(float(retry_after) + 1)
+        if retry_after is not None:
+            # PTB_TIMEDELTA=true makes RetryAfter.retry_after a timedelta.
+            seconds = retry_after.total_seconds() if isinstance(retry_after, timedelta) else float(retry_after)
+            await asyncio.sleep(max(0.0, seconds) + 1)
             return await send()
         if exc.__class__.__name__ in _TRANSIENT:
             await asyncio.sleep(3)

@@ -6,12 +6,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-redis_module = types.ModuleType("redis")
-redis_asyncio_module = types.ModuleType("redis.asyncio")
-redis_asyncio_module.Redis = object
-redis_module.asyncio = redis_asyncio_module
-sys.modules.setdefault("redis", redis_module)
-sys.modules.setdefault("redis.asyncio", redis_asyncio_module)
+
 
 import tg_forwarder.runtime.bot_runtime as mod
 

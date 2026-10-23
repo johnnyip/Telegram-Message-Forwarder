@@ -1,5 +1,5 @@
 # -------- docker/Dockerfile --------
-FROM python:3.10-slim
+FROM python:3.14.9-slim-bookworm
 
 # 安裝必要系統套件（git 只在 build 時抓依賴時需要）
 RUN apt-get update && \
@@ -15,7 +15,7 @@ WORKDIR /app
 
 # 先複製 requirements 以便分層快取
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
 # 可調整 Telethon internal timeout，預設 10 秒
 ARG TELETHON_NO_UPDATES_TIMEOUT=10
@@ -45,6 +45,9 @@ assert actual == expected, f'VERIFY FAILED: expected {expected}, got {actual}'"
 # 再複製程式碼
 COPY main.py .
 COPY tg_forwarder ./tg_forwarder
+COPY tests ./tests
+COPY Jenkinsfile README.md ./
+RUN python -m unittest discover -s tests -v
 
 # 建立資料夾作 下載 / session 儲存
 RUN mkdir -p /app/downloads \

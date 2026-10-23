@@ -194,6 +194,77 @@ Recommended production defaults for `APP_MODE=send`:
 - `ENABLE_DEBUG_LOGS=false`
 - `TELETHON_DEBUG=false`
 
+## Runtime and reproducible dependencies
+
+Baseline checked 2026-10-23: **Python 3.14.9** (standard GIL build),
+Telethon 1.45.0, cryptg 0.6.0, python-dotenv 1.2.4, aiokafka 0.14.0,
+python-telegram-bot 22.8, redis[hiredis] 8.1.0 and Pillow 13.0.0.
+Python 3.10 reached EOL on 2026-10-01. Python 3.15 is now stable, but this
+bounded upgrade stays on the supported 3.14 maintenance line (EOL 2030-10):
+cryptg and aiokafka currently publish CPython 3.14 wheels, not 3.15 wheels.
+3.14.9 is the October 21 expedited security release; do not use 3.14.7 in production.
+
+Sources: [Python lifecycle](https://devguide.python.org/versions/),
+[3.14.9 release/security notes](https://www.python.org/downloads/release/python-3149/),
+[official image tag](https://hub.docker.com/v2/repositories/library/python/tags/3.14.9-slim-bookworm).
+Exact latest package releases, Requires-Python, release files and published advisories
+were checked through `https://pypi.org/pypi/<package>/json` (substitute the package names above).
+No direct-package advisories were listed there at the time; that is not a complete security audit.
+
+Keep direct pins in `requirements.in` and the complete transitive hash lock in
+`requirements.txt`. Use Python 3.14 when regenerating; other Python minors can select
+different environment markers. Existing requirements.txt-based installs remain supported:
+
+~~~bash
+python3.14 -m venv .venv
+.venv/bin/python -m pip install --require-hashes -r requirements.txt
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m pip check
+# Only when intentionally refreshing the lock:
+.venv/bin/python -m pip install pip-tools==7.6.2
+.venv/bin/pip-compile --generate-hashes --strip-extras --no-emit-index-url --no-emit-trusted-host --output-file requirements.txt requirements.in
+~~~
+
+Docker installs with hash checking and runs the offline tests during the existing Jenkins
+Build and Offline Tests stage, before publishing. Jenkins defaults both
+`PUBLISH_IMAGES=false` and `PROMOTE_LATEST=false`. A missing legacy persisted
+`PROMOTE_LATEST` parameter is treated as false; only an explicit true value together with
+`PUBLISH_IMAGES=true` can reach the separate `latest` promotion stage. Publication pushes
+a unique `sha-<full-source-sha>-build-<build-number>` source tag first. The image carries
+full-SHA revision, source URL, and branch labels. Jenkins records the pulled image config
+ID, repository digest, labels, and source SHA in an archived receipt, then writes a
+full-SHA completion marker only after all requested publication steps succeed. A bounded
+push's nonzero/timeout status remains a failed build, not a successful receipt. Deploy by
+the recorded digest; tags are not registry-enforced immutable. Tests run with
+`--network none`, no runtime mounts, and an overridden entrypoint. Review existing Jenkins
+job parameter values before a build: changing defaults does not override saved values, and
+an old saved `PUBLISH_IMAGES=true` can still publish the unique SHA tag but cannot advance
+`latest` without the new, explicitly enabled promotion parameter. Credentials use the existing
+Jenkins binding, stdin login, and a temporary isolated Docker config; they are not written
+to receipts. The Telethon internal timeout patch still asserts its
+match and imported value, so upstream internal changes fail the build instead of silently
+losing the patch. The image tag and OS packages are not digest/snapshot locked; dependency
+hash locking does not make the whole image bit-for-bit reproducible. pyaes is distributed
+as an sdist; its hash is locked, but its isolated build tooling is not.
+
+Offline tests cover text-job serialization through a fake producer into the real sender
+wrapper/fake Bot API, media snapshot-job handoff, missing files/all-target failures,
+bounded Kafka/Bot retries (including PTB timedelta RetryAfter), and dedup/journal TTLs.
+They do not prove live Telegram download, Kafka offset/rebalance behavior or delivery.
+No application entrypoint, real sessions/tokens or live broker are required for tests.
+
+Upgrade validation was run locally on Python 3.14.7 with the new locked packages; the exact
+3.14.9 container build/test remains a release gate (no Docker access during implementation).
+Before rollout, build/test the pinned image and verify dependency health/security scanning.
+Use a bounded staging route and fresh explicitly authorized source media, then correlate
+listener snapshot, Kafka job and intended destination IDs. Do not replay arbitrary live jobs.
+Preserve sessions, shared spool, send journal, Redis data and Kafka group/offsets. Stop the old
+sender before replacing it; never run competing senders as an upgrade test. Keep the prior
+immutable image/config available for rollback without resetting offsets or deleting state.
+Existing delivery is not exactly-once: partial-target failures, ambiguous API timeouts,
+processing-journal crash windows, and file-journal concurrent writers remain hazards.
+A dependency upgrade does not resolve those pre-existing semantics.
+
 ## Docker image
 The Docker image includes:
 - `main.py`

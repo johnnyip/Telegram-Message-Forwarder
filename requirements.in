@@ -1,0 +1,8 @@
+# Direct runtime dependencies; regenerate requirements.txt as documented in README.
+telethon==1.45.0
+cryptg==0.6.0
+python-dotenv==1.2.4
+aiokafka==0.14.0
+python-telegram-bot==22.8
+redis[hiredis]==8.1.0
+pillow==13.0.0
