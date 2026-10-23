@@ -31,7 +31,7 @@ pipeline {
       # Dockerfile runs the offline suite while building; these checks are a second gate.
       docker run --rm --network none --entrypoint python "$IMAGE:ci-$BUILD_NUMBER" -m unittest discover -s tests -v
       docker run --rm --network none --entrypoint python "$IMAGE:ci-$BUILD_NUMBER" -m pip check
-      ''' } } }
+      ''' } }
     stage('Publish Image') {
       when { expression { return params.PUBLISH_IMAGES == true } }
       steps { withCredentials([usernamePassword(credentialsId: 'dockerhub-johnnyip', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_TOKEN')]) { sh '''set -eu
