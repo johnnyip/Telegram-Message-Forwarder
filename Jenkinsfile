@@ -2,8 +2,8 @@ pipeline {
   agent any
   options { skipDefaultCheckout(true); disableConcurrentBuilds(); timestamps(); timeout(time: 25, unit: 'MINUTES'); buildDiscarder(logRotator(numToKeepStr: '30')) }
   parameters {
-    booleanParam(name: 'PUBLISH_IMAGES', defaultValue: false, description: 'Publish a source-labelled release tag after offline validation.')
-    booleanParam(name: 'PROMOTE_LATEST', defaultValue: false, description: 'Explicitly promote the validated release to latest; requires PUBLISH_IMAGES.')
+    booleanParam(name: 'PUBLISH_IMAGES', defaultValue: true, description: 'Publish a source-labelled release tag after offline validation.')
+    booleanParam(name: 'PROMOTE_LATEST', defaultValue: true, description: 'Promote validated release to latest for Watchtower; requires PUBLISH_IMAGES.')
   }
   environment { IMAGE = 'johnnyip/telegram-message-forwarder' }
   stages {

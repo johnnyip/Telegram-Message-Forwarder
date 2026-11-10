@@ -8,8 +8,9 @@ README = (ROOT / "README.md").read_text()
 
 
 class JenkinsPublicationContracts(unittest.TestCase):
-    def test_latest_is_opt_in_and_legacy_missing_parameter_fails_closed(self):
-        self.assertRegex(PIPELINE, r"booleanParam\(name: 'PROMOTE_LATEST', defaultValue: false")
+    def test_latest_default_on_and_legacy_missing_parameter_fails_closed(self):
+        self.assertRegex(PIPELINE, r"booleanParam\(name: 'PROMOTE_LATEST', defaultValue: true")
+        self.assertIn("booleanParam(name: 'PUBLISH_IMAGES', defaultValue: true", PIPELINE)
         self.assertIn("params.PROMOTE_LATEST == true", PIPELINE)
         self.assertIn("env.PROMOTE_LATEST_ENABLED = (params.PROMOTE_LATEST == true).toString()", PIPELINE)
         self.assertIn("params.PUBLISH_IMAGES == true && params.PROMOTE_LATEST == true", PIPELINE)

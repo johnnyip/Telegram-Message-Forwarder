@@ -227,19 +227,18 @@ python3.14 -m venv .venv
 
 Docker installs with hash checking and runs the offline tests during the existing Jenkins
 Build and Offline Tests stage, before publishing. Jenkins defaults both
-`PUBLISH_IMAGES=false` and `PROMOTE_LATEST=false`. A missing legacy persisted
+`PUBLISH_IMAGES=true` and `PROMOTE_LATEST=true` (owner-authorized latest tracking). A missing legacy persisted
 `PROMOTE_LATEST` parameter is treated as false; only an explicit true value together with
 `PUBLISH_IMAGES=true` can reach the separate `latest` promotion stage. Publication pushes
 a unique `sha-<full-source-sha>-build-<build-number>` source tag first. The image carries
 full-SHA revision, source URL, and branch labels. Jenkins records the pulled image config
 ID, repository digest, labels, and source SHA in an archived receipt, then writes a
 full-SHA completion marker only after all requested publication steps succeed. A bounded
-push's nonzero/timeout status remains a failed build, not a successful receipt. Deploy by
-the recorded digest; tags are not registry-enforced immutable. Tests run with
+push's nonzero/timeout status remains a failed build, not a successful receipt. The Telegram stack follows latest with Watchtower after this owner-authorized enrollment; the recorded digest still proves each accepted release. Tags are not registry-enforced immutable. Tests run with
 `--network none`, no runtime mounts, and an overridden entrypoint. Review existing Jenkins
 job parameter values before a build: changing defaults does not override saved values, and
 an old saved `PUBLISH_IMAGES=true` can still publish the unique SHA tag but cannot advance
-`latest` without the new, explicitly enabled promotion parameter. Credentials use the existing
+`latest` without the enabled promotion parameter. Credentials use the existing
 Jenkins binding, stdin login, and a temporary isolated Docker config; they are not written
 to receipts. The Telethon internal timeout patch still asserts its
 match and imported value, so upstream internal changes fail the build instead of silently
@@ -280,3 +279,5 @@ docker build -t johnnyip/telegram-message-forwarder:latest .
 ## Append-only forwarded edit history
 
 Source text/caption edits retain the destination text and append a timestamped full revision. Both general and topic copies are updated; album edits affect the first caption of each copy. Existing message links/formatting are preserved via HTML entities. Identical source text and older edit events are ignored within the existing Redis mapping TTL. The single-listener topology serializes fetch/append/store. If text exceeds Telegram limits (4096 UTF-16 units for text, 1024 for captions), or the original cannot be read, the original is left untouched and the full revision is sent as reply chunks. Ambiguous reply sends are logged and not automatically replayed. Earlier overwritten versions, edits before the service observes them, expired mappings, media binary replacements and direct Telethon forwards cannot be reconstructed by this feature.
+
+For validation-only jobs explicitly use `PUBLISH_IMAGES=false` and `PROMOTE_LATEST=false`. Ordinary main-branch SCM builds default to tested immutable publication followed by latest promotion.
