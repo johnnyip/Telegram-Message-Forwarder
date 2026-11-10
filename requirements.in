@@ -6,3 +6,5 @@ aiokafka==0.15.0
 python-telegram-bot==22.8
 redis[hiredis]==8.1.0
 pillow==13.0.0
+# Security floor for Telethon -> rsa transitive ASN.1 decoder.
+pyasn1>=0.6.5
