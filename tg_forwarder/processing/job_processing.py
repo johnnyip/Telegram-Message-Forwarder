@@ -103,6 +103,7 @@ async def process_text_job(job: dict, ctx: JobProcessingContext) -> List[str]:
             if result and getattr(result, "sent_message_id", None):
                 await store_message_mapping(info["chat_id"], info["msg_id"], target, {
                     "message_id": result.sent_message_id,
+                    "source_text": job['text'],
                     "general_message_id": getattr(result, "general_message_id", None),
                     "topic_message_id": getattr(result, "topic_message_id", None),
                     "delivery_kind": getattr(result, "delivery_kind", None),
@@ -150,6 +151,7 @@ async def process_media_file_job(job: dict, ctx: JobProcessingContext) -> List[s
             if result and getattr(result, "sent_message_id", None):
                 await store_message_mapping(info["chat_id"], info["msg_id"], target, {
                     "message_id": result.sent_message_id,
+                    "source_text": snapshot.get('caption_text', '').strip(),
                     "general_message_id": getattr(result, "general_message_id", None),
                     "topic_message_id": getattr(result, "topic_message_id", None),
                     "delivery_kind": getattr(result, "delivery_kind", None),
@@ -205,6 +207,7 @@ async def process_media_album_file_job(job: dict, ctx: JobProcessingContext) -> 
             if result and getattr(result, "sent_message_id", None):
                 await store_album_mapping(info["chat_id"], info.get("grouped_id"), target, {
                     "message_id": result.sent_message_id,
+                    "source_text": caption_body,
                     "message_ids": getattr(result, "sent_message_ids", None),
                     "general_message_id": getattr(result, "general_message_id", None),
                     "topic_message_id": getattr(result, "topic_message_id", None),

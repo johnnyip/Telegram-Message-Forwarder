@@ -1290,18 +1290,18 @@ async def on_message_edited(event: events.MessageEdited.Event):
             return
 
         if getattr(msg, "media", None) is None:
-            edited = await edit_forwarded_text(bot, info, msg.text or msg.message or "[empty]", log, semaphore=edit_bot_semaphore)
+            edited = await edit_forwarded_text(bot, info, msg.text or msg.message or "[empty]", log, semaphore=edit_bot_semaphore, original_fetcher=fetch_message_by_id)
             if not edited:
                 log({"ts": tstamp(), "type": "warn", "op": "edited_text_no_mapping_or_failed", "chat_id": info.get("chat_id"), "msg_id": info.get("msg_id")})
             return
 
         if getattr(msg, "grouped_id", None) is not None:
-            edited = await edit_forwarded_album_caption(bot, info, (msg.text or msg.message or "").strip(), log, semaphore=edit_bot_semaphore)
+            edited = await edit_forwarded_album_caption(bot, info, (msg.text or msg.message or "").strip(), log, semaphore=edit_bot_semaphore, original_fetcher=fetch_message_by_id)
             if not edited:
                 log({"ts": tstamp(), "type": "warn", "op": "edited_album_no_mapping_or_failed", "chat_id": info.get("chat_id"), "grouped_id": info.get("grouped_id")})
             return
 
-        edited = await edit_forwarded_media_caption(bot, info, (msg.text or msg.message or "").strip(), log, semaphore=edit_bot_semaphore)
+        edited = await edit_forwarded_media_caption(bot, info, (msg.text or msg.message or "").strip(), log, semaphore=edit_bot_semaphore, original_fetcher=fetch_message_by_id)
         if not edited:
             log({"ts": tstamp(), "type": "warn", "op": "edited_media_no_mapping_or_failed", "chat_id": info.get("chat_id"), "msg_id": info.get("msg_id")})
     except Exception as e:

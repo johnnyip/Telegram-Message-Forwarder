@@ -276,3 +276,7 @@ Rebuild the image after changing dependencies:
 ```bash
 docker build -t johnnyip/telegram-message-forwarder:latest .
 ```
+
+## Append-only forwarded edit history
+
+Source text/caption edits retain the destination text and append a timestamped full revision. Both general and topic copies are updated; album edits affect the first caption of each copy. Existing message links/formatting are preserved via HTML entities. Identical source text and older edit events are ignored within the existing Redis mapping TTL. The single-listener topology serializes fetch/append/store. If text exceeds Telegram limits (4096 UTF-16 units for text, 1024 for captions), or the original cannot be read, the original is left untouched and the full revision is sent as reply chunks. Ambiguous reply sends are logged and not automatically replayed. Earlier overwritten versions, edits before the service observes them, expired mappings, media binary replacements and direct Telethon forwards cannot be reconstructed by this feature.
