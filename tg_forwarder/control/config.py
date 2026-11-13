@@ -49,6 +49,8 @@ class Config:
 
     @classmethod
     def from_env(cls):
+        from tg_forwarder.canonical_media import trusted_file_owner_uids
+        trusted_file_owner_uids()
         targets = json.loads(os.getenv("CONTROL_TARGETS_JSON", "[]"))
         if not isinstance(targets, list):
             raise ValueError("CONTROL_TARGETS_JSON must be a list")

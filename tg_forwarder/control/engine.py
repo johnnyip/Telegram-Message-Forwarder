@@ -13,7 +13,7 @@ from telegram.error import BadRequest, Forbidden, RetryAfter
 from .store import digest, encode
 from .filesystems import guard_archive
 from tg_forwarder.canonical_media import relative as original_relative, secure_path
-from tg_forwarder.shared_media import _io
+from tg_forwarder.shared_media import _io, _join
 from types import SimpleNamespace
 from tg_forwarder.shared_media import media_identity, AmbiguousDelivery, SharedUnavailable, definite_rejection
 
@@ -110,7 +110,7 @@ class Archive:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 def sanitized(value):
                     if isinstance(value, dict):
-                        return {k:sanitized(v) for k,v in value.items() if k != "access_hash"}
+                        return {k:sanitized(v) for k,v in value.items() if k not in ("access_hash", "file_id")}
                     if isinstance(value, list):
                         return [sanitized(v) for v in value]
                     return value
@@ -202,6 +202,7 @@ class Engine:
     def _cached_path(self,cached,selected,used=0):
         try:
             path = self.archive.path(*Path(cached["path"]).relative_to(self.archive.root).parts)
+            path = secure_path(self.archive.root,path.relative_to(self.archive.root),existing=True)
             size = path.stat().st_size
             if not path.is_file() or size <= 0 or size != cached["size"] or (selected.get("size") is not None and selected["size"] != size):
                 raise ValueError()
@@ -234,7 +235,42 @@ class Engine:
         try:os.fsync(directory)
         finally:os.close(directory)
 
+    async def download_temporary(self, parent):
+        """A cancelled thread handoff must not abandon its created FD/path."""
+        owned = []
+        def acquire():
+            resource = tempfile.mkstemp(prefix=".download-", dir=parent)
+            owned.append(resource)  # Recorded before the worker can hand off.
+            return resource
+        def discard():
+            if not owned:return
+            fd, name = owned.pop()
+            try:
+                info = os.fstat(fd)
+            finally:
+                os.close(fd)
+            path = Path(name)
+            try:current = path.lstat()
+            except FileNotFoundError:return
+            if (current.st_dev,current.st_ino) == (info.st_dev,info.st_ino) and not path.is_symlink():
+                path.unlink()
+        try:
+            return await _io(acquire)
+        except BaseException:
+            # _io has joined acquisition. Join cleanup too, even if this task
+            # receives repeated cancellation while waiting for the IO gate.
+            await _join(asyncio.create_task(_io(discard)))
+            raise
+
     async def download(self, task, payload, i, used):
+        inbound = i.get("source_kind") == "bot-inbound"
+        if inbound:
+            from .inbound import OWNER
+            if (task["owner"] != OWNER or task["chat"] != OWNER or i["chat"] != OWNER
+                    or i.get("bot_id") != self.bot_id or payload.get("bot_id") != self.bot_id
+                    or payload["action"] != "download" or i["kind"] != "photo"
+                    or i["media_id"] != "bot-inbound:"+str(self.bot_id)+":"+i["file_unique_id"]):
+                raise PermissionError("Received photo principal/action mismatch")
         key = digest([i["chat"], i["id"], i.get("media_id", "")])
         async with self.download_lock:
             cached = self.store.db.execute("SELECT * FROM cache WHERE key=?", (key,)).fetchone()
@@ -243,6 +279,7 @@ class Engine:
                     path=Path(cached["path"])
                     try:path=self.archive.path(*path.relative_to(self.archive.root).parts)
                     except ValueError:raise ValueError("unsafe cache path") from None
+                    if path.exists():path=secure_path(self.archive.root,path.relative_to(self.archive.root),existing=True)
                     if path.is_file() and cached["size"]>0 and path.stat().st_size==cached["size"] and (not i.get("size") or i["size"]==cached["size"]):
                         return path,cached["size"]
                     return None
@@ -271,21 +308,25 @@ class Engine:
                     self.store.db.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)",(key,str(path),size))
                     await self.publish(i,path)
                     return path,size
-            if self.bridge is not None:
+            if self.bridge is not None and not inbound:
                 imported = await self.import_shared(task, payload, i, key, used)
                 if imported is not None:
                     return imported
             await self.gate.wait()
-            msg = await self.client.get_messages(self.peer(i), ids=i["id"])
-            if not msg or not getattr(msg, "media", None):
-                raise ValueError("媒體已刪除／不可用")
-            # Reject changed identity/type rather than downloading a replacement outside snapshot.
-            from .source import item
-            current = item(msg, i["section"])
-            if current["kind"] != i["kind"] or current["album"] != i["album"] or current["media_id"] != i.get("media_id", ""):
-                raise ValueError("來源媒體已更改，請重新查詢")
-            if payload["action"] != "download" and current["protected"]:
-                raise PermissionError("來源現時禁止轉發")
+            if inbound:
+                current = i
+                msg = await self.inbound_media(task, i, used)
+            else:
+                msg = await self.client.get_messages(self.peer(i), ids=i["id"])
+                if not msg or not getattr(msg, "media", None):
+                    raise ValueError("媒體已刪除／不可用")
+                # Reject changed identity/type rather than downloading a replacement outside snapshot.
+                from .source import item
+                current = item(msg, i["section"])
+                if current["kind"] != i["kind"] or current["album"] != i["album"] or current["media_id"] != i.get("media_id", ""):
+                    raise ValueError("來源媒體已更改，請重新查詢")
+                if payload["action"] != "download" and current["protected"]:
+                    raise PermissionError("來源現時禁止轉發")
             naming = i
             if not i.get("archive_meta"):
                 await self.gate.wait()
@@ -299,7 +340,7 @@ class Engine:
             if await _io(path.exists):
                 # Orphan (crash before cache commit): do not overwrite unverifiable bytes.
                 raise ValueError("未記錄既有檔案，需管理員核對，未覆寫")
-            fd, temp = await _io(lambda:tempfile.mkstemp(prefix=".download-",dir=path.parent))
+            fd, temp = await self.download_temporary(path.parent)
             expected_total = [None]
             async def progress(done, total):
                 if total and total > 0:
@@ -333,6 +374,43 @@ class Engine:
                 def cleanup():
                     if os.path.isfile(temp) and not os.path.islink(temp):os.unlink(temp)
                 await _io(cleanup)
+
+    async def inbound_media(self, task, selected, used):
+        """PTB reads directly into the existing task-owned tempfile lifecycle."""
+        from .inbound import CLOUD_DOWNLOAD_LIMIT
+        bot = getattr(self.delivery, "bot", None)
+        if bot is None or self.bot_id is None:
+            raise ValueError("Received photo bot transport unavailable")
+        remote = await bot.get_file(selected["file_id"])
+        if remote.file_unique_id != selected["file_unique_id"]:
+            raise ValueError("Received photo file identity mismatch")
+        expected = remote.file_size
+        if expected is not None and (expected <= 0 or expected > CLOUD_DOWNLOAD_LIMIT
+                or (selected.get("size") is not None and expected != selected["size"])):
+            raise ValueError("Received photo size mismatch / Bot API 20 MB limit")
+        await _io(self.archive.space, expected or 0)
+        engine = self
+        class Media:
+            async def download_media(self, file, progress_callback):
+                # PTB retrieves a bounded cloud response before out.write(). Retain
+                # those bytes only until an owned filesystem thread writes them;
+                # do not block the event loop on a private NFS tempfile write.
+                chunks, received = [], [0]
+                class BoundedOutput:
+                    def write(self, data):
+                        engine.check(task)
+                        received[0] += len(data)
+                        if received[0] > min(CLOUD_DOWNLOAD_LIMIT, engine.config.max_bytes-used):
+                            raise ValueError("Received photo exceeds download limit")
+                        chunks.append(data)
+                        return len(data)
+                await remote.download_to_memory(out=BoundedOutput())
+                for chunk in chunks:
+                    engine.check(task)
+                    await _io(file.write, chunk)
+                await progress_callback(file.tell(), expected)
+                return file
+        return Media()
 
     async def publish(self, selected, path):
         if self.bridge is not None:
@@ -487,6 +565,7 @@ class Engine:
 
     async def execute(self, task):
         payload = json.loads(task["payload"])
+        inbound = payload.get("source_kind") == "bot-inbound"
         manifest = {"task": task["id"], "snapshot": payload["snapshot"], "action": payload["action"],
                     "target": payload.get("target"), "selection": payload["items"], "items": [], "state": "running"}
         try:
@@ -537,10 +616,10 @@ class Engine:
             state = "delayed" if task["attempt"] < self.config.retries else "failed"
             self.store.set_task(task["id"], state=state, due=due, error="FloodWait: "+str(delay)+" 秒")
         except (Forbidden, BadRequest) as exc:
-            self.store.set_task(task["id"], state="failed", error="目的地權限／媒體限制拒絕（"+type(exc).__name__+"）；下載檔保留，未改用原生轉發")
+            self.store.set_task(task["id"], state="failed", error=(("收到相片下載被拒絕（"+type(exc).__name__+"）；Bot API 單檔上限 20 MB，原接收記錄保留") if inbound else "目的地權限／媒體限制拒絕（"+type(exc).__name__+"）；下載檔保留，未改用原生轉發"))
         except Exception as exc:
             state = "delayed" if task["attempt"] < self.config.retries and not isinstance(exc, (ValueError, PermissionError, OSError, BadRequest, Forbidden)) else "failed"
-            self.store.set_task(task["id"], state=state, due=time.time()+min(60, 2**task["attempt"]), error=(str(exc)[:300] if isinstance(exc, (ValueError, PermissionError, OSError)) else type(exc).__name__))
+            self.store.set_task(task["id"], state=state, due=time.time()+min(60, 2**task["attempt"]), error=(("Received photo download failed ("+type(exc).__name__+"); private API details omitted") if inbound else (str(exc)[:300] if isinstance(exc, (ValueError, PermissionError, OSError)) else type(exc).__name__)))
         finally:
             row = self.store.task(task["id"], task["owner"], task["chat"])
             manifest["state"], manifest["error"] = row["state"], row["error"]

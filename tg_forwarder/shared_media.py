@@ -12,7 +12,7 @@ import tempfile
 import time
 import uuid
 import weakref
-from .canonical_media import secure_path, fingerprint
+from .canonical_media import secure_path, fingerprint, trusted_file_owner_uids
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -87,10 +87,13 @@ def message_identity(msg, chat_id=None):
 
 class SharedMedia:
     def __init__(self, redis, root, *, prefix="tgfwd", account_rate_key, max_bytes=2147483648,
-                 min_free_bytes=1073741824, index_ttl=2592000, rate_interval=.1, canonical_roots=None, persistent_cache_enabled=True):
+                 min_free_bytes=1073741824, index_ttl=2592000, rate_interval=.1, canonical_roots=None, persistent_cache_enabled=True, cache_read_enabled=True):
+        trusted_file_owner_uids()
         if redis is None or not account_rate_key:
             raise SharedUnavailable("shared Redis and MEDIA_ACCOUNT_RATE_KEY required")
         if type(persistent_cache_enabled) is not bool:raise ValueError("Persistent cache flag must be boolean")
+        if type(cache_read_enabled) is not bool:raise ValueError("Cache read flag must be boolean")
+        self.cache_read_enabled = cache_read_enabled
         self.persistent_cache_enabled = persistent_cache_enabled
         self.redis, self.prefix = redis, prefix + ":media_shared:"
         if not Path(root).is_absolute():
@@ -145,6 +148,7 @@ class SharedMedia:
         return path
 
     async def cached(self, identity):
+        if not self.cache_read_enabled:return None
         raw = await self.redis.get(self.prefix + "source:" + digest(identity))
         if not raw:return None
         entry = json.loads(raw)
@@ -399,6 +403,9 @@ async def configured_bridge():
     persistent_cache = os.getenv("MEDIA_SHARED_PERSISTENT_CACHE_ENABLED","false").lower()
     if persistent_cache not in ("true","false"):
         raise ValueError("MEDIA_SHARED_PERSISTENT_CACHE_ENABLED must be true or false")
+    cache_read = os.getenv("MEDIA_SHARED_CACHE_READ_ENABLED","true").lower()
+    if cache_read not in ("true","false"):
+        raise ValueError("MEDIA_SHARED_CACHE_READ_ENABLED must be true or false")
     from redis.asyncio import Redis
     # Do not inherit edit_mapping import-time env snapshots: control loads its
     # protected env file after imports. Read credentials ONLY at this call.
@@ -422,7 +429,7 @@ async def configured_bridge():
                        index_ttl=int(os.getenv("MEDIA_SHARED_INDEX_TTL", "2592000")),
                        rate_interval=float(os.getenv("MEDIA_ACCOUNT_RATE_INTERVAL", ".1")),
                        canonical_roots=json.loads(os.getenv("MEDIA_SHARED_ARCHIVE_ROOTS_JSON", "{}")),
-                       persistent_cache_enabled=persistent_cache=="true")
+                       persistent_cache_enabled=persistent_cache=="true", cache_read_enabled=cache_read=="true")
 
 
 async def legacy_send(send, snapshots, target, caption, info, source_kind):

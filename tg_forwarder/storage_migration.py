@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 import sqlite3
 import tempfile
-from .canonical_media import secure_path, fingerprint, relative
+from .canonical_media import secure_path, fingerprint, relative, trusted_file_owner_uids
 from .control.filesystems import guard_state
 from .control.store import digest as cache_digest
 from .shared_media import _io, _owned, configured_bridge, digest
@@ -227,7 +227,7 @@ class Migration:
             secure_path(self.old_root,directory.relative_to(self.old_root))
             if not directory.exists():continue
             info=directory.lstat()
-            if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (os.getuid(),self.old_root.stat().st_uid):
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid not in ({os.getuid(),self.old_root.stat().st_uid} | trusted_file_owner_uids()) or info.st_mode & 0o022:
                 raise ValueError('Prune directory is not owned')
             with os.scandir(directory) as entries:
                 if next(entries,None) is not None:continue

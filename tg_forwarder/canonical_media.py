@@ -70,7 +70,19 @@ def relative(selected, tz='UTC'):
     return Path(title) / (date.astimezone(ZoneInfo(tz)).strftime('%Y_%m') if date else '0') / filename(selected)
 
 
+def trusted_file_owner_uids():
+    """Explicit public NFS identity mapping; never infer trust from a parent."""
+    raw = os.getenv('MEDIA_ARCHIVE_FILE_OWNER_UIDS', '')
+    if not raw:
+        return frozenset()
+    parts = raw.split(',')
+    if len(parts) > 16 or any(not re.fullmatch(r'(0|[1-9][0-9]{0,9})', v.strip()) or int(v) > 2**32-2 for v in parts):
+        raise ValueError('Invalid MEDIA_ARCHIVE_FILE_OWNER_UIDS')
+    return frozenset(int(v.strip()) for v in parts)
+
+
 def secure_path(root, relative_path, *, existing=False):
+    trusted_uids = trusted_file_owner_uids()
     root, rel = Path(root).absolute(), Path(relative_path)
     if rel.is_absolute() or not rel.parts or any(p in ('','.','..') or '\x00' in p for p in rel.parts):
         raise ValueError('Unsafe canonical relative path')
@@ -82,7 +94,7 @@ def secure_path(root, relative_path, *, existing=False):
         if path.is_symlink(): raise ValueError('Canonical symlink rejected')
     if existing:
         info=path.lstat()
-        if not stat.S_ISREG(info.st_mode) or info.st_size <= 0 or info.st_uid not in (os.getuid(),root.stat().st_uid) or info.st_mode & 0o022:
+        if not stat.S_ISREG(info.st_mode) or info.st_size <= 0 or info.st_uid not in ({os.getuid(),root.stat().st_uid} | trusted_uids) or info.st_mode & 0o022:
             raise ValueError('Canonical file must be owned, regular, nonempty, not writable by others')
     return path
 

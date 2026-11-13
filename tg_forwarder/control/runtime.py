@@ -155,6 +155,10 @@ async def run(inspect_url=None, health=False):
             logging.getLogger("telethon").setLevel(logging.ERROR)
             async with Bot(token) as bot:
                 bot_id = (await bot.get_me()).id
+                prior_bot = store.get_meta("bot_principal", "")
+                if prior_bot and prior_bot != str(bot_id):
+                    raise StartupError("Control state belongs to a different bot")
+                store.meta("bot_principal", bot_id)
                 engine = Engine(config, store, client, gate, delivery=BotDelivery(bot, positive(os.getenv("CONTROL_BOT_UPLOAD_MAX_BYTES", str(49*1024*1024)))), bridge=bridge, bot_id=bot_id)
                 controller = Controller(config, store, resolver, engine, bot)
                 async def notify(task):

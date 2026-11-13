@@ -360,3 +360,7 @@ forward identities are unchanged. A failed definite rejection can use the task's
 Retry control. Unknown/partial sends remain ambiguous and blocked pending operator
 reconciliation, not automatically resent. This is one resend per original task, not an
 unlimited resend button.
+
+## Received-photo automatic downloads
+
+Private incoming photos from owner 5268216341 automatically queue one durable download per received bot message, including personal/hidden origins and caption URLs; original-post text links keep the resolver workflow. No batch confirmation or automatic media forwarding. See [inbound-photo-downloads.md](inbound-photo-downloads.md) for cloud limits, exact naming/fallback and bounded retained-update recovery.

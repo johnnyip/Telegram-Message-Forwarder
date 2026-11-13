@@ -95,3 +95,7 @@ configured_bridge and should be explicitly false in both services. Legacy fresh 
 publication becomes a no-copy/no-index operation; existing upload/spool cleanup remains
 unchanged. V2 canonical publication/reuse and old v1 reads/migration still work. Manual
 GC does not substitute for this policy or guarantee legacy object cleanup.
+
+## Independent legacy cache reads
+
+`MEDIA_SHARED_CACHE_READ_ENABLED` defaults to `true`. Explicit `false` returns before any filesystem or Redis source-index access; shared rate and send-receipt coordination remains enabled. Use together with `MEDIA_SHARED_PERSISTENT_CACHE_ENABLED=false` on NAS and remove cache/archive binds rather than widening private NUC permissions. NAS uses its original owned transient download/send/cleanup path. See [inbound-photo-downloads.md](inbound-photo-downloads.md).

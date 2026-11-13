@@ -149,3 +149,14 @@ mount. Canonical bindings, complete metadata inventory and live service configur
 still require normal Git/CI deployment. Timezone remains unknown; the current Nov 11
 file stays in 2026_11 across the relevant zones, so explicit provisional UTC need not
 block this one file. This is not confirmation of original runtime timezone.
+
+## Explicit NFS file-owner mapping
+
+MEDIA_ARCHIVE_FILE_OWNER_UIDS=0,1024 explicitly admits known original root-owned
+files and server-mapped NFS UID 1024 in addition to the existing process/root-owner
+policy. UID 0 is not globally trusted by default. Canonical validators, bridge
+references and migration use the same bounded numeric policy; symlinks, empty or
+nonregular files and group/other writable files remain rejected. No chmod/chown/ACL
+changes or parent-owner inference. Existing original directories may still require
+an independently approved narrow write grant; the whitelist does not grant access.
+See [inbound-photo-downloads.md](inbound-photo-downloads.md).

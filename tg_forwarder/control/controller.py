@@ -62,7 +62,7 @@ class Controller:
             parts = text.split()
             command = parts[0].split("@")[0] if parts else ""
             if command in ("/start", "/help"):
-                await self.bot.send_message(chat_id=chat, text="貼原帖／留言 t.me 連結，或轉發有來源嘅原帖。\n/tasks 任務；/watches 監察；/health 授權檢查。")
+                await self.bot.send_message(chat_id=chat, text="私人對話轉發／上傳相片會自動下載；或貼原帖／留言 t.me 連結。\n/tasks 任務；/watches 監察；/health 授權檢查。")
                 return
             if command == "/health":
                 await self.bot.send_message(chat_id=chat, text="控制台正常；你的數字 ID 已獲授權。獨立下載佇列；未執行下載／轉發。")
@@ -72,6 +72,10 @@ class Controller:
                 return
             if command in ("/watches", "/unwatch"):
                 await self.watch_command(owner, chat, command, parts[1:])
+                return
+            if getattr(message, "photo", None):
+                from .inbound import enqueue
+                enqueue(self.store, self.config, update, self.engine.bot_id)
                 return
             ref = from_message(message)
             media_group = getattr(message, "media_group_id", None)
