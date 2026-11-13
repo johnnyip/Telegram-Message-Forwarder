@@ -25,7 +25,7 @@ and make it readable by the actual container UID, not by all users.
 - CONTROL_TARGETS_JSON: explicit JSON list of objects with numeric chat_id and an
   optional positive thread_id. Default empty: download-only. No free-form destination
   input. The downloader bot must actually access each destination; memberships of
-  other bots do not imply access. Initial known target is owner private 192114587.
+  other bots do not imply access. Initial known target is owner private 5268216341.
 - API_ID / API_HASH: downloader user API application credentials.
 - MEDIA_USER_SESSION_STRING: separate Telethon StringSession; preferred. OR explicitly
   set MEDIA_USER_SESSION_FILE to an existing dedicated Telethon .session file.
@@ -185,8 +185,8 @@ verified before startup; do not silently download onto an unmounted local direct
           CONTROL_ENV_FILE: /run/secrets/control.env
           CONTROL_STATE_DIR: /data/control
           MEDIA_ARCHIVE_DIR: /media/TG_Download/workbench
-          CONTROL_ALLOWED_USER_IDS: '192114587'
-          CONTROL_TARGETS_JSON: '[{"chat_id":192114587}]'
+          CONTROL_ALLOWED_USER_IDS: '5268216341'
+          CONTROL_TARGETS_JSON: '[{"chat_id":5268216341}]'
           CONTROL_CONCURRENCY: '1'
           CONTROL_EXPECTED_ARCHIVE_MOUNT: /media
           CONTROL_EXPECTED_ARCHIVE_FSTYPES: nfs,nfs4
@@ -301,3 +301,36 @@ A read-only container root is compatible with StringSession: all persistent writ
 in CONTROL_STATE_DIR and MEDIA_ARCHIVE_DIR, plus /tmp tmpfs. Parent must verify the
 container UID can read the protected secret file and write both local state and the
 NAS-mapped archive owner; filesystem type checks do not grant permissions.
+
+## Send already-downloaded photos into this private chat
+
+Completed download/both task cards with valid archived photos offer
+**📤 傳送已下載圖片到此對話（N）**. Only photos are included; video-only tasks
+have no button. Clicking creates one durable cache-only photo-send task addressed
+only to the originating private owner chat, which must also be explicitly present
+in CONTROL_TARGETS_JSON as that numeric chat with no topic. The deployed owner is
+@lasscc, numeric UID 5268216341; authorization remains configuration-based, not a
+hardcoded username. This button grants no group or topic access.
+
+**Existing completed tasks work without another download:** send /tasks, click that
+task's 詳情 button (or open /tasks TASK_ID). The refreshed card renders the new button
+from its persisted task and cache records. Older completion messages are not mass
+edited on startup. Expired controls require a fresh /tasks card. Nothing is sent
+until the owner explicitly clicks the photo-send button.
+
+The worker preflights every selected local file before sending. Cache misses, unsafe
+paths, missing/empty files or known size mismatches fail clearly: there are no source
+entity/message lookups, downloads or shared-cache materialization fallbacks, including
+after restart. Archive files are never removed by this action. Existing Bot API upload,
+caption, job-size, rate and protection-snapshot constraints still apply; it deliberately
+does not query current Telegram source state because the action is cache-only.
+
+Original source albums remain grouped by source and split into at most ten photos per
+send; singles remain singles. The origin task ID plus cached_photos action identifies
+one durable explicit resend, separate from normal forward/both task receipts. Repeated
+clicks reuse that task rather than trigger another copy. Per-item operations and shared
+receipts use their own cached-photo namespace, also scoped to the origin task; normal
+forward identities are unchanged. A failed definite rejection can use the task's existing
+Retry control. Unknown/partial sends remain ambiguous and blocked pending operator
+reconciliation, not automatically resent. This is one resend per original task, not an
+unlimited resend button.

@@ -257,6 +257,15 @@ class Controller:
             buttons.append(self.button("重試失敗項目", owner, chat, reply, {**base, "do": "retry"}))
         elif task["state"] == "cancelled":
             buttons.append(self.button("繼續", owner, chat, reply, {**base, "do": "resume"}))
+        if task["state"] == "done":
+            try:
+                payload = self.engine.cached_photo_payload(task)
+                for selected in payload["items"]:
+                    self.engine.cached_file(selected)
+            except (ValueError,PermissionError,OSError):
+                pass
+            else:
+                buttons.append(self.button("📤 傳送已下載圖片到此對話（"+str(len(payload["items"]))+"）",owner,chat,reply,{**base,"do":"cached_photos"}))
         return buttons
 
     async def render_task(self, owner, chat, reply, task):
@@ -266,7 +275,7 @@ class Controller:
         if not reply:
             sent = await self.bot.send_message(chat_id=chat, text="正在讀取任務…")
             reply = sent.message_id
-        action = {"download": "下載", "forward": "轉發", "both": "下載＋轉發"}[p["action"]]
+        action = {"download": "下載", "forward": "轉發", "both": "下載＋轉發", "cached_photos": "傳送已下載圖片（不重新下載）"}[p["action"]]
         text = "任務 "+task["id"]+"："+task["state"]+"\n"+action+"；"+self.media_counts(p["items"])
         text += "\n已完成 "+str(completed)+"/"+str(total)+"；已下載 "+str(downloaded)+"/"+str(total)
         if task["state"] in ("done", "failed", "cancelled", "ambiguous"):
@@ -317,9 +326,14 @@ class Controller:
         if data.get("do") == "list":
             await self.render_tasks(owner, chat, reply)
             return
-        if data.get("do") not in ("details", "cancel", "retry", "resume"):
+        if data.get("do") not in ("details", "cancel", "retry", "resume", "cached_photos"):
             raise ValueError("不支援任務動作")
         task = self.store.task(data.get("task"), owner, chat)
+        if data["do"] == "cached_photos":
+            payload = self.engine.cached_photo_payload(task)
+            cached = self.store.create_task(owner,chat,reply,payload)
+            await self.render_task(owner,chat,reply,cached)
+            return
         if data["do"] in ("retry", "resume") and task["state"] not in ("failed", "cancelled"):
             # Stale controls refresh the authoritative state without resetting an active task.
             await self.render_task(owner, chat, reply, task)

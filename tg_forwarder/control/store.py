@@ -90,6 +90,8 @@ class Store:
     def insert_task(self, owner, chat, reply, payload):
         """Caller holds BEGIN IMMEDIATE; permits task+watch cursor atomic commit."""
         key = digest([owner, chat, sorted((i["chat"], i["id"], i.get("media_id", "")) for i in payload["items"]), payload["action"], payload.get("target")])
+        if payload["action"] == "cached_photos":
+            key = digest(["cached-photos-v1",payload["origin_task"],key])
         task = secrets.token_hex(8)
         self.db.execute("INSERT OR IGNORE INTO tasks(id,owner,chat,reply,key,payload,state) VALUES(?,?,?,?,?,?,?)",
                         (task, owner, chat, reply, key, encode(payload), "queued"))

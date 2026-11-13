@@ -156,20 +156,59 @@ class Engine:
         known = sum(i.get("size") or 0 for i in values)
         if known > self.config.max_bytes:
             raise ValueError("媒體大小超過上限")
-        if payload["action"] not in ("download", "forward", "both"):
+        if payload["action"] not in ("download", "forward", "both", "cached_photos"):
             raise ValueError("unknown action")
         if payload["action"] != "download":
             if tuple(payload.get("target") or ()) not in self.config.targets:
                 raise PermissionError("目的地不在允許清單")
             if any(i["protected"] for i in values):
                 raise PermissionError("來源禁止轉發（protected）；不會嘗試原生轉發或繞過")
-        self.archive.space(known)
+        self.archive.space(0 if payload["action"] == "cached_photos" else known)
 
     @staticmethod
     def peer(i):
         if i.get("access_hash") is not None and i["chat"] < -1000000000000:
             return types.InputPeerChannel(-i["chat"]-1000000000000, i["access_hash"])
         return i["chat"]
+
+    def cached_photo_payload(self, task):
+        original = self.store.task(task["id"],task["owner"],task["chat"])
+        source = json.loads(original["payload"])
+        if original["state"] != "done" or source["action"] not in ("download", "both"):
+            raise ValueError("只可傳送已完成下載任務的圖片")
+        if original["chat"] != original["owner"] or (original["chat"],None) not in self.config.targets:
+            raise PermissionError("只可傳送至已明確允許的原私人對話，不包含群組／話題權限")
+        photos = [i for i in source["items"] if i["kind"] == "photo"]
+        payload = {"action":"cached_photos", "origin_task":original["id"], "target":[original["chat"],None],
+                   "snapshot":source["snapshot"], "items":photos}
+        self.validate(payload)
+        return payload
+
+    def cached_file(self, selected, used=0):
+        key = digest([selected["chat"],selected["id"],selected.get("media_id", "")])
+        cached = self.store.db.execute("SELECT * FROM cache WHERE key=?",(key,)).fetchone()
+        if cached is None:
+            raise ValueError("已下載圖片快取記錄遺失；此動作不會重新下載")
+        try:
+            path = self.archive.path(*Path(cached["path"]).relative_to(self.archive.root).parts)
+            size = path.stat().st_size
+            if not path.is_file() or size <= 0 or size != cached["size"] or (selected.get("size") is not None and selected["size"] != size):
+                raise ValueError()
+        except (OSError,ValueError):
+            raise ValueError("已下載圖片檔案遺失／無效；檔案保留，不會重新下載") from None
+        if used + size > self.config.max_bytes:
+            raise ValueError("媒體大小超過上限")
+        return path,size
+
+    def validate_cached_task(self, task, payload):
+        original = self.store.task(payload.get("origin_task"),task["owner"],task["chat"])
+        expected = self.cached_photo_payload(original)
+        if encode(expected) != encode(payload):
+            raise ValueError("已下載圖片任務與原始任務不符")
+        used = 0
+        for selected in payload["items"]:
+            _,size = self.cached_file(selected,used)
+            used += size
 
     async def download(self, task, payload, i, used):
         key = digest([i["chat"], i["id"], i.get("media_id", "")])
@@ -287,6 +326,8 @@ class Engine:
 
     def operation_key(self, payload, selected):
         base = ["forward", payload.get("target"), selected["chat"], selected["id"], selected.get("media_id", "")]
+        if payload["action"] == "cached_photos":
+            base = ["cached-photo-send-v1",payload["origin_task"],*base]
         if self.bridge is not None:
             base += [self.bot_id, selected["caption"], selected["kind"]]
         return digest(base)
@@ -306,16 +347,19 @@ class Engine:
             return []
         group, files, keys = map(list, zip(*pending))
         self.check(task)
-        # Check current chat-level protection as well as snapshot/message flag.
-        await self.gate.wait()
-        entity = await self.client.get_entity(self.peer(group[0]))
-        if getattr(entity, "noforwards", False):
-            raise PermissionError("來源現時禁止轉發")
-        for selected in group:
+        if payload["action"] == "cached_photos":
             await self.gate.wait()
-            current = await self.client.get_messages(self.peer(selected), ids=selected["id"])
-            if not current or getattr(current, "noforwards", False):
-                raise PermissionError("來源已刪除／不可用或現時禁止轉發；下載檔保留")
+        else:
+            # Check current chat-level protection as well as snapshot/message flag.
+            await self.gate.wait()
+            entity = await self.client.get_entity(self.peer(group[0]))
+            if getattr(entity, "noforwards", False):
+                raise PermissionError("來源現時禁止轉發")
+            for selected in group:
+                await self.gate.wait()
+                current = await self.client.get_messages(self.peer(selected), ids=selected["id"])
+                if not current or getattr(current, "noforwards", False):
+                    raise PermissionError("來源已刪除／不可用或現時禁止轉發；下載檔保留")
         self.check(task)
         if self.delivery is None:
             raise RuntimeError("Bot delivery is not configured")
@@ -329,7 +373,7 @@ class Engine:
                 operation = self.bridge.operation(
                     [media_identity(i["chat"], i["id"], i.get("media_id", "")) for i in group],
                     target[0], target[1], "bot:"+str(self.bot_id)+":control-upload-v1",
-                    action="upload", caption=encode([[i["id"], i["caption"], i["kind"]] for i in group]))
+                    action=("cached-photos-v1:"+payload["origin_task"] if payload["action"] == "cached_photos" else "upload"), caption=encode([[i["id"], i["caption"], i["kind"]] for i in group]))
                 async def deliver():
                     try:
                         result = await self.delivery.send(target, group, files)
@@ -359,6 +403,10 @@ class Engine:
                 self.store.mark(key, "ambiguous", {"task": task["id"]})
             raise Ambiguous("傳送結果未確認；需核對目的地，未自動重送")
         ids = [getattr(m, "message_id", None) or getattr(m, "id", None) for m in (sent if isinstance(sent, (list, tuple)) else [sent])]
+        if payload["action"] == "cached_photos" and (len(ids) != len(keys) or any(type(mid) is not int or mid <= 0 for mid in ids)):
+            for key in keys:
+                self.store.mark(key,"ambiguous")
+            raise Ambiguous("傳送回應無效；需核對目的地，不會盲目重送")
         with self.store.transaction():
             for key, mid in zip(keys, ids):
                 self.store.mark(key, "done", mid)
@@ -375,6 +423,8 @@ class Engine:
         try:
             self.check(task)
             self.validate(payload)
+            if payload["action"] == "cached_photos":
+                self.validate_cached_task(task,payload)
             groups = OrderedDict()
             for i in payload["items"]:
                 # Photos/videos are compatible; no document/audio album mixing.
@@ -386,7 +436,10 @@ class Engine:
                 files = []
                 for i in group:
                     self.check(task)
-                    path, size = await self.download(task, payload, i, used)
+                    if payload["action"] == "cached_photos":
+                        path,size = self.cached_file(i,used)
+                    else:
+                        path, size = await self.download(task, payload, i, used)
                     used += size
                     files.append(path)
                     manifest["items"].append({**i, "path": str(path.relative_to(self.archive.root)), "download": "done", "bytes": size})
