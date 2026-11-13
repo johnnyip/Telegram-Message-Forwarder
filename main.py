@@ -1578,7 +1578,30 @@ def startup_banner() -> str:
     return "🚀 tg-forwarder send up | sender=telegram-bot | kafka=consumers"
 
 
+def authenticated_delivery_identity(kind, principal_id, configured=None):
+    """Pure principal binding; never infer identity from targets or session metadata."""
+    if kind not in {"user", "bot"} or isinstance(principal_id, bool) or not isinstance(principal_id, int) or principal_id <= 0:
+        raise ValueError("authenticated delivery principal unavailable")
+    principal = f"{kind}:{principal_id}"
+    if configured is None or configured == "":
+        return principal + (":native-v1" if kind == "user" else ":legacy-mirror-v1")
+    parts = configured.split(":", 2)
+    if len(parts) != 3 or ":".join(parts[:2]) != principal or not parts[2].strip() or parts[2] != parts[2].strip():
+        raise ValueError("configured delivery principal does not match authenticated account")
+    return configured
+
+
+def bind_authenticated_delivery_identity(me, kind):
+    if os.getenv("MEDIA_SHARED_ENABLED", "false").lower() != "true":
+        return
+    if kind == "user" and getattr(me, "bot", False):
+        raise ValueError("native forwarding requires authenticated user, not bot session")
+    name = "MEDIA_NATIVE_DELIVERY_IDENTITY" if kind == "user" else "MEDIA_DELIVERY_IDENTITY"
+    os.environ[name] = authenticated_delivery_identity(kind, getattr(me, "id", None), os.getenv(name))
+
+
 async def main():
+    shared_mode = os.getenv("MEDIA_SHARED_ENABLED", "false").lower() == "true"
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     SPOOL_DIR.mkdir(parents=True, exist_ok=True)
@@ -1598,16 +1621,22 @@ async def main():
         if APP_MODE == "listen":
             LOGGER.info("startup listen mode sender=telethon-user producer=true consumers=false")
             assert client is not None
-            register_telethon_handlers()
+            if not shared_mode:
+                register_telethon_handlers()
             async with client:
                 try:
                     try:
                         me = await client.get_me()
+                        bind_authenticated_delivery_identity(me, "user")
                         LOGGER.info("telethon auth ok id=%s username=%s", getattr(me, "id", None), getattr(me, "username", None))
                     except Exception as e:
                         LOGGER.warning("telethon auth probe failed err=%s msg=%s", e.__class__.__name__, str(e))
+                        if shared_mode:
+                            raise
 
                     await startup_kafka_producer()
+                    if shared_mode:
+                        register_telethon_handlers()
                     touch_health("listen:running")
                     await client.run_until_disconnected()
                 finally:
@@ -1619,9 +1648,12 @@ async def main():
             async with client:
                 try:
                     me = await client.get_me()
+                    bind_authenticated_delivery_identity(me, "user")
                     LOGGER.info("telethon auth ok id=%s username=%s", getattr(me, "id", None), getattr(me, "username", None))
                 except Exception as e:
                     LOGGER.warning("telethon auth probe failed err=%s msg=%s", e.__class__.__name__, str(e))
+                    if shared_mode:
+                        raise
                 touch_health("migrate:running")
                 from tg_forwarder.migrate.runner import run_migration
                 await run_migration(client, log)
@@ -1634,6 +1666,7 @@ async def main():
             assert bot is not None
             try:
                 me = await bot.get_me()
+                bind_authenticated_delivery_identity(me, "bot")
                 LOGGER.info("bot auth ok id=%s username=%s", getattr(me, "id", None), getattr(me, "username", None))
                 if BOT_STARTUP_SMOKE_TEST:
                     for smoke_target in (-1003836445993, -1002548092183):
@@ -1644,6 +1677,8 @@ async def main():
                             LOGGER.warning("bot startup smoke failed target=%s err=%s msg=%s", smoke_target, smoke_err.__class__.__name__, str(smoke_err))
             except TelegramError as e:
                 LOGGER.warning("bot auth probe failed err=%s msg=%s", e.__class__.__name__, str(e))
+                if shared_mode:
+                    raise
             await startup_kafka_consumers()
             touch_health("send:running")
             consumer_tasks = [
@@ -1660,9 +1695,12 @@ async def main():
             async with client:
                 try:
                     me = await client.get_me()
+                    bind_authenticated_delivery_identity(me, "user")
                     LOGGER.info("telethon auth ok id=%s username=%s", getattr(me, "id", None), getattr(me, "username", None))
                 except Exception as e:
                     LOGGER.warning("telethon auth probe failed err=%s msg=%s", e.__class__.__name__, str(e))
+                    if shared_mode:
+                        raise
                 touch_health("reconcile:running")
                 from tg_forwarder.reconcile_topics import run_topic_reconcile
                 await run_topic_reconcile(client, log)
