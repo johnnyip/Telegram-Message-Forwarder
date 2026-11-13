@@ -15,7 +15,8 @@ def summary(snap):
             "counts": {k:len(v) for k,v in scopes(snap).items()},
             "photos": sum(i["kind"] == "photo" for i in values),
             "videos": sum(i["kind"] == "video" for i in values),
-            "partial": snap["partial"], "warning": snap["warning"]}
+            "partial": snap["partial"], "warning": snap["warning"],
+            "archive_metadata": [{k:i[k] for k in ("chat","id","media_id","kind","archive_meta") if k in i} for i in values]}
 
 
 def socket_path(config):

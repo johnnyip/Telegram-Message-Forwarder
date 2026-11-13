@@ -12,6 +12,8 @@ from telethon.errors import FloodWaitError, RPCError
 from telegram.error import BadRequest, Forbidden, RetryAfter
 from .store import digest, encode
 from .filesystems import guard_archive
+from tg_forwarder.canonical_media import relative as original_relative, secure_path
+from tg_forwarder.shared_media import _io
 from types import SimpleNamespace
 from tg_forwarder.shared_media import media_identity, AmbiguousDelivery, SharedUnavailable, definite_rejection
 
@@ -48,7 +50,8 @@ class RateGate:
 
 
 class Archive:
-    def __init__(self, root, reserve_bytes, expected_mount=None, expected_fstypes=("nfs","nfs4")):
+    def __init__(self, root, reserve_bytes, expected_mount=None, expected_fstypes=("nfs","nfs4"), archive_timezone="UTC"):
+        self.timezone = archive_timezone
         self.expected_mount, self.expected_fstypes = expected_mount, expected_fstypes
         self.root = Path(root).absolute()
         self.guard()
@@ -57,7 +60,7 @@ class Archive:
         for p in (root, *root.parents):
             if p.is_symlink():
                 raise ValueError("archive root/ancestor cannot be a symlink")
-        root.mkdir(parents=True, exist_ok=True)
+        root.mkdir(parents=True, exist_ok=True,mode=0o700)
         self.root, self.reserve = root, reserve_bytes
 
     def guard(self):
@@ -68,7 +71,7 @@ class Archive:
         current = self.root
         for part in parts:
             part = str(part)
-            if not re.fullmatch(r"[A-Za-z0-9_.-]+", part) or part in (".", ".."):
+            if any(c in part for c in ("/", "\\", "\x00")) or part in ("", ".", ".."):
                 raise ValueError("unsafe archive path")
             current = current / part
             if current.is_symlink():
@@ -84,6 +87,9 @@ class Archive:
         return self.path(str(int(snapshot["peer"])), date+"_"+str(int(snapshot["post"])))
 
     def file(self, snapshot, i):
+        if i.get("archive_meta"):
+            rel = original_relative(i,self.timezone)
+            return self.path(*rel.parts)
         base = self.directory(snapshot)
         section = "main" if i["section"] == "main" else "discussion"
         album = str(int(i["album"])) if i["album"] else "single"
@@ -96,9 +102,9 @@ class Archive:
             raise OSError("磁碟可用空間不足（保留空間限制）")
 
     def manifest(self, snapshot, tid, data):
-        base = self.directory(snapshot)
-        base.mkdir(parents=True, exist_ok=True)
-        path = self.path(*base.relative_to(self.root).parts, "manifest_"+tid+".json")
+        base = self.path(".metadata")
+        base.mkdir(parents=True, exist_ok=True,mode=0o700)
+        path = self.path(".metadata", "manifest_"+tid+".json")
         fd, temp = tempfile.mkstemp(prefix=".manifest-", dir=base)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -122,10 +128,12 @@ class Archive:
 class Engine:
     def __init__(self, config, store, client, gate, notify=None, delivery=None, bridge=None, bot_id=None):
         self.config, self.store, self.client, self.gate = config, store, client, gate
-        self.archive = Archive(config.root, config.reserve_bytes, config.expected_archive_mount, config.expected_archive_fstypes)
+        self.archive = Archive(config.root, config.reserve_bytes, config.expected_archive_mount, config.expected_archive_fstypes, config.archive_timezone)
         self.notify = notify
         self.delivery = delivery
         self.bridge, self.bot_id = bridge, bot_id
+        if bridge is not None:
+            bridge.register_root("control", config.root)
         if bridge is not None and (not isinstance(bot_id, int) or bot_id <= 0):
             raise ValueError("Shared control delivery requires verified bot identity")
         self.last_notice = {}
@@ -149,7 +157,7 @@ class Engine:
             except Exception:
                 pass  # Notification failure must never cause media resend.
 
-    def validate(self, payload):
+    def validate(self, payload, check_space=True):
         values = payload["items"]
         if not values or len(values) > self.config.max_items:
             raise ValueError("媒體數量超過上限／選取為空")
@@ -163,7 +171,7 @@ class Engine:
                 raise PermissionError("目的地不在允許清單")
             if any(i["protected"] for i in values):
                 raise PermissionError("來源禁止轉發（protected）；不會嘗試原生轉發或繞過")
-        self.archive.space(0 if payload["action"] == "cached_photos" else known)
+        if check_space:self.archive.space(0 if payload["action"]=="cached_photos" else known)
 
     @staticmethod
     def peer(i):
@@ -181,7 +189,7 @@ class Engine:
         photos = [i for i in source["items"] if i["kind"] == "photo"]
         payload = {"action":"cached_photos", "origin_task":original["id"], "target":[original["chat"],None],
                    "snapshot":source["snapshot"], "items":photos}
-        self.validate(payload)
+        self.validate(payload,check_space=False)
         return payload
 
     def cached_file(self, selected, used=0):
@@ -189,6 +197,9 @@ class Engine:
         cached = self.store.db.execute("SELECT * FROM cache WHERE key=?",(key,)).fetchone()
         if cached is None:
             raise ValueError("已下載圖片快取記錄遺失；此動作不會重新下載")
+        return self._cached_path(dict(cached),selected,used)
+
+    def _cached_path(self,cached,selected,used=0):
         try:
             path = self.archive.path(*Path(cached["path"]).relative_to(self.archive.root).parts)
             size = path.stat().st_size
@@ -200,32 +211,66 @@ class Engine:
             raise ValueError("媒體大小超過上限")
         return path,size
 
-    def validate_cached_task(self, task, payload):
+    async def cached_file_async(self,selected,used=0):
+        key=digest([selected["chat"],selected["id"],selected.get("media_id","")])
+        cached=self.store.db.execute("SELECT * FROM cache WHERE key=?",(key,)).fetchone()
+        if cached is None:raise ValueError("已下載圖片快取記錄遺失；此動作不會重新下載")
+        return await _io(self._cached_path,dict(cached),selected,used)
+
+    async def validate_cached_task(self, task, payload):
         original = self.store.task(payload.get("origin_task"),task["owner"],task["chat"])
         expected = self.cached_photo_payload(original)
         if encode(expected) != encode(payload):
             raise ValueError("已下載圖片任務與原始任務不符")
         used = 0
         for selected in payload["items"]:
-            _,size = self.cached_file(selected,used)
+            _,size = await self.cached_file_async(selected,used)
             used += size
+
+    def finalize(self, temporary, path):
+        self.archive.path(*path.relative_to(self.archive.root).parts)
+        os.link(temporary,path,follow_symlinks=False)
+        directory=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
+        try:os.fsync(directory)
+        finally:os.close(directory)
 
     async def download(self, task, payload, i, used):
         key = digest([i["chat"], i["id"], i.get("media_id", "")])
         async with self.download_lock:
             cached = self.store.db.execute("SELECT * FROM cache WHERE key=?", (key,)).fetchone()
             if cached:
-                path = Path(cached["path"])
-                try:
-                    path = self.archive.path(*path.relative_to(self.archive.root).parts)
-                except ValueError:
-                    raise ValueError("unsafe cache path")
-                if path.is_file() and cached["size"] > 0 and path.stat().st_size == cached["size"] and (not i.get("size") or i["size"] == cached["size"]):
-                    if used + cached["size"] > self.config.max_bytes:
-                        raise ValueError("媒體大小超過上限")
-                    await self.publish(i, path)
-                    return path, cached["size"]
+                def lookup():
+                    path=Path(cached["path"])
+                    try:path=self.archive.path(*path.relative_to(self.archive.root).parts)
+                    except ValueError:raise ValueError("unsafe cache path") from None
+                    if path.is_file() and cached["size"]>0 and path.stat().st_size==cached["size"] and (not i.get("size") or i["size"]==cached["size"]):
+                        return path,cached["size"]
+                    return None
+                found=await _io(lookup)
+                if found:
+                    path,size=found
+                    if used+size>self.config.max_bytes:raise ValueError("媒體大小超過上限")
+                    await self.publish(i,path)
+                    return path,size
             self.check(task)
+            # Original downloader skips a valid finalized destination before downloading.
+            if i.get("archive_meta"):
+                candidate = await _io(self.archive.file,payload["snapshot"],i)
+                def existing():
+                    if not candidate.exists():return None
+                    path=secure_path(self.archive.root,candidate.relative_to(self.archive.root),existing=True)
+                    size=path.stat().st_size
+                    if i.get("size") is not None and size!=i["size"]:raise ValueError("Existing original-format file size mismatch; not overwritten")
+                    return path,size
+                found=await _io(existing)
+                if found:
+                    path,size=found
+                    if used+size>self.config.max_bytes:raise ValueError("媒體大小超過上限")
+                    if self.store.db.execute("SELECT 1 FROM cache WHERE path=? AND key!=?",(str(path),key)).fetchone():
+                        raise ValueError("Original-format filename collision; existing identity differs")
+                    self.store.db.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)",(key,str(path),size))
+                    await self.publish(i,path)
+                    return path,size
             if self.bridge is not None:
                 imported = await self.import_shared(task, payload, i, key, used)
                 if imported is not None:
@@ -241,14 +286,20 @@ class Engine:
                 raise ValueError("來源媒體已更改，請重新查詢")
             if payload["action"] != "download" and current["protected"]:
                 raise PermissionError("來源現時禁止轉發")
-            path = self.archive.file(payload["snapshot"], i)
-            path.parent.mkdir(parents=True, exist_ok=True)
+            naming = i
+            if not i.get("archive_meta"):
+                await self.gate.wait()
+                entity = await self.client.get_entity(self.peer(i))
+                metadata = {**current["archive_meta"],"title":getattr(entity,"title",None) or str(i["chat"])}
+                naming = {**i,"archive_meta":metadata}
+            path = await _io(self.archive.file,payload["snapshot"], naming)
+            await _io(lambda:path.parent.mkdir(parents=True,exist_ok=True))
             # Recheck every component after mkdir; archive is operator-owned, not shared-writable.
-            self.archive.path(*path.relative_to(self.archive.root).parts)
-            if path.exists():
+            await _io(lambda:self.archive.path(*path.relative_to(self.archive.root).parts))
+            if await _io(path.exists):
                 # Orphan (crash before cache commit): do not overwrite unverifiable bytes.
                 raise ValueError("未記錄既有檔案，需管理員核對，未覆寫")
-            fd, temp = tempfile.mkstemp(prefix=".download-", dir=path.parent)
+            fd, temp = await _io(lambda:tempfile.mkstemp(prefix=".download-",dir=path.parent))
             expected_total = [None]
             async def progress(done, total):
                 if total and total > 0:
@@ -256,7 +307,7 @@ class Engine:
                 self.check(task)
                 if used + done > self.config.max_bytes or (total and used+total > self.config.max_bytes):
                     raise ValueError("媒體大小超過上限")
-                self.archive.space()
+                await _io(self.archive.space)
                 await self.notice(task)
             try:
                 with os.fdopen(fd, "wb") as f:
@@ -264,31 +315,32 @@ class Engine:
                     result = await msg.download_media(file=f, progress_callback=progress)
                     if result is None:
                         raise ValueError("Telegram 未返回有效下載結果，未記錄成功")
-                    f.flush()
-                    os.fsync(f.fileno())
-                size = os.stat(temp).st_size
+                    await _io(f.flush)
+                    await _io(lambda:os.fsync(f.fileno()))
+                size = await _io(lambda:os.stat(temp).st_size)
                 if size <= 0 or (expected_total[0] is not None and size != expected_total[0]) or (i.get("size") is not None and size != i["size"]) or (current.get("size") is not None and size != current["size"]):
                     raise ValueError("下載為空／長度不符，可能截斷；未記錄成功")
                 if used+size > self.config.max_bytes:
                     raise ValueError("媒體大小超過上限")
                 self.check(task)
-                self.archive.space()
+                await _io(self.archive.space)
                 # link() is atomic no-clobber; then remove ONLY this task-owned tempfile.
-                os.link(temp, path, follow_symlinks=False)
+                await _io(self.finalize,temp,path)
                 self.store.db.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)", (key, str(path), size))
                 await self.publish(i, path)
                 return path, size
             finally:
-                if os.path.isfile(temp) and not os.path.islink(temp):
-                    os.unlink(temp)
+                def cleanup():
+                    if os.path.isfile(temp) and not os.path.islink(temp):os.unlink(temp)
+                await _io(cleanup)
 
     async def publish(self, selected, path):
         if self.bridge is not None:
             try:
-                await self.bridge.publish(media_identity(selected["chat"], selected["id"], selected.get("media_id", "")), path)
+                await self.bridge.publish_reference(media_identity(selected["chat"], selected["id"], selected.get("media_id", "")), path)
             except Exception:
                 # Local successful cache/bytes remain authoritative and untouched.
-                raise ValueError("共享媒體發佈失敗（Redis／共享磁碟／每檔大小限制）；本機下載檔已保留，可重試") from None
+                raise ValueError("共享索引發佈失敗（Redis／路徑驗證）；原下載檔已保留，可重試") from None
 
     async def import_shared(self, task, payload, selected, key, used):
         identity = media_identity(selected["chat"], selected["id"], selected.get("media_id", ""))
@@ -299,29 +351,46 @@ class Engine:
             raise SharedUnavailable("Shared source cache unavailable") from None
         if source is None:
             return None
-        size = source.stat().st_size
+        try:
+            rel = source.relative_to(self.archive.root)
+        except ValueError:
+            pass
+        else:
+            path = await _io(lambda:secure_path(self.archive.root,rel,existing=True))
+            size = await _io(lambda:path.stat().st_size)
+            if selected.get("size") is not None and size != selected["size"]:
+                raise ValueError("Canonical reference size mismatch")
+            if used+size > self.config.max_bytes:raise ValueError("媒體大小超過上限")
+            self.store.db.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)",(key,str(path),size))
+            return path,size
+        size = await _io(lambda:source.stat().st_size)
         if size <= 0 or (selected.get("size") is not None and size != selected["size"]):
             raise ValueError("共享媒體長度不符")
         if used + size > self.config.max_bytes:
             raise ValueError("媒體大小超過上限")
-        self.archive.space(size)
-        path = self.archive.file(payload["snapshot"], selected)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.archive.path(*path.relative_to(self.archive.root).parts)
-        with tempfile.TemporaryDirectory(prefix=".shared-", dir=path.parent) as staging:
-            temp = Path(staging) / "media"
+        await _io(self.archive.space,size)
+        path = await _io(self.archive.file,payload["snapshot"], selected)
+        await _io(lambda:path.parent.mkdir(parents=True,exist_ok=True))
+        await _io(lambda:self.archive.path(*path.relative_to(self.archive.root).parts))
+        staging=await _io(lambda:tempfile.TemporaryDirectory(prefix=".shared-",dir=path.parent))
+        try:
+            temp = Path(staging.name) / "media"
             try:
                 imported = await self.bridge.materialize(identity, temp)
             except Exception:
                 raise SharedUnavailable("Shared source materialization failed") from None
-            if imported is None or temp.is_symlink() or not temp.is_file() or temp.stat().st_size != size:
-                raise ValueError("共享媒體匯入不完整")
+            def validate_import():
+                if imported is None or temp.is_symlink() or not temp.is_file() or temp.stat().st_size!=size:
+                    raise ValueError("共享媒體匯入不完整")
+                self.archive.space()
+                with temp.open("rb") as stream:os.fsync(stream.fileno())
+            await _io(validate_import)
             self.check(task)
-            self.archive.space()
-            with temp.open("rb") as stream:
-                os.fsync(stream.fileno())
-            os.link(temp, path, follow_symlinks=False)
+            await _io(self.finalize,temp,path)
             self.store.db.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)", (key, str(path), size))
+        finally:
+            await _io(staging.cleanup)
+        await self.publish(selected,path)
         return path, size
 
     def operation_key(self, payload, selected):
@@ -422,9 +491,10 @@ class Engine:
                     "target": payload.get("target"), "selection": payload["items"], "items": [], "state": "running"}
         try:
             self.check(task)
-            self.validate(payload)
+            self.validate(payload,check_space=False)
+            await _io(self.archive.space,0 if payload["action"]=="cached_photos" else sum(i.get("size") or 0 for i in payload["items"]))
             if payload["action"] == "cached_photos":
-                self.validate_cached_task(task,payload)
+                await self.validate_cached_task(task,payload)
             groups = OrderedDict()
             for i in payload["items"]:
                 # Photos/videos are compatible; no document/audio album mixing.
@@ -437,7 +507,7 @@ class Engine:
                 for i in group:
                     self.check(task)
                     if payload["action"] == "cached_photos":
-                        path,size = self.cached_file(i,used)
+                        path,size = await self.cached_file_async(i,used)
                     else:
                         path, size = await self.download(task, payload, i, used)
                     used += size
@@ -445,7 +515,7 @@ class Engine:
                     manifest["items"].append({**i, "path": str(path.relative_to(self.archive.root)), "download": "done", "bytes": size})
                     count += 1
                     self.store.set_task(task["id"], progress=count)
-                    self.archive.manifest(payload["snapshot"], task["id"], manifest)
+                    await _io(self.archive.manifest,payload["snapshot"], task["id"], manifest)
                     await self.notice(task)
                 if payload["action"] != "download":
                     for start in range(0, len(group), 10):
@@ -453,7 +523,7 @@ class Engine:
                         for entry in manifest["items"][len(manifest["items"])-len(group)+start:len(manifest["items"])-len(group)+start+10]:
                             entry["forward"] = "done"
                             entry["destination_ids"] = ids
-                self.archive.manifest(payload["snapshot"], task["id"], manifest)
+                await _io(self.archive.manifest,payload["snapshot"], task["id"], manifest)
             self.store.set_task(task["id"], state="done", error="")
         except asyncio.CancelledError:
             raise
@@ -479,7 +549,7 @@ class Engine:
             if payload["action"] != "download":
                 manifest["forward_operations"] = [{"chat": i["chat"], "id": i["id"], "state": self.store.operation(self.operation_key(payload, i))[0] or "pending"} for i in payload["items"]]
             try:
-                self.archive.manifest(payload["snapshot"], task["id"], manifest)
+                await _io(self.archive.manifest,payload["snapshot"], task["id"], manifest)
             except (ValueError, OSError):
                 pass
             await self.notice(task, final=True)

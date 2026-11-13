@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "owner_uid": 5268216341,
+  "db": "/data/control/control.sqlite3",
+  "old_root": "/media/workbench",
+  "old_archive": "/media/workbench/REPLACE_EXACT_OLD_PATH.mp4",
+  "shared_root": "/media/shared-cache",
+  "shared_object": "/media/shared-cache/REPLACE_EXACT_IDENTITY_HASH",
+  "canonical_root": "/media/TG_Download",
+  "timezone": "UTC",
+  "sha256": "7d48e14a28e800a87fa8c8bf8cf136d03751a4fa6c7e015f4b05bd99e699dda9",
+  "identity": [
+    "REPLACE_SOURCE_CHAT_ID",
+    0,
+    "REPLACE_MEDIA_ID"
+  ],
+  "selected": {
+    "chat": "REPLACE_NUMERIC_SOURCE_CHAT_ID",
+    "id": 0,
+    "media_id": "REPLACE_MEDIA_ID",
+    "kind": "video",
+    "archive_meta": {
+      "title": "REPLACE_ORIGINAL_TITLE",
+      "datetime": "REPLACE_MESSAGE_DATETIME_ISO8601",
+      "filename": "REPLACE_DOCUMENT_ATTRIBUTE_FILENAME",
+      "extension": ".mp4",
+      "photo_id": null
+    }
+  },
+  "task_ids": [
+    "REPLACE_TASK_ID"
+  ],
+  "manifests": [
+    "/media/workbench/REPLACE_MANIFEST_PATH.json"
+  ],
+  "prune_dirs": [
+    "/media/workbench/REPLACE_EXACT_EMPTY_OLD_FILE_ANCESTOR"
+  ]
+}

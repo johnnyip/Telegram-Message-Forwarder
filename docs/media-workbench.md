@@ -97,13 +97,28 @@ Fixture evidence: channel -1004433596337 post 4833..4842 has 10 photos; group
 six 10-item albums; comment24204 selects the last 6-photo/4-video album. Combined
 70 media =59 photos+11 videos. This is an offline fixture, not a live acceptance claim.
 
-Archives use numeric channel/date_canonicalPost/main/albumId and discussion/albumId
-paths with numeric message filenames. Highest Telegram available quality is downloaded
-without claiming camera originals. Text captions and source IDs/order are sanitized in
-per-task manifests, including selected items, downloaded successes, unfinished items,
-forward-operation states and task errors. Source deletions never delete archives or
-destination content. Existing pipeline caption-edit mappings are unchanged; on-demand
-archives are snapshots, not synchronized mirrors.
+Permanent archives now follow the original tangyoha downloader default workflow:
+
+    TG_Download/<chat.title or configured ID>/<message YYYY_MM>/<message ID> - <original stem><extension>
+
+Missing document filenames become ID.ext, without a repeated ID stem. Photos use
+Pyrogram DOCUMENT-type unique IDs (not raw media IDs). Unicode/spaces/emoji and original
+suffixes remain. Discussion items use their actual source chat/message metadata.
+CONTROL_ARCHIVE_TIMEZONE=UTC is an explicit **provisional** default; original NAS
+runtime timezone is not verified. Confirm/set it before migration, especially at month
+boundaries. Source metadata is captured with snapshots and exposed in the existing
+operator --inspect response as archive_metadata; no cloned session is required.
+
+The thin Telethon adapter follows original metadata -> finalized-file check -> owned
+temporary download -> completion/size validation -> durable finalization -> success.
+A valid owned original-format file is reused without another download even if its
+SQLite cache row is absent. Unlike upstream's overwrite-capable move, collisions and
+symlinks fail closed. Manifests remain private in .metadata; no visible custom post/album
+folders are created. Old persisted snapshots remain readable. Changing archive root
+requires explicit cache-path migration, not redownloading existing files. See
+[original-downloader-storage.md](original-downloader-storage.md) for pinned source,
+MIT attribution, supported defaults, migration plan and remaining deployment inputs.
+Highest available Telegram quality is downloaded, not a claim of camera originals.
 
 Temp files are exclusively created; publication is atomic no-clobber hard-link then
 unlink of that owned temp (same-directory), so existing/orphan files cannot be silently
@@ -249,16 +264,27 @@ cache, using matching REDIS_PREFIX and MEDIA_ACCOUNT_RATE_KEY when using one use
 Never use credentials as identity labels. Control derives its delivery principal from
 actual bot.get_me().id, never from a guessed username or token text.
 
-Control copies a matching chat/message/immutable-media-revision shared object into an
-owned staging directory, checks known byte size, job/disk limits, then publishes into
-its own archive with atomic no-clobber semantics. Network download is skipped on a
-valid hit. A successful Telegram download is locally cached before shared publication;
-shared errors or MEDIA_SHARED_MAX_BYTES (default **2 GiB per file**, independent of
-CONTROL_MAX_BYTES **20 GiB per task**) fail visibly but do not remove successful local
-archives. Retrying can publish the already downloaded file without redownloading it.
-Cache publication does not certify delivery. No forward-spool cleanup deletes either
-archive. Shared Redis lookup/materialization failure never bypasses the shared cache
-or rate gate and never silently falls back to an uncoordinated send/download.
+Control now publishes a **v2 metadata reference** to its one permanent original-format
+file, not a second hashed payload. Configure permitted root labels consistently:
+
+    MEDIA_SHARED_ARCHIVE_ROOTS_JSON={"control":"/media/TG_Download"}
+
+Control registers its trusted MEDIA_ARCHIVE_DIR as control and refuses a conflicting
+mapping. Each legacy process maps the same label to its mount of that same physical
+archive. Redis cannot supply arbitrary absolute paths. Lookup checks owned regular
+files, traversal/symlinks, size and SHA256 off the event loop. Missing references miss;
+corrupt or unknown-root references fail closed. Canonical lifetime belongs to the
+operator, never cache cleanup. V2 references have no TTL and no 2 GiB blob size limit;
+CONTROL_MAX_BYTES still bounds each task. Shared index errors preserve completed files.
+
+V1 hashed cache objects remain readable/migratable. Configured bridges now default
+MEDIA_SHARED_PERSISTENT_CACHE_ENABLED=false; set this explicitly false in NAS and NUC.
+Legacy fresh downloads remain transient spools: upload and existing cleanup proceed
+unchanged, with no new persistent v1 blob and no transient-path index reference.
+Control-first canonical files remain reusable by legacy; legacy-only bytes are not
+promised to survive spool cleanup for a future explicit control download. Existing old
+objects require explicit migration/retirement. Manual gc_owned is optional maintenance,
+not a promise of automatic cleanup. No GC daemon or new scheduler is introduced.
 
 The composite rate gate retains SQLite rate_until and visible delayed/restart task
 states, and joins shared Redis FloodWait writes before admission. Shared mode can

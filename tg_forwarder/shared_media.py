@@ -3,6 +3,7 @@ No network/client ownership: uses the legacy Redis provider and namespace.
 """
 import asyncio
 import hashlib
+import fcntl
 import json
 import os
 import shutil
@@ -11,6 +12,7 @@ import tempfile
 import time
 import uuid
 import weakref
+from .canonical_media import secure_path, fingerprint
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -85,9 +87,11 @@ def message_identity(msg, chat_id=None):
 
 class SharedMedia:
     def __init__(self, redis, root, *, prefix="tgfwd", account_rate_key, max_bytes=2147483648,
-                 min_free_bytes=1073741824, index_ttl=2592000, rate_interval=.1):
+                 min_free_bytes=1073741824, index_ttl=2592000, rate_interval=.1, canonical_roots=None, persistent_cache_enabled=True):
         if redis is None or not account_rate_key:
             raise SharedUnavailable("shared Redis and MEDIA_ACCOUNT_RATE_KEY required")
+        if type(persistent_cache_enabled) is not bool:raise ValueError("Persistent cache flag must be boolean")
+        self.persistent_cache_enabled = persistent_cache_enabled
         self.redis, self.prefix = redis, prefix + ":media_shared:"
         if not Path(root).is_absolute():
             raise ValueError("MEDIA_SHARED_ROOT must be absolute")
@@ -98,6 +102,9 @@ class SharedMedia:
             raise ValueError("shared size/retention/rate bounds invalid")
         self.rate_key = self.prefix + "rate:" + digest(account_rate_key)
         self._pending_delays = set()
+        self.canonical_roots = {}
+        for label, path in (canonical_roots or {}).items():
+            self.register_root(label,path)
 
     def _root(self):
         # Root is an operator-owned mount, never accept a symlink anywhere in its path.
@@ -120,21 +127,54 @@ class SharedMedia:
             raise SharedUnavailable("archive size mismatch")
         return s.st_size
 
+    def register_root(self, label, path):
+        if not isinstance(label,str) or not label or not label.replace('-','').replace('_','').isalnum():
+            raise ValueError("Invalid canonical root label")
+        path = Path(path)
+        if not path.is_absolute(): raise ValueError("Canonical root must be absolute")
+        if label in self.canonical_roots and self.canonical_roots[label] != path:
+            raise ValueError("Canonical root mapping conflicts with control archive")
+        self.canonical_roots[label] = path
+
+    def _reference_path(self, entry):
+        if entry.get("v") != 2 or entry.get("owner") != "canonical" or entry.get("root") not in self.canonical_roots:
+            raise SharedUnavailable("Unknown canonical reference/root")
+        path = secure_path(self.canonical_roots[entry["root"]],entry["path"],existing=True)
+        if fingerprint(path) != {"size":entry["size"],"sha256":entry["sha256"]}:
+            raise SharedUnavailable("Canonical reference hash mismatch")
+        return path
+
     async def cached(self, identity):
         raw = await self.redis.get(self.prefix + "source:" + digest(identity))
-        if not raw:
-            return None
+        if not raw:return None
         entry = json.loads(raw)
         def lookup():
-            path = self._object(entry["path"])
             try:
-                self._validate(path, entry["size"])
-            except FileNotFoundError:
-                return None
-            return path
+                if entry.get("v") == 2:return self._reference_path(entry)
+                if entry.get("v",1) != 1:raise SharedUnavailable("Unknown shared source version")
+                path = self._object(entry["path"])
+                self._validate(path,entry["size"])
+                return path
+            except FileNotFoundError:return None
         return await _io(lookup)
 
+    async def publish_reference(self, identity, source, label="control"):
+        if label not in self.canonical_roots:raise SharedUnavailable("Canonical root not configured")
+        def inspect():
+            rel=Path(source).absolute().relative_to(self.canonical_roots[label].absolute())
+            path=secure_path(self.canonical_roots[label],rel,existing=True)
+            info=fingerprint(path)
+            return {"v":2,"owner":"canonical","root":label,"path":str(rel),**info}
+        async def commit():
+            entry=await _io(inspect)
+            await self.redis.set(self.prefix+"source:"+digest(identity),json.dumps(entry))
+            return Path(source)
+        return await _owned(commit())
+
     async def publish(self, identity, source):
+        # Legacy caller keeps its owned spool path and ignores this return value.
+        # Never index transient bytes or create another permanent payload when disabled.
+        if not self.persistent_cache_enabled:return Path(source)
         async def commit():
             target, size = await _io(self._publish_file, identity, source)
             await self.redis.set(self.prefix + "source:" + digest(identity),
@@ -175,11 +215,26 @@ class SharedMedia:
                 os.chmod(target, 0o444)
             except FileExistsError:
                 self._validate(target, size)
+                if fingerprint(target) != fingerprint(Path(temp)):
+                    raise SharedUnavailable("Existing shared object hash differs; not overwritten")
             directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
             try:
                 os.fsync(directory)
             finally:
                 os.close(directory)
+            metadata = root / ".metadata"
+            metadata.mkdir(mode=0o700,exist_ok=True)
+            if metadata.is_symlink():raise SharedUnavailable("Shared metadata symlink")
+            marker = metadata / (relative+".json")
+            if not marker.exists():
+                fd2, tmp2 = tempfile.mkstemp(prefix=".marker-",dir=metadata)
+                try:
+                    with os.fdopen(fd2,"w") as out:
+                        json.dump({"owner":"tgfwd-v1-cache", "identity":identity,"created":time.time(),**fingerprint(target)},out)
+                        out.flush();os.fsync(out.fileno())
+                    os.link(tmp2,marker,follow_symlinks=False)
+                except FileExistsError:pass
+                finally:os.unlink(tmp2)
             return target, size
         finally:
             # Only our mkstemp absolute regular file; never sweep archives.
@@ -191,14 +246,25 @@ class SharedMedia:
         source = await self.cached(identity)
         if source is None:
             return None
+        raw_entry = await self.redis.get(self.prefix+"source:"+digest(identity))
+        entry = json.loads(raw_entry) if raw_entry else None
+        if entry is None:raise SharedUnavailable("Source index changed during materialization")
         destination = Path(destination)
         created = False
         def copy():
             nonlocal created
             with os.fdopen(os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)), "rb") as src:
-                with destination.open("xb") as dst:
+                fcntl.flock(src,fcntl.LOCK_SH)
+                with os.fdopen(os.open(destination,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),"wb") as dst:
                     created = True
-                    shutil.copyfileobj(src, dst, 1024 * 1024)
+                    before=os.fstat(src.fileno())
+                    shutil.copyfileobj(src,dst,1024*1024)
+                    dst.flush();os.fsync(dst.fileno())
+                    after=os.fstat(src.fileno())
+                    if (before.st_ino,before.st_size,before.st_mtime_ns)!=(after.st_ino,after.st_size,after.st_mtime_ns) or dst.tell()!=entry["size"]:
+                        raise SharedUnavailable("Source changed during materialization")
+            if entry.get("v")==2 and fingerprint(destination)["sha256"]!=entry["sha256"]:
+                raise SharedUnavailable("Canonical copy hash mismatch")
             return destination
         def cleanup():
             if created and destination.is_file() and not destination.is_symlink():
@@ -210,6 +276,45 @@ class SharedMedia:
                 await _io(cleanup)
                 raise
         return await _owned(materialize(), cleanup)
+
+    async def gc_owned(self, identities, *, minimum_age=86400, apply=False, quiescent=False):
+        """Explicit bounded maintenance only; never delete canonical files or unknown v1 objects."""
+        if len(identities)>32 or minimum_age<3600:raise ValueError("GC batch/age bound")
+        if apply and not quiescent:raise SharedUnavailable("Stop all writers/readers before GC")
+        results=[]
+        for identity in identities:
+            relative=digest(identity)
+            raw=await self.redis.get(self.prefix+"source:"+relative)
+            if raw and json.loads(raw).get("v",1)==1:
+                results.append({"object":relative,"state":"indexed"});continue
+            lease=self.prefix+"maintenance:"+relative
+            if await self.redis.get(lease):
+                results.append({"object":relative,"state":"leased"});continue
+            def inspect_or_retire():
+                target=self._object(relative)
+                marker=self._root()/".metadata"/(relative+".json")
+                if marker.parent.is_symlink() or marker.is_symlink() or not marker.is_file():return "unowned"
+                entry=json.loads(marker.read_text())
+                if entry.get("owner")!="tgfwd-v1-cache" or entry.get("identity")!=identity:return "unowned"
+                if time.time()-entry["created"]<minimum_age:return "young"
+                if target.is_symlink():raise SharedUnavailable("GC symlink rejected")
+                if not target.exists():return "absent"
+                if fingerprint(target)!={"size":entry["size"],"sha256":entry["sha256"]}:raise SharedUnavailable("GC hash mismatch")
+                if apply:
+                    with target.open("rb") as stream:
+                        fcntl.flock(stream,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                        target.unlink()
+                    marker.unlink()
+                    return "retired"
+                return "eligible"
+            token=uuid.uuid4().hex
+            if apply and not await self.redis.set(lease,token,nx=True,ex=300):continue
+            try:
+                results.append({"object":relative,"state":await _io(inspect_or_retire)})
+            finally:
+                if apply:
+                    await self.redis.eval("if redis.call('GET',KEYS[1]) == ARGV[1] then return redis.call('DEL',KEYS[1]) else return 0 end",1,lease,token)
+        return results
 
     def operation(self, identities, destination, topic, delivery_identity, *, action="upload", caption=""):
         if not delivery_identity:
@@ -291,6 +396,9 @@ async def configured_bridge():
         raise ValueError("MEDIA_SHARED_ENABLED must be true or false")
     if value == "false":
         return None
+    persistent_cache = os.getenv("MEDIA_SHARED_PERSISTENT_CACHE_ENABLED","false").lower()
+    if persistent_cache not in ("true","false"):
+        raise ValueError("MEDIA_SHARED_PERSISTENT_CACHE_ENABLED must be true or false")
     from redis.asyncio import Redis
     # Do not inherit edit_mapping import-time env snapshots: control loads its
     # protected env file after imports. Read credentials ONLY at this call.
@@ -312,7 +420,9 @@ async def configured_bridge():
                        max_bytes=int(os.getenv("MEDIA_SHARED_MAX_BYTES", "2147483648")),
                        min_free_bytes=int(os.getenv("MEDIA_SHARED_MIN_FREE_BYTES", "1073741824")),
                        index_ttl=int(os.getenv("MEDIA_SHARED_INDEX_TTL", "2592000")),
-                       rate_interval=float(os.getenv("MEDIA_ACCOUNT_RATE_INTERVAL", ".1")))
+                       rate_interval=float(os.getenv("MEDIA_ACCOUNT_RATE_INTERVAL", ".1")),
+                       canonical_roots=json.loads(os.getenv("MEDIA_SHARED_ARCHIVE_ROOTS_JSON", "{}")),
+                       persistent_cache_enabled=persistent_cache=="true")
 
 
 async def legacy_send(send, snapshots, target, caption, info, source_kind):

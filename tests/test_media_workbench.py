@@ -1285,10 +1285,11 @@ class ControlSharedBridgeTests(Base):
         self.assertEqual((await self.run_task(await self.payload('forward',[OWNER,None])))['state'],'ambiguous')
         self.assertFalse(any(':done:' in k for k in self.redis.data))
 
-    async def test_shared_publish_size_guard_preserves_successful_local_archive(self):
+    async def test_reference_does_not_copy_or_apply_legacy_blob_size_limit(self):
         self.bridge.max_bytes=3
         row=await self.run_task(await self.payload())
-        self.assertEqual(row['state'],'failed');self.assertIn('共享媒體發佈失敗',row['error'])
+        self.assertEqual(row['state'],'done')
+        self.assertFalse(list(self.bridge.root.glob('[0-9a-f]'*64)))
         self.assertEqual(next(self.config.root.rglob('*.jpg')).read_bytes(),b'data')
         self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM cache').fetchone()[0],1)
 

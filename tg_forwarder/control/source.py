@@ -20,6 +20,10 @@ def item(msg, section):
             "media_id": str(getattr(getattr(msg, "photo", None) or getattr(msg, "document", None), "id", "")),
             "kind": kind, "size": getattr(file, "size", None), "caption": clean(getattr(msg, "message", "")),
             "date": date.date().isoformat(), "section": section,
+            "archive_meta": {"datetime":getattr(msg,"date",None).isoformat() if getattr(msg,"date",None) else None, "title":str(msg.chat_id),
+                "photo_id":getattr(getattr(msg,"photo",None),"id",None),
+                "extension":getattr(file,"ext",None) or (".jpg" if kind=="photo" else ".mp4"),
+                "filename":next((a.file_name for a in getattr(getattr(msg,"document",None),"attributes",[]) if hasattr(a,"file_name")),None)},
             "protected": bool(getattr(msg, "noforwards", False))}
 
 
@@ -111,6 +115,7 @@ class Resolver:
         for value in snap["discussion"]:
             value["protected"] |= bool(getattr(entity, "noforwards", False))
             value["access_hash"] = getattr(entity, "access_hash", None)
+            value["archive_meta"]["title"] = getattr(entity,"title",None) or str(value["chat"])
         snap["partial"], snap["warning"] = partial, "新留言超過增量掃描上限" if partial else ""
         snap["cursor"] = max(messages, default=cursor)
         snap["captured"] = datetime.now(timezone.utc).isoformat()
@@ -128,6 +133,7 @@ class Resolver:
         for m in main:
             m["protected"] |= protected
             m["access_hash"] = getattr(entity, "access_hash", None)
+            m["archive_meta"]["title"] = getattr(entity,"title",None) or str(m["chat"])
         snap = {"ref": ref.as_dict(), "peer": peer, "post": min(m.id for m in main_messages),
                 "main": main, "discussion": [], "selected": [m for m in main if m["id"] == seed.id],
                 "selected_album": main, "partial": False, "warning": "", "thread": None,
@@ -161,6 +167,7 @@ class Resolver:
             for m in snap["discussion"]:
                 m["protected"] |= group_protected
                 m["access_hash"] = getattr(root_peer, "access_hash", None)
+                m["archive_meta"]["title"] = getattr(root_peer,"title",None) or str(m["chat"])
             if ref.comment:
                 selected = messages.get(ref.comment)
                 if selected is None or selected.id in root_ids:

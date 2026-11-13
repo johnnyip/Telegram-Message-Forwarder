@@ -79,3 +79,19 @@ Existing native venv: python -m unittest discover -s tests -v. No containers or 
 Review regressions: targeted tests additionally cover event-loop responsiveness during blocked copies, cancellation-safe index publication, owned materialization cleanup, two-worker IO cap, definite rejection release versus timeout uncertainty, and native >BotAPI media forwarding with no download plus header receipt preservation. Public bridge APIs remain compatible.
 
 Authenticated startup binding: under shared mode the existing get_me probes must succeed, return a valid positive principal ID, and agree with any explicit identity. Binding happens before producer/consumer startup; listen event handlers are registered only after binding and producer readiness so no early bridge call can use an unverified principal. Probe failures are fatal under shared mode, not warning-continue. Default OFF retains previous warning/continuation behavior and does not set identity variables. No cloned authorization or fresh session is needed. Tests/test_shared_startup_identity.py executes pure binding helpers and actual startup branch bodies (unrelated shutdown flushing isolated) to verify ordering and failure boundaries.
+
+## Original-format canonical references (v2)
+
+Control no longer copies completed archives into permanent hashed objects. It publishes
+root-labelled relative-path/size/SHA256 references. MEDIA_SHARED_ARCHIVE_ROOTS_JSON
+maps permitted names to trusted local mount paths in each process; configure control
+to the original-format TG_Download root. V1 hashed source lookup remains compatible.
+Rate/send-receipt behavior is unchanged. See original-downloader-storage.md for explicit
+legacy retirement/GC and dry-run-first one-file migration. Never delete unknown hashed
+objects ad hoc: they may be the sole surviving copy.
+
+Production transient policy: MEDIA_SHARED_PERSISTENT_CACHE_ENABLED defaults false for
+configured_bridge and should be explicitly false in both services. Legacy fresh spool
+publication becomes a no-copy/no-index operation; existing upload/spool cleanup remains
+unchanged. V2 canonical publication/reuse and old v1 reads/migration still work. Manual
+GC does not substitute for this policy or guarantee legacy object cleanup.

@@ -1,6 +1,7 @@
 """Actual Bot API update handlers: auth is checked before parsing ANY input."""
 import asyncio
 import json
+from tg_forwarder.shared_media import _io
 import logging
 import time
 from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup as Markup
@@ -205,7 +206,7 @@ class Controller:
         if action not in ("download", "forward", "both"):
             raise ValueError("不支援動作")
         payload = {"snapshot": snap, "items": selected, "action": action, "target": data.get("target")}
-        self.engine.validate(payload)
+        await _io(self.engine.validate,payload)
         unknown = any(i.get("size") is None for i in selected)
         if (len(selected) >= self.config.confirm_items or unknown or snap["partial"]) and not data.get("confirmed"):
             await self.edit(chat, reply, "較大／未知大小／partial 任務：只處理已列出 "+str(len(selected))+" 項，仍受數量／空間上限限制。確認？",
@@ -248,7 +249,7 @@ class Controller:
             completed = sum(self.store.operation(self.engine.operation_key(p, i))[0] == "done" for i in p["items"])
         return p, total, completed, downloaded
 
-    def task_buttons(self, owner, chat, reply, task):
+    async def task_buttons(self, owner, chat, reply, task):
         base = {"kind": "task", "task": task["id"]}
         buttons = [self.button("詳情／更新", owner, chat, reply, {**base, "do": "details"})]
         if task["state"] in ("queued", "running", "delayed"):
@@ -261,7 +262,7 @@ class Controller:
             try:
                 payload = self.engine.cached_photo_payload(task)
                 for selected in payload["items"]:
-                    self.engine.cached_file(selected)
+                    await self.engine.cached_file_async(selected)
             except (ValueError,PermissionError,OSError):
                 pass
             else:
@@ -287,7 +288,7 @@ class Controller:
             text += "\n可重試時間："+time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(task["due"]))
         if task["state"] == "ambiguous":
             text += "\n傳送結果未確認，必須核對目的地，禁止盲目重送。"
-        rows = [self.task_buttons(owner, chat, reply, task),
+        rows = [await self.task_buttons(owner, chat, reply, task),
                 [self.button("我的任務", owner, chat, reply, {"kind": "task", "do": "list"})]]
         await self.edit(chat, reply, text[:4000], rows)
 
@@ -306,7 +307,7 @@ class Controller:
         for task in tasks:
             _, total, done, _ = self.task_counts(task)
             lines.append(task["id"]+" "+task["state"]+" "+str(done)+"/"+str(total))
-            buttons = self.task_buttons(owner, chat, reply, task)
+            buttons = await self.task_buttons(owner, chat, reply, task)
             buttons[0] = self.button("詳情 "+task["id"], owner, chat, reply,
                 {"kind": "task", "task": task["id"], "do": "details"})
             rows.append(buttons)
@@ -403,7 +404,7 @@ class Controller:
                 task = None
                 if values:
                     task = {"snapshot": snap, "items": values, "action": p["action"], "target": p.get("target")}
-                    self.engine.validate(task)
+                    await _io(self.engine.validate,task)
                     if len(values) >= self.config.confirm_items or any(i.get("size") is None for i in values):
                         raise ValueError("新留言任務超過確認門檻／未知大小，請手動查詢；游標未前進")
                 self.store.commit_watch(watch,cursor=snap["cursor"],task=task,subscription=p,

@@ -43,6 +43,7 @@ class Config:
     scan_limit: int = 10000
     watch_interval: int = 300
     watch_settle_seconds: int = 30
+    archive_timezone: str = "UTC"
     expected_archive_mount: object = None
     expected_archive_fstypes: tuple = ("nfs", "nfs4")
 
@@ -77,6 +78,9 @@ class Config:
             raise ValueError("invalid expected filesystem types")
         if expected and not Path(expected).is_absolute():
             raise ValueError("expected archive mount must be absolute")
+        from zoneinfo import ZoneInfo
+        kw["archive_timezone"] = os.getenv("CONTROL_ARCHIVE_TIMEZONE","UTC")
+        ZoneInfo(kw["archive_timezone"])
         kw.update(expected_archive_mount=Path(expected) if expected else None, expected_archive_fstypes=fstypes)
         return cls(allowed_ids(os.getenv("CONTROL_ALLOWED_USER_IDS", "")), tuple(parsed),
                    Path(os.getenv("MEDIA_ARCHIVE_DIR", os.getenv("MEDIA_ARCHIVE_ROOT", "/data/media-archive"))),
