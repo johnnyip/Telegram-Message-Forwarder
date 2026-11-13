@@ -345,6 +345,11 @@ def should_skip_message(msg) -> Optional[str]:
 
 
 def job_fingerprint(job: dict) -> str:
+    if job.get("info", {}).get("future_comments"):
+        import hashlib
+        context = job["info"]["future_comments"]
+        identities = [v.get("shared_identity", [v.get("chat_id"), v.get("msg_id")]) for v in job.get("snapshots", [job.get("snapshot", {})])]
+        return "future-comments:"+hashlib.sha256(json.dumps([context, identities, sorted(job.get("route_names", []))],sort_keys=True).encode()).hexdigest()
     job_type = job.get("job_type", "unknown")
     source_kind = job.get("source_kind", "unknown")
     info = job.get("info", {}) if isinstance(job.get("info"), dict) else {}
@@ -431,7 +436,7 @@ async def publish_media_job(msg, info: dict, routes: List[Dict[str, Any]], sourc
         msg, info, routes, source_kind,
         media_delay_seconds=MEDIA_DELAY_SECONDS,
         topic=KAFKA_MEDIA_TOPIC,
-        producer=producer,
+        producer=future_comment_producer(producer, info),
         json_bytes=json_bytes,
         log=log,
         should_direct_forward_large_media=should_direct_forward_large_media,
@@ -453,7 +458,7 @@ async def publish_album_job(msgs: List[Any], info: dict, routes: List[Dict[str, 
         msgs, info, routes, source_kind,
         media_delay_seconds=MEDIA_DELAY_SECONDS,
         topic=KAFKA_MEDIA_TOPIC,
-        producer=producer,
+        producer=future_comment_producer(producer, info),
         json_bytes=json_bytes,
         log=log,
         should_direct_forward_large_album=should_direct_forward_large_album,
@@ -591,12 +596,18 @@ async def send_text_to_target(route: Dict[str, Any], tgt: Any, combined: str, in
 
 
 async def send_file_to_target(route: Dict[str, Any], tgt: Any, fpath: Path, caption: str, info: dict, source_kind: str) -> bool:
+    if info.get("future_comments") and not await future_comment_permitted(info, route):
+        from telegram.error import BadRequest
+        raise BadRequest("Future comment route disabled before transport")
     if APP_MODE == "send" and bot is not None:
         return await send_file_via_bot(bot, tgt, fpath, caption, info, route, source_kind, bot_send_semaphore=bot_send_semaphore, log=log, upload_max_bytes=BOT_UPLOAD_MAX_BYTES)
     return await send_file_to_target_mod(route, tgt, fpath, caption, info, source_kind, client=client, run_api=run_api, log=log)
 
 
 async def send_album_to_target(route: Dict[str, Any], tgt: Any, files: List[str], caption: str, info: dict, source_kind: str) -> bool:
+    if info.get("future_comments") and not await future_comment_permitted(info, route):
+        from telegram.error import BadRequest
+        raise BadRequest("Future comment route disabled before transport")
     if APP_MODE == "send" and bot is not None:
         return await send_album_via_bot(
             bot,
@@ -807,12 +818,14 @@ async def text_consumer_loop():
         await text_consumer.stop()
 
 
-async def media_consumer_loop():
-    assert media_consumer is not None
-    commit_batcher = OffsetCommitBatcher(media_consumer, "media")
-    await media_consumer.start()
+async def media_consumer_loop(consumer=None, lane="media"):
+    consumer = media_consumer if consumer is None else consumer
+    assert consumer is not None
+    future_lane = lane == "future-comments"
+    commit_batcher = OffsetCommitBatcher(consumer, lane)
     try:
-        async for record in media_consumer:
+        await consumer.start()
+        async for record in consumer:
             cleanup_paths: List[str] = []
             job = None
             fingerprint = None
@@ -830,14 +843,38 @@ async def media_consumer_loop():
                     "due_at": job.get("due_at"),
                     "created_at": job.get("created_at"),
                 })
+                if future_lane:
+                    from tg_forwarder.processing.future_delivery import record as future_record, terminal, receipts_complete, selection
+                    selection(job)
+                    _, evidence = await future_record(job)
+                    if json.loads(evidence['job']['data']) != job:
+                        raise ValueError('Future payload differs from durable prepared evidence')
                 # P1: Sleep BEFORE claiming the journal entry.  If the process
                 # crashes during the delay, the offset is uncommitted and Kafka
                 # redelivers the message on restart.  Claiming first and then
                 # sleeping causes the journal to have a "processing" entry that
                 # causes a skip on restart, silently dropping the message.
                 await sleep_until_due(job)
+                if future_lane and evidence.get('status') == 'canceled':
+                    commit_batcher.mark_processed(record)
+                    await commit_batcher.maybe_commit(reason='future_evidence_canceled')
+                    continue
+                if job.get("info", {}).get("future_comments") and not await future_comment_job_permitted(job):
+                    if future_lane:
+                        await terminal(job, "canceled")
+                    # No shared send claim is acquired for canceled queued work.
+                    commit_batcher.mark_processed(record)
+                    await commit_batcher.maybe_commit(reason="future_comments_disabled")
+                    continue
                 fingerprint = job_fingerprint(job)
                 existing = journal_get(fingerprint)
+                if future_lane and (evidence.get('status') != 'prepared' or (existing and existing.get('status') in {'processing','done'})):
+                    if not await receipts_complete(job, build_job_processing_ctx()):
+                        raise RuntimeError('Unconfirmed future delivery; reconciliation required')
+                    await terminal(job, 'complete')
+                    commit_batcher.mark_processed(record)
+                    await commit_batcher.maybe_commit(reason='future_receipts_confirmed')
+                    continue
                 if existing and existing.get("status") in {"processing", "done"}:
                     log({
                         "ts": tstamp(),
@@ -854,6 +891,14 @@ async def media_consumer_loop():
                     await commit_batcher.maybe_commit(reason="journal_skip")
                     continue
 
+                if future_lane:
+                    handoff = await terminal(job, 'in_flight')
+                    if not handoff['accepted']:
+                        if handoff['status'] == 'canceled':
+                            commit_batcher.mark_processed(record)
+                            await commit_batcher.maybe_commit(reason='future_handoff_canceled')
+                            continue
+                        raise RuntimeError('Future handoff already owned/completed; reconcile before transport')
                 claimed = journal_claim(fingerprint, {
                     "job_type": job.get("job_type"),
                     "chat_id": job.get("info", {}).get("chat_id") if isinstance(job.get("info"), dict) else None,
@@ -861,6 +906,8 @@ async def media_consumer_loop():
                     "grouped_id": job.get("info", {}).get("grouped_id") if isinstance(job.get("info"), dict) else None,
                     "source_kind": job.get("source_kind"),
                 })
+                if not claimed and future_lane:
+                    raise RuntimeError('Future journal claim uncertain; reconciliation required')
                 if not claimed:
                     log({
                         "ts": tstamp(),
@@ -877,6 +924,10 @@ async def media_consumer_loop():
                     continue
 
                 cleanup_paths = await dispatch_media_job(job, build_job_processing_ctx())
+                if future_lane:
+                    if not await receipts_complete(job, build_job_processing_ctx()):
+                        raise RuntimeError('Incomplete future target delivery receipts')
+                    await terminal(job, 'complete')
 
                 commit_batcher.mark_processed(record)
                 await commit_batcher.maybe_commit(reason="processed")
@@ -903,6 +954,17 @@ async def media_consumer_loop():
                 if cleanup_paths:
                     cleanup_files(cleanup_paths, job.get("source_kind", "unknown"), job.get("info", {}).get("msg_id"), log)
             except Exception as e:
+                if future_lane:
+                    if fingerprint:
+                        journal_record_failure(fingerprint, {"job_type": job.get("job_type"), "err": e.__class__.__name__})
+                    log({"ts": tstamp(), "type": "critical", "op": "future_comment_delivery_unacknowledged",
+                         "err": e.__class__.__name__, "note": "offset retained; retry or reconcile before resuming consumer"})
+                    # Do not inherit the legacy continue/poison-skip behavior: a
+                    # later offset must not acknowledge this unresolved new job.
+                    from tg_forwarder.processing.future_delivery import block
+                    await block({'reason':e.__class__.__name__, 'topic':record.topic, 'partition':record.partition,
+                                 'offset':record.offset, 'fingerprint':fingerprint})
+                    raise RuntimeError("Future comment delivery requires retry/reconciliation") from None
                 if fingerprint:
                     failures = journal_record_failure(fingerprint, {
                         "job_type": job.get("job_type") if isinstance(job, dict) else None,
@@ -942,7 +1004,7 @@ async def media_consumer_loop():
                 "err": e.__class__.__name__,
                 "msg": str(e),
             })
-        await media_consumer.stop()
+        await consumer.stop()
 
 
 # ============================================================
@@ -950,6 +1012,64 @@ async def media_consumer_loop():
 # ============================================================
 
 _DISCUSSION_SNAPSHOTS = None
+_FUTURE_COMMENTS = None
+
+
+async def replay_future_comment_job(topic, data):
+    assert producer is not None
+    from tg_forwarder.processing.future_delivery import metadata_ready
+    if topic != KAFKA_MEDIA_TOPIC + '-future-comments':
+        raise ValueError('Unexpected future replay topic')
+    await metadata_ready(producer.client, topic)
+    await producer.send_and_wait(topic, data.encode())
+
+
+def future_comment_producer(actual, info):
+    if not info.get("future_comments"):
+        return actual
+    from tg_forwarder.processing.future_comments import OutboxProducer
+    return OutboxProducer(actual)
+
+
+async def start_future_comments():
+    global _FUTURE_COMMENTS
+    if not any(r.get("forward_future_comment_photos", False) for r in ROUTES) and not edit_mapping_enabled():
+        return
+    from tg_forwarder.processing.future_comments import FutureComments, REGISTRY
+    if not any(r.get("forward_future_comment_photos", False) for r in ROUTES):
+        try:
+            redis = await get_redis()
+            if redis is None or not json.loads(await redis.get(REGISTRY) or '[]'):
+                return
+        except Exception as exc:
+            log({'type':'err','op':'future_comments_start','err':type(exc).__name__})
+            return
+    _FUTURE_COMMENTS = FutureComments(
+        client=client, routes=ROUTES, publish_media=publish_media_job, publish_album=publish_album_job,
+        resolve_info=resolve_sender_info_from_message,
+        should_ignore=lambda info: should_ignore(info, IGNORE_USERS, IGNORE_IDS),
+        should_skip=should_skip_message, log=log, run_api=run_api, replay_job=replay_future_comment_job)
+    spawn_bg(_FUTURE_COMMENTS.loop())
+
+
+async def future_comment_permitted(info, route):
+    if not info.get("future_comments"):
+        return True
+    from tg_forwarder.processing.future_comments import permitted, selections, signature
+    context = info["future_comments"]
+    if signature(selections(ROUTES).get(context["source"], [])) != context["signature"]:
+        return False
+    return await permitted(info, route)
+
+
+async def future_comment_job_permitted(job):
+    info = job.get("info", {})
+    if not info.get("future_comments"):
+        return True
+    for route in ROUTES:
+        if route["name"] in job.get("route_names", []) and await future_comment_permitted(info, route):
+            return True
+    return False
 
 
 def schedule_discussion_snapshot(messages, routes, source_kind):
@@ -1068,6 +1188,8 @@ async def _album_timer(source_kind: str, chat_id: int, grouped_id: int):
 # ============================================================
 
 async def handle_incoming_message(msg, source_kind: str):
+    if _FUTURE_COMMENTS is not None:
+        _FUTURE_COMMENTS.offer(msg)  # wake only; never await mapping/poll/download here
     overall_timer = StepTimer()
 
     msg_date_obj = getattr(msg, "date", None)
@@ -1371,6 +1493,7 @@ async def startup_kafka_producer():
         max_batch_size=KAFKA_PRODUCER_MAX_BATCH_SIZE,
     )
     await producer.start()
+    await start_future_comments()
 
 
 async def startup_kafka_consumers():
@@ -1391,6 +1514,57 @@ async def startup_kafka_consumers():
         enable_auto_commit=False,
         auto_offset_reset="earliest",
     )
+
+    await start_future_consumer()
+
+
+async def start_future_consumer():
+    from tg_forwarder.processing.future_comments import REGISTRY
+    try:
+        enabled = any(r.get("forward_future_comment_photos", False) for r in ROUTES)
+        if not enabled and not edit_mapping_enabled():
+            return
+        redis = await get_redis()
+        known = json.loads(await redis.get(REGISTRY) or '[]') if redis is not None else []
+        if not enabled and not known:
+            return
+        spawn_bg(future_consumer_supervisor())
+    except Exception as exc:
+        log({'type':'err','op':'future_consumer_start','err':type(exc).__name__})
+
+
+async def future_consumer_supervisor():
+    from tg_forwarder.processing.future_delivery import BLOCKED, metadata_ready, block
+    from aiokafka.client import AIOKafkaClient
+    probe = None
+    try:
+        redis = await get_redis()
+        if redis is None:
+            raise RuntimeError('Future consumer requires Redis')
+        # A blocked lane may only drain work if ALL configured sources are now disabled.
+        if await redis.get(BLOCKED) and any(r.get('forward_future_comment_photos',False) for r in ROUTES):
+            return
+        topic = KAFKA_MEDIA_TOPIC + '-future-comments'
+        probe = AIOKafkaClient(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
+        await asyncio.wait_for(probe.bootstrap(),20)
+        await metadata_ready(probe, topic)
+        await probe.close()
+        probe = None
+        consumer = AIOKafkaConsumer(topic, bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            group_id=f"{KAFKA_CONSUMER_GROUP}-future-comments", enable_auto_commit=False,
+            auto_offset_reset='earliest')
+        await media_consumer_loop(consumer, 'future-comments')
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log({'type':'critical','op':'future_lane_paused','err':type(exc).__name__})
+        try:
+            await block({'reason':type(exc).__name__})
+        except Exception:
+            pass  # future lane stopped even if Redis is unavailable; ordinary consumers survive
+    finally:
+        if probe is not None:
+            await probe.close()
 
 
 async def shutdown_kafka():

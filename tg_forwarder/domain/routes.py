@@ -29,11 +29,17 @@ def load_routes(routes_json: str) -> List[Dict[str, Any]]:
         include_discussion = raw.get("include_discussion_media", False)
         if type(include_discussion) is not bool:
             raise RuntimeError(f"Route #{idx} include_discussion_media must be a boolean")
+        future_comments = raw.get("forward_future_comment_photos", False)
+        if type(future_comments) is not bool:
+            raise RuntimeError(f"Route #{idx} forward_future_comment_photos must be a boolean")
+        if future_comments and any(type(v) is not int or v >= -1000000000000 for v in sources):
+            raise RuntimeError("Future comments require explicit numeric channel sources")
         routes.append({
             "name": str(raw.get("name", f"route_{idx}")),
             "sources": set(sources),
             "targets": targets,
             "include_discussion_media": include_discussion,
+            "forward_future_comment_photos": future_comments,
         })
     return routes
 

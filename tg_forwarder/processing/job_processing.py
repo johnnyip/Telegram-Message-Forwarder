@@ -118,6 +118,9 @@ async def process_text_job(job: dict, ctx: JobProcessingContext) -> List[str]:
 
 
 async def process_media_file_job(job: dict, ctx: JobProcessingContext) -> List[str]:
+    if job.get("info",{}).get("future_comments"):
+        from .future_delivery import validate_files
+        await validate_files(job)
     info = job["info"]
     if ctx.should_ignore(info, ctx.ignore_users, ctx.ignore_ids):
         ctx.log({"ts": tstamp(), "type": "info", "note": "ignored_media_file_job", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
@@ -159,6 +162,8 @@ async def process_media_file_job(job: dict, ctx: JobProcessingContext) -> List[s
                     "route": route["name"],
                     "message_thread_id": getattr(result, "message_thread_id", None),
                 })
+        if info.get('future_comments') and any(not result or getattr(result,'preserve_local_copy',False) for result in results):
+            raise RuntimeError('Future target did not confirm full delivery; spool retained in place')
         route_wants_preserve = any(getattr(result, "preserve_local_copy", False) for result in results)
         if route_wants_preserve and not preserve_local_copy:
             current_path = retain_file(current_path, ctx, info=info, kind="media_file")
@@ -173,6 +178,9 @@ async def process_media_file_job(job: dict, ctx: JobProcessingContext) -> List[s
 
 
 async def process_media_album_file_job(job: dict, ctx: JobProcessingContext) -> List[str]:
+    if job.get("info",{}).get("future_comments"):
+        from .future_delivery import validate_files
+        await validate_files(job)
     info = job["info"]
     if ctx.should_ignore(info, ctx.ignore_users, ctx.ignore_ids):
         ctx.log({"ts": tstamp(), "type": "info", "note": "ignored_media_album_file_job", "chat_id": info["chat_id"], "msg_id": info["msg_id"]})
@@ -218,6 +226,8 @@ async def process_media_album_file_job(job: dict, ctx: JobProcessingContext) -> 
                     "route": route["name"],
                     "message_thread_id": getattr(result, "message_thread_id", None),
                 })
+        if info.get('future_comments') and any(not result or getattr(result,'preserve_local_copy',False) for result in results):
+            raise RuntimeError('Future target did not confirm full delivery; spool retained in place')
         route_wants_preserve = any(getattr(result, "preserve_local_copy", False) for result in results)
         if route_wants_preserve and not preserve_local_copy:
             retained_files = []
@@ -376,6 +386,9 @@ async def process_media_album_forward_job(job: dict, ctx: JobProcessingContext) 
 
 
 async def dispatch_media_job(job: dict, ctx: JobProcessingContext) -> List[str]:
+    if job.get('info',{}).get('future_comments'):
+        from .future_delivery import validate_files
+        await validate_files(job)
     job_type = job.get("job_type")
     if job_type == "media_file":
         return await process_media_file_job(job, ctx)
