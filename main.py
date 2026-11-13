@@ -1,4 +1,10 @@
 import os
+
+# Early opt-in dispatch: no legacy clients or env capture.
+if __name__ == "__main__" and os.getenv("APP_MODE", "listen").strip().lower() == "control":
+    from tg_forwarder.control.runtime import cli
+    cli()
+    raise SystemExit(0)
 import asyncio
 from pathlib import Path
 import json
@@ -35,6 +41,7 @@ from tg_forwarder.core.metrics import StepTimer
 from tg_forwarder.domain.routes import find_matching_routes, load_routes
 from tg_forwarder.runtime.bot_limits import env_flag, resolve_bot_album_max_total_mb, resolve_bot_upload_max_mb
 from tg_forwarder.delivery.senders import fetch_message_by_id as fetch_message_by_id_mod, fetch_messages_by_ids as fetch_messages_by_ids_mod, send_album_to_target as send_album_to_target_mod, send_file_to_target as send_file_to_target_mod, send_text_to_target as send_text_to_target_mod
+from tg_forwarder.shared_media import configured_bridge, native_forward
 from tg_forwarder.processing.snapshot import snapshot_album_messages as snapshot_album_messages_mod, snapshot_media_message as snapshot_media_message_mod
 from tg_forwarder.domain.telegram_info import resolve_sender_info_from_message
 from tg_forwarder.storage.send_journal import journal_claim, journal_get, journal_mark, journal_record_failure, journal_is_poison, SEND_JOURNAL_MAX_FAILURES
@@ -253,9 +260,14 @@ async def run_api(coro_fn: Callable[[], Any], op: str, extra: Optional[dict] = N
     exhausted coroutine raises RuntimeError in Python 3.10+.
     """
     extra = extra or {}
+    shared = await configured_bridge()
+    if shared:
+        await shared.wait()
     try:
         return await coro_fn()
     except errors.FloodWaitError as e:
+        if shared:
+            await shared.record_delay(e.seconds)
         log({
             "ts": tstamp(),
             "type": "warn",
@@ -265,7 +277,14 @@ async def run_api(coro_fn: Callable[[], Any], op: str, extra: Optional[dict] = N
             **extra,
         })
         await asyncio.sleep(e.seconds + 1)
-        return await coro_fn()
+        if shared:
+            await shared.wait()
+        try:
+            return await coro_fn()
+        except errors.FloodWaitError as repeated:
+            if shared:
+                await shared.record_delay(repeated.seconds)
+            raise
     except errors.RPCError as e:
         log({
             "ts": tstamp(),
@@ -474,8 +493,7 @@ async def direct_forward_large_media(msg, info: dict, routes: List[Dict[str, Any
                     "media_size": get_media_size(msg),
                     "media_type": media_type(msg),
                 }
-                await run_api(lambda t=target, h=hdr: client.send_message(t, h), op="send_header_before_forward_large", extra=extra)
-                await run_api(lambda t=target, m=msg: client.forward_messages(t, m, m.peer_id), op="forward_large_media", extra=extra)
+                await native_forward([msg], info, target, hdr, source_kind, client=client, run_api=run_api, extra=extra)
                 log({"ts": tstamp(), "type": "out", "op": "forward_large_media", "status": "ok", **extra})
                 success_count += 1
         if success_count > 0:
@@ -529,8 +547,7 @@ async def direct_forward_large_album(msgs: List[Any], info: dict, routes: List[D
                     "msg_ids": [m.id for m in sorted_msgs],
                     "grouped_id": info.get("grouped_id"),
                 }
-                await run_api(lambda t=target, h=hdr: client.send_message(t, h), op="send_header_before_forward_album", extra=extra)
-                await run_api(lambda t=target, ms=sorted_msgs: client.forward_messages(t, ms, ms[0].peer_id), op="forward_large_album", extra=extra)
+                await native_forward(sorted_msgs, info, target, hdr, source_kind, client=client, run_api=run_api, extra=extra, album=True)
                 log({"ts": tstamp(), "type": "out", "op": "forward_large_album", "status": "ok", **extra})
                 success_count += 1
         if success_count > 0:
@@ -932,6 +949,23 @@ async def media_consumer_loop():
 # Album buffering
 # ============================================================
 
+_DISCUSSION_SNAPSHOTS = None
+
+
+def schedule_discussion_snapshot(messages, routes, source_kind):
+    global _DISCUSSION_SNAPSHOTS
+    if not any(r.get("include_discussion_media", False) for r in routes):
+        return
+    if _DISCUSSION_SNAPSHOTS is None:
+        from tg_forwarder.processing.discussion import DiscussionSnapshots
+        _DISCUSSION_SNAPSHOTS = DiscussionSnapshots(
+            client=client, spawn=spawn_bg, resolve_info=resolve_sender_info_from_message,
+            publish_media=publish_media_job, publish_album=publish_album_job,
+            should_ignore=lambda info: should_ignore(info, IGNORE_USERS, IGNORE_IDS),
+            should_skip=should_skip_message, log=log)
+    _DISCUSSION_SNAPSHOTS.schedule(messages, routes, source_kind)
+
+
 async def flush_album(source_kind: str, chat_id: int, grouped_id: int):
     key = (source_kind, chat_id, grouped_id)
     album = PENDING_ALBUMS.pop(key, None)
@@ -987,6 +1021,7 @@ async def flush_album(source_kind: str, chat_id: int, grouped_id: int):
     else:
         await publish_album_job(msgs, info, routes, source_kind)
     dedup_mark(dedup_key_for_album(info["chat_id"], grouped_id, source_kind))
+    schedule_discussion_snapshot(msgs, routes, source_kind)
 
 
 def add_to_album_buffer(msg, source_kind: str):
@@ -1202,6 +1237,7 @@ async def handle_incoming_message(msg, source_kind: str):
             return
         await publish_text_job(msg, info, routes, source_kind)
         dedup_mark(_text_dedup_key)
+        schedule_discussion_snapshot([msg], routes, source_kind)
         return
 
     if getattr(msg, "grouped_id", None) is not None:
@@ -1230,6 +1266,7 @@ async def handle_incoming_message(msg, source_kind: str):
         else:
             await publish_media_job(msg, info, routes, source_kind)
         dedup_mark(_dedup_key)
+        schedule_discussion_snapshot([msg], routes, source_kind)
 
     spawn_bg(_publish_and_mark())
 

@@ -281,3 +281,7 @@ docker build -t johnnyip/telegram-message-forwarder:latest .
 Source text/caption edits retain the destination text and append a timestamped full revision. Both general and topic copies are updated; album edits affect the first caption of each copy. Existing message links/formatting are preserved via HTML entities. Identical source text and older edit events are ignored within the existing Redis mapping TTL. The single-listener topology serializes fetch/append/store. If text exceeds Telegram limits (4096 UTF-16 units for text, 1024 for captions), or the original cannot be read, the original is left untouched and the full revision is sent as reply chunks. Ambiguous reply sends are logged and not automatically replayed. Earlier overwritten versions, edits before the service observes them, expired mappings, media binary replacements and direct Telethon forwards cannot be reconstructed by this feature.
 
 For validation-only jobs explicitly use `PUBLISH_IMAGES=false` and `PROMOTE_LATEST=false`. Ordinary main-branch SCM builds default to tested immutable publication followed by latest promotion.
+
+## On-demand media workbench
+
+Optional `APP_MODE=control`: independent downloader-bot control plane, durable archives/tasks and per-post opt-in comment watches. Existing modes/routes are unchanged. See [configuration, safety limits, NUC Compose and acceptance](docs/media-workbench.md).

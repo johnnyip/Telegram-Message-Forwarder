@@ -26,10 +26,14 @@ def load_routes(routes_json: str) -> List[Dict[str, Any]]:
         if not targets:
             raise RuntimeError(f"Route #{idx} has no targets")
 
+        include_discussion = raw.get("include_discussion_media", False)
+        if type(include_discussion) is not bool:
+            raise RuntimeError(f"Route #{idx} include_discussion_media must be a boolean")
         routes.append({
             "name": str(raw.get("name", f"route_{idx}")),
             "sources": set(sources),
             "targets": targets,
+            "include_discussion_media": include_discussion,
         })
     return routes
 

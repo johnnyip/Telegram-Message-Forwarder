@@ -3,6 +3,7 @@ import uuid
 from pathlib import Path
 from typing import Any, List, Optional
 
+from ..shared_media import configured_bridge, message_identity
 from ..domain.media import build_filename_from_message, get_media_size, media_type
 from ..core.metrics import StepTimer
 from ..core.utils import tstamp
@@ -14,7 +15,7 @@ async def snapshot_media_message(msg, info: dict, source_kind: str, spool_dir: P
     file_name = build_filename_from_message(msg, sender_display)
 
     chat_id = info.get("chat_id")
-    msg_id = info.get("msg_id")
+    msg_id = msg.id
     unique = uuid.uuid4().hex[:8]
 
     target_dir = spool_dir / source_kind / str(chat_id)
@@ -32,8 +33,14 @@ async def snapshot_media_message(msg, info: dict, source_kind: str, spool_dir: P
         "media_size": get_media_size(msg),
     }
 
-    async with download_semaphore:
-        fpath = await run_api(lambda: msg.download_media(save_path), op="snapshot_download_media", extra=extra)
+    bridge = await configured_bridge()
+    identity = message_identity(msg, chat_id) if bridge else None
+    fpath = await bridge.materialize(identity, save_path) if bridge else None
+    if fpath is None:
+        async with download_semaphore:
+            fpath = await run_api(lambda: msg.download_media(save_path), op="snapshot_download_media", extra=extra)
+        if bridge and fpath:
+            await bridge.publish(identity, fpath)
 
     if not fpath:
         log({
@@ -53,6 +60,9 @@ async def snapshot_media_message(msg, info: dict, source_kind: str, spool_dir: P
         "caption_text": (msg.text or msg.message or "").strip(),
         "msg_id": msg.id,
     }
+
+    if identity:
+        snapshot["shared_identity"] = identity
 
     log({
         "ts": tstamp(),
