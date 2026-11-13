@@ -47,6 +47,7 @@ COPY main.py .
 COPY tg_forwarder ./tg_forwarder
 COPY tests ./tests
 COPY Jenkinsfile README.md ./
+COPY docs/licenses ./docs/licenses
 RUN python -m unittest discover -s tests -v
 
 # 建立資料夾作 下載 / session 儲存
