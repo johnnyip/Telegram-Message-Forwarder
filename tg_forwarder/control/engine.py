@@ -180,6 +180,9 @@ class Engine:
             raise ValueError("Shared control delivery requires verified bot identity")
         self.last_notice = {}
         self.download_outcomes = {}
+        self.transfers = {}  # Ephemeral, attempt-bound; never persisted as completion.
+        self.progress_notices = {}  # At most one owned notification per executing task.
+        self.notice_until = 0.0
         # Different concurrent tasks can reference the same disk identity.
         self.download_lock = asyncio.Lock()
         self.send_lock = asyncio.Lock()
@@ -191,14 +194,66 @@ class Engine:
         if task["owner"] not in self.config.allowed:
             raise PermissionError("任務擁有人不再獲授權")
 
-    async def notice(self, task, final=False):
+    async def notice(self, task, final=False, _retry=True):
+        pending=self.progress_notices.get(task['id'])
+        if pending and not pending.done() and pending is not asyncio.current_task():return
         now = time.monotonic()
-        if self.notify and (final or now-self.last_notice.get(task["id"], 0) >= 10):
+        payload=json.loads(task['payload'])
+        known_edit=task['reply']>0 and not payload.get('inbound_notice') and not payload.get('origin_notice')
+        if now < self.notice_until:
+            if final and known_edit:await asyncio.sleep(self.notice_until-now)
+            else:return
+        if self.notify and (final or now-self.last_notice.get(task["id"], -10) >= 3):
             self.last_notice[task["id"]] = now
             try:
                 await self.notify(self.store.task(task["id"], task["owner"], task["chat"]))
+            except RetryAfter as exc:
+                seconds=exc.retry_after.total_seconds() if hasattr(exc.retry_after,'total_seconds') else exc.retry_after
+                self.notice_until=max(self.notice_until,time.monotonic()+float(seconds))
+                # Retry only a known task-card edit, never an ambiguous first send.
+                if final and known_edit and _retry:await self.notice(task,final=True,_retry=False)
             except Exception:
                 pass  # Notification failure must never cause media resend.
+
+    def schedule_progress_notice(self, task):
+        """Coalesce bytes; never await Telegram inside the transfer callback."""
+        pending=self.progress_notices.get(task['id'])
+        if pending and not pending.done():return
+        now=time.monotonic()
+        if now < self.notice_until or now-self.last_notice.get(task['id'],-10)<3:return
+        self.progress_notices[task['id']]=asyncio.create_task(self.notice(task))
+
+    def record_progress(self, task, selected, done, total):
+        now=time.monotonic();prior=self.transfers.get(task['id'])
+        identity=[task['attempt'],selected['chat'],selected['id'],selected.get('media_id')]
+        if not prior or prior['identity']!=identity or done<prior['done']:
+            prior={'identity':identity,'started':now,'sample':now,'sample_bytes':0,'speed':None}
+        elapsed=now-prior['sample']
+        if elapsed>=1:
+            prior.update(speed=max(0,done-prior['sample_bytes'])/elapsed,sample=now,sample_bytes=done)
+        prior.update(done=done,total=total if isinstance(total,(int,float)) and total>0 else None,updated=now)
+        self.transfers[task['id']]=prior
+        self.schedule_progress_notice(task)
+
+    @staticmethod
+    def format_bytes(value):
+        number=float(value)
+        for unit in ('B','KiB','MiB','GiB','TiB'):
+            if number<1024 or unit=='TiB':return (str(int(number)) if unit=='B' else f'{number:.1f}')+' '+unit
+            number/=1024
+
+    def progress_text(self, task):
+        value=self.transfers.get(task['id'])
+        if task['state']!='running' or not value or value['identity'][0]!=task['attempt']:return ''
+        done,total,speed=value['done'],value['total'],value['speed']
+        age=max(0,time.monotonic()-value['updated'])
+        text='目前檔案 '+self.format_bytes(done)+' / '+(self.format_bytes(total) if total else '大小未知')
+        if total:text+=' ('+str(min(100,int(done/total*100)))+'%)'
+        # An old sample is not a claim of current speed or a batch ETA.
+        if age>10:return text+'｜等待新進度'
+        text+='｜'+(self.format_bytes(speed)+'/s' if speed is not None else '測速中')
+        if total and speed and done<total:text+='｜此檔 ETA '+str(int((total-done)/speed))+'s'
+        return text
 
     def validate(self, payload, check_space=True):
         values = payload["items"]
@@ -690,6 +745,9 @@ class Engine:
                 entity = await self.client.get_entity(self.peer(i))
                 metadata = {**current["archive_meta"],"title":getattr(entity,"title",None) or str(i["chat"])}
                 naming = {**i,"archive_meta":metadata}
+                if self.archive.named and repair_path is None and getattr(entity,'forum',False):
+                    from .source import Resolver
+                    await Resolver(self.client,gate=self.gate,named_folders=True).topics(entity,[msg],[naming])
             if repair_path is not None:path=repair_path
             elif self.archive.flat:
                 path = await self.flat_destination(payload['snapshot'],naming,key)
@@ -713,7 +771,7 @@ class Engine:
                 if used + done > self.config.max_bytes or (total and used+total > self.config.max_bytes):
                     raise ValueError("媒體大小超過上限")
                 await _io(self.archive.space)
-                await self.notice(task)
+                self.record_progress(task,i,done,total)
             try:
                 with os.fdopen(fd, "wb") as f:
                     await self.gate.wait()
@@ -747,6 +805,7 @@ class Engine:
                             raise ValueError('Repair publication changed before receipt')
                     await _io(verify_publication)
                     self.store.meta('repair-publication:'+task['id']+':'+key,encode({'binding':binding,'proof':repair_proof,'identity':list(owned_identity)}))
+                self.transfers.pop(task['id'],None)
                 await self.publish(i, path)
             finally:
                 def cleanup():
@@ -953,6 +1012,7 @@ class Engine:
     async def execute(self, task):
         payload = json.loads(task["payload"])
         inbound = payload.get("source_kind") == "bot-inbound"
+        self.transfers.pop(task['id'],None)
         run={'attempt':task['attempt'],'fresh':0,'reused':0}
         self.store.meta('task-last-run:'+task['id'],encode(run))
         manifest = {"task": task["id"], "snapshot": payload["snapshot"], "action": payload["action"],
@@ -1024,6 +1084,12 @@ class Engine:
             state = "delayed" if task["attempt"] < self.config.retries and not isinstance(exc, (ValueError, PermissionError, OSError, BadRequest, Forbidden)) else "failed"
             self.store.set_task(task["id"], state=state, due=time.time()+min(60, 2**task["attempt"]), error=(("Received media download failed ("+type(exc).__name__+"); private API details omitted") if inbound else (str(exc)[:300] if isinstance(exc, (ValueError, PermissionError, OSError)) else type(exc).__name__)))
         finally:
+            pending=self.progress_notices.pop(task['id'],None)
+            if pending is not None:
+                try:await _join(pending)
+                except asyncio.CancelledError:raise
+                except Exception:pass
+            self.transfers.pop(task['id'],None)
             row = self.store.task(task["id"], task["owner"], task["chat"])
             manifest["state"], manifest["error"] = row["state"], row["error"]
             done = {(i["chat"], i["id"]) for i in manifest["items"]}

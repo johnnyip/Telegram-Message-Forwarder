@@ -3,12 +3,24 @@
 Implementation: tg_forwarder/shared_media.py. Native tests do not imply live acceptance.
 Defaults: MEDIA_SHARED_ENABLED=false; include_discussion_media=false on every route.
 
+## Current deployment boundary
+
+Latest live Ops verification reports NAS shared_cache_reads=true and persistent payload
+publication=false (MEDIA_SHARED_CACHE_READ_ENABLED=true and
+MEDIA_SHARED_PERSISTENT_CACHE_ENABLED=false). Verified existing cache/canonical references
+may therefore be reused; fresh legacy downloads remain transient download/send/cleanup
+without publishing another persistent payload. Shared Redis rate/send receipts are
+independent. Exact mounts, root labels and permissions require their own live inventory;
+these flags alone do not prove a mapping. Examples below do not authorize configuration
+or mount changes. Disabling reads is a separate optional hardening policy, NOT the
+current deployment. NUC control keeps its canonical archive and private local state.
+
 ## Lazy configuration
 
 Factory reads environment at call time AFTER environment()/CONTROL_ENV_FILE, including Redis credentials; no import-time credential snapshot.
 
 - MEDIA_SHARED_ENABLED: true/false only, default false.
-- MEDIA_SHARED_ROOT: absolute operator-owned shared mount. All runtimes must see the same physical NAS directory, possibly at different container paths. Physical /volume1/video/TG_Download/workbench/shared-cache; controller /media/TG_Download/workbench/shared-cache; legacy /media-shared. No symlink path components. Do not allow untrusted writers.
+- MEDIA_SHARED_ROOT: absolute operator-owned root for OPTIONAL byte-sharing consumers. When reads are enabled, matching physical storage may use different container paths. Old workbench/shared-cache and /media-shared mappings are historical examples, not current NAS mount requirements. Read-disabled NAS needs no such bind. No symlink components or untrusted writers.
 - MEDIA_ACCOUNT_RATE_KEY: required nonsecret account label shared across processes using the same user account. Conservatively sharing different accounts is allowed. Never use a session string or token.
 - MEDIA_ACCOUNT_RATE_INTERVAL=.1: shared admission slot spacing seconds, not byte-bandwidth control.
 - MEDIA_DELIVERY_IDENTITY: legacy shared upload identity. APP_MODE=send derives bot:{authenticated_bot.id}:legacy-mirror-v1 from its existing bot.get_me() startup probe when unset. Explicit matching-principal semantic suffixes are preserved; mismatched kind/ID or empty suffix fails startup. Never infer from destination owner or use a token.
@@ -19,9 +31,12 @@ Factory reads environment at call time AFTER environment()/CONTROL_ENV_FILE, inc
 
 Shared mode PRESERVES the configured native large-media direct-forward path (including media larger than Bot API upload limits), using immutable document/photo revisions from fetched source messages. Native header and native-forward actions have separate receipts: a definite forward rejection can retry without duplicating an already sent header. No shared cache download/re-upload is involved in native forwarding. Protected-content rejection still reaches the original legacy fallback policy. Old upload snapshots without shared_identity still need deliberate re-snapshot; old native jobs fetch current source messages and can use revision-aware native claims. OFF keeps old behavior.
 
-## Exact controller API glue
+## Historical v1 adapter example (not current control integration)
 
-After protected environment loading:
+Current control publishes its finalized permanent file with publish_reference(identity,
+path), a v2 reference rather than another persistent payload. Current NAS reads are
+enabled; valid configured references may supply source bytes. The following v1 example
+applies only to compatibility callers, after protected environment loading:
 
     from tg_forwarder.shared_media import configured_bridge, media_identity, message_identity
     bridge = await configured_bridge()  # None disabled; exceptions are NOT bypass
@@ -44,7 +59,9 @@ Other signatures:
 - await receipt(operation) -> dict | None (empty dict also means success)
 - await wait(); await record_delay(seconds); sync delay(seconds) compatible with Resolver gate.
 
-Both pipelines COPY cache bytes into owned spool. Cleanup/unlink/retention never deletes shared archive or mutates its bytes. Publication copies, fsyncs, atomic no-clobber link and directory fsync; task-owned exclusive incoming file alone is cleaned up. Filesystem validation/copy/fsync execute through asyncio.to_thread with a shared two-worker admission semaphore per event loop, across bridge instances. Cancellation joins shielded owned work before returning: publish completes durable file plus Redis index (or propagates its failure), materialize removes only its own exclusive partial/completed spool copy after the thread finishes. No detached filesystem worker races caller cleanup. NAS outage can delay cancellation until its kernel filesystem call returns; do not promise instant cancellation of a blocked mount. Redis stores relative flat hash filename and size, never cross-host absolute paths. Size/symlink/traversal guard failures are fatal. Existing objects never overwritten. Operator-trusted immutable cache, not adversarial-storage checksum verification; malicious filesystem writers are outside trust boundary.
+Optional v1 materialization COPYs cache bytes into an owned spool. Current control
+v2 publication keeps its one permanent file. Read-enabled NAS may copy verified shared
+bytes to its transient spool; persistent publication remains disabled. Cleanup/unlink/retention never deletes shared archive or mutates its bytes. Publication copies, fsyncs, atomic no-clobber link and directory fsync; task-owned exclusive incoming file alone is cleaned up. Filesystem validation/copy/fsync execute through asyncio.to_thread with a shared two-worker admission semaphore per event loop, across bridge instances. Cancellation joins shielded owned work before returning: publish completes durable file plus Redis index (or propagates its failure), materialize removes only its own exclusive partial/completed spool copy after the thread finishes. No detached filesystem worker races caller cleanup. NAS outage can delay cancellation until its kernel filesystem call returns; do not promise instant cancellation of a blocked mount. Redis stores relative flat hash filename and size, never cross-host absolute paths. Size/symlink/traversal guard failures are fatal. Existing objects never overwritten. Operator-trusted immutable cache, not adversarial-storage checksum verification; malicious filesystem writers are outside trust boundary.
 
 ## Receipts, identity and safe failure
 

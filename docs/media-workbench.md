@@ -97,27 +97,40 @@ Fixture evidence: channel -1004433596337 post 4833..4842 has 10 photos; group
 six 10-item albums; comment24204 selects the last 6-photo/4-video album. Combined
 70 media =59 photos+11 videos. This is an offline fixture, not a live acceptance claim.
 
-Permanent archives now follow the original tangyoha downloader default workflow:
+## Current archive layout versus historical compatibility
 
-    TG_Download/<chat.title or configured ID>/<message YYYY_MM>/<message ID> - <original stem><extension>
+For the current named service (CONTROL_ARCHIVE_NAMED=true), BOTH fresh native URL
+and received-copy downloads use:
 
-Missing document filenames become ID.ext, without a repeated ID stem. Photos use
-Pyrogram DOCUMENT-type unique IDs (not raw media IDs). Unicode/spaces/emoji and original
-suffixes remain. Discussion items use their actual source chat/message metadata.
-CONTROL_ARCHIVE_TIMEZONE=UTC is an explicit **provisional** default; original NAS
-runtime timezone is not verified. Confirm/set it before migration, especially at month
-boundaries. Source metadata is captured with snapshots and exposed in the existing
-operator --inspect response as archive_metadata; no cloned session is required.
+    TG_Download/<confirmed chat title[ - confirmed forum topic]>/<message ID> - <original stem><extension>
 
-The thin Telethon adapter follows original metadata -> finalized-file check -> owned
-temporary download -> completion/size validation -> durable finalization -> success.
-A valid owned original-format file is reused without another download even if its
-SQLite cache row is absent. Unlike upstream's overwrite-capable move, collisions and
-symlinks fail closed. Manifests remain private in .metadata; no visible custom post/album
-folders are created. Old persisted snapshots remain readable. Changing archive root
-requires explicit cache-path migration, not redownloading existing files. See
-[original-downloader-storage.md](original-downloader-storage.md) for pinned source,
-MIT attribution, supported defaults, migration plan and remaining deployment inputs.
+No month/post/album subdirectories are added in named mode. URL discussion media uses
+its actual linked-group title/identity, not the channel's name. Genuine received
+channel origins may provide a naming label only; hidden origins never invent a source
+name or authorize MTProto access. Folder collisions remain identity-bound; filenames
+use the pinned upstream codec with sanitization and deterministic collision suffixes.
+Missing document names become ID.ext; photos use the supported stable unique-ID codec.
+
+Historical library/default mode may retain <chat>/<YYYY_MM>/..., root-flat mode retains
+its old files, and older workbench snapshots may retain channel/datepost/main-discussion/
+album nesting. They are compatibility paths, NOT the current named layout. No flag moves
+old files or repairs a deleted historical folder automatically. CONTROL_ARCHIVE_TIMEZONE
+remains provisionally UTC for historical month-based behavior; this is not confirmation
+of NAS timezone. Source archive_metadata is available through the existing owned --inspect
+socket without cloning an authorization session.
+
+Current flat/named manifests live in the private local CONTROL_DB parent/manifests,
+not public TG_Download. Historical default .metadata manifests remain readable. In
+named/flat mode unknown existing files are never adopted by size or overwritten;
+current exact-cache/alias proof guards and no-clobber publication remain authoritative.
+The historical non-flat original-format adoption branch is compatibility-only, not a
+promise about current named downloads. A completed DB task is historical completion,
+not proof of current files: use native details/locations and explicit missing-only repair.
+The CURRENT repair action pins the recorded OLD path; canonical retargeting is not yet
+implemented. See [the proposed legacy alignment plan](legacy-named-alignment-plan.md)
+before any organization or canonical repair. No automatic migration is authorized here.
+See [original-downloader-storage.md](original-downloader-storage.md) for exact upstream
+commit/MIT provenance, naming boundaries and buffered received-progress limitations.
 Highest available Telegram quality is downloaded, not a claim of camera originals.
 
 Temp files are exclusively created; publication is atomic no-clobber hard-link then
@@ -199,7 +212,8 @@ verified before startup; do not silently download onto an unmounted local direct
           APP_MODE: control
           CONTROL_ENV_FILE: /run/secrets/control.env
           CONTROL_STATE_DIR: /data/control
-          MEDIA_ARCHIVE_DIR: /media/TG_Download/workbench
+          MEDIA_ARCHIVE_DIR: /media/TG_Download
+          CONTROL_ARCHIVE_NAMED: 'true'
           CONTROL_ALLOWED_USER_IDS: '5268216341'
           CONTROL_TARGETS_JSON: '[{"chat_id":5268216341}]'
           CONTROL_CONCURRENCY: '1'
@@ -259,8 +273,14 @@ MEDIA_SHARED_ENABLED=false preserves standalone behavior. When explicitly enable
 control creates configured_bridge only after CONTROL_ENV_FILE loading. See
 [media-shared.md](media-shared.md) for required Redis/shared-root/account-label settings,
 NAS path mappings, retention, ACLs and the default-off route discussion snapshot.
-Both processes must point MEDIA_SHARED_ROOT at the same physical operator-owned NAS
-cache, using matching REDIS_PREFIX and MEDIA_ACCOUNT_RATE_KEY when using one user account.
+When byte sharing is explicitly enabled on both processes, their shared roots must
+represent the same operator-owned storage. Latest live Ops verification reports NAS
+cache reads enabled and persistent payload publication disabled. Existing verified
+references may be reused; fresh legacy spools retain normal upload/cleanup without
+another persistent payload. Exact mounts/root labels need separate inventory; this
+document does not authorize changing them. Read-disabled operation is an optional
+policy, not the current deployment. Shared receipt/rate coordination is independent; keep matching
+REDIS_PREFIX and MEDIA_ACCOUNT_RATE_KEY for the same user account.
 Never use credentials as identity labels. Control derives its delivery principal from
 actual bot.get_me().id, never from a guessed username or token text.
 
@@ -270,8 +290,9 @@ file, not a second hashed payload. Configure permitted root labels consistently:
     MEDIA_SHARED_ARCHIVE_ROOTS_JSON={"control":"/media/TG_Download"}
 
 Control registers its trusted MEDIA_ARCHIVE_DIR as control and refuses a conflicting
-mapping. Each legacy process maps the same label to its mount of that same physical
-archive. Redis cannot supply arbitrary absolute paths. Lookup checks owned regular
+mapping. Only a legacy process explicitly authorized for canonical byte reads maps that label
+to the same physical archive. A NAS process with MEDIA_SHARED_CACHE_READ_ENABLED=false
+does not need, and must not be given, a canonical archive bind merely for coordination. Redis cannot supply arbitrary absolute paths. Lookup checks owned regular
 files, traversal/symlinks, size and SHA256 off the event loop. Missing references miss;
 corrupt or unknown-root references fail closed. Canonical lifetime belongs to the
 operator, never cache cleanup. V2 references have no TTL and no 2 GiB blob size limit;
@@ -281,7 +302,8 @@ V1 hashed cache objects remain readable/migratable. Configured bridges now defau
 MEDIA_SHARED_PERSISTENT_CACHE_ENABLED=false; set this explicitly false in NAS and NUC.
 Legacy fresh downloads remain transient spools: upload and existing cleanup proceed
 unchanged, with no new persistent v1 blob and no transient-path index reference.
-Control-first canonical files remain reusable by legacy; legacy-only bytes are not
+Control-first canonical files are reusable only by an explicitly read-enabled legacy
+consumer; current NAS has reads enabled, subject to verified root/path/proof guards. Legacy-only bytes are not
 promised to survive spool cleanup for a future explicit control download. Existing old
 objects require explicit migration/retirement. Manual gc_owned is optional maintenance,
 not a promise of automatic cleanup. No GC daemon or new scheduler is introduced.
@@ -340,8 +362,9 @@ hardcoded username. This button grants no group or topic access.
 
 **Existing completed tasks work without another download:** send /tasks, click that
 task's 詳情 button (or open /tasks TASK_ID). The refreshed card renders the new button
-from its persisted task and cache records. Older completion messages are not mass
-edited on startup. Expired controls require a fresh /tasks card. Nothing is sent
+from its persisted task and cache records. Startup may refresh at most 32 verified stable task-card anchors through the native
+per-card revision mechanism (including matching persisted capability anchors); active/
+ambiguous anchors and unknown first sends are not replaced. This is not a mass-history scan. Expired controls require a fresh /tasks card. Nothing is sent
 until the owner explicitly clicks the photo-send button.
 
 The worker preflights every selected local file before sending. Cache misses, unsafe

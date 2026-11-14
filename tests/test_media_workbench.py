@@ -811,7 +811,8 @@ class TaskUiTests(Base):
         self.client.main[0].download_media.assert_awaited_once()
         await self.controller.render_task(OWNER,OWNER,100,task)
         self.assertIn("已完成 2/2",self.bot.edit_message_text.call_args.kwargs["text"])
-        self.assertIn("未完成餘下 0",self.bot.edit_message_text.call_args.kwargs["text"])
+        self.assertNotIn("未完成餘下 0",self.bot.edit_message_text.call_args.kwargs["text"])  # Compact DONE card omits zero-error clutter.
+        self.assertIn("已完成 2/2",self.bot.edit_message_text.call_args.kwargs["text"])
         self.assertFalse(any(b.text in ("取消","繼續","重試失敗項目") for b in self.buttons()))
 
     async def test_notify_uses_render_task_and_keeps_live_controls(self):

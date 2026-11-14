@@ -574,7 +574,7 @@ class Controller:
             except Exception:continue  # Failed cards remain retryable; never send replacements.
             self.store.meta(cardmarker,stamp)
 
-    async def render_task(self, owner, chat, reply, task):
+    async def render_task(self, owner, chat, reply, task, *, detail=False):
         # Re-read by owner/chat; notification payloads and stale buttons are not authority.
         task = self.store.task(task["id"], owner, chat)
         p, total, completed, downloaded = self.task_counts(task)
@@ -588,6 +588,8 @@ class Controller:
             if self.location_allowed(owner,chat):
                 inventory=await self.location_inventory(task)
                 text+='\n目前可用 '+str(sum(v[2]=='可用' for v in inventory))+'/'+str(total)+'；遺失 '+str(sum(v[2]=='檔案遺失' for v in inventory))+'（📂 下載位置查看／補下載）'
+                uncertain=sum(v[2] not in ('可用','檔案遺失') for v in inventory)
+                if uncertain:text+='；待核對 '+str(uncertain)
         else:text += "\n已完成 "+str(completed)+"/"+str(total)+"；已下載 "+str(downloaded)+"/"+str(total)
         if p.get('missing_repair'):text+='\n補下載遺失項目；原歷史任務 '+p['missing_repair']['origin']+' 保留；不會重新轉發。'
         stats=json.loads(self.store.get_meta('task-last-run:'+task['id'],'null'))
@@ -595,13 +597,23 @@ class Controller:
         elif task['state']=='done':text+='\n沒有本次重新下載紀錄；並非新下載成功。'
         if task["state"] in ("done", "failed", "cancelled", "ambiguous"):
             text += "\n失敗／未完成餘下 "+str(total-completed)+" 項"
-        text += "\n嘗試 "+str(task["attempt"])
+        if detail:text += "\n嘗試 "+str(task["attempt"])
         if task["error"]:
-            text += "\n"+task["error"]
+            text += "\n"+(task["error"] if detail else task["error"][:180])
         if task["state"] == "delayed":
             text += "\n可重試時間："+time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(task["due"]))
         if task["state"] == "ambiguous":
             text += "\n傳送結果未確認，必須核對目的地，禁止盲目重送。"
+        live=self.engine.progress_text(task)
+        if live:text+='\n'+live
+        if not detail:
+            text=text.replace('任務 '+task['id']+'：'+task['state']+'\n'+action+'；',action+'｜'+task['state']+'\n',1)
+            text=text.replace('；不代表目前檔案仍存在或本次有重新下載。','')
+            text=text.replace('\n沒有本次重新下載紀錄；並非新下載成功。','')
+            if p.get('missing_repair'):
+                text=text.replace('補下載遺失項目；原歷史任務 '+p['missing_repair']['origin']+' 保留；不會重新轉發。','補下載遺失項目（不轉發）')
+            text=text.replace('；不代表目前檔案仍存在或本次有重新下載。','；非本次新下載').replace('（📂 下載位置查看／補下載）','').replace('最近一次執行（attempt '+str(task['attempt'])+'）：',('本次紀錄：' if task['state']=='running' else '最近執行：')).replace('沒有本次重新下載紀錄；並非新下載成功。','沒有本次新下載紀錄。')
+            text=text.replace('\n失敗／未完成餘下 0 項','')
         rows = [await self.task_buttons(owner, chat, reply, task),
                 [self.button("我的任務", owner, chat, reply, {"kind": "task", "do": "list"})]]
         await self.edit(chat, reply, text[:4000], rows)
@@ -661,7 +673,7 @@ class Controller:
             return
         if data["do"] != "details":
             task = self.change_task(owner, chat, task["id"], data["do"])
-        await self.render_task(owner, chat, reply, task)
+        await self.render_task(owner, chat, reply, task, detail=data['do']=='details')
 
     async def task_command(self, owner, chat, command, args):
         if command == "/tasks" and not args:

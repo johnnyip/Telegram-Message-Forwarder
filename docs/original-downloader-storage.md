@@ -132,13 +132,16 @@ copy/publication waits for its owned worker before cleaning its own temporary fi
 A shared-index failure never deletes a completed canonical download.
 
 Legacy v1 objects remain **read/migrate-only in production**. The configured bridge
-now defaults MEDIA_SHARED_PERSISTENT_CACHE_ENABLED=false; parent will set it explicitly
-false in both NAS and NUC Git configurations. With this flag, legacy publish returns
+now defaults MEDIA_SHARED_PERSISTENT_CACHE_ENABLED=false. Latest live Ops verification
+confirms NAS persistent payload publication is false; cache reads are independently true. With this flag, legacy publish returns
 its caller-owned spool path without copying or indexing it. The real legacy caller
 ignores that return value, uploads the spool normally and uses its existing cleanup.
 A transient spool is never registered as a canonical reference.
 
-Control-first -> legacy reuses the v2 canonical reference without redownloading.
+Read-enabled legacy consumers can reuse verified control-first v2 references without
+redownloading. Current NAS reads are enabled; exact configured roots, mounts and proof
+guards still determine whether any particular reference is usable. Fresh cache misses
+use the original transient download/upload/cleanup, with persistent publication disabled.
 Legacy-only -> normal transient download/upload/cleanup, with no additional permanent
 payload. A later explicit control download may fetch once if the old spool is gone;
 there is no claim of preserving transient bytes forever for future reuse. Old v1 lookups
@@ -228,7 +231,16 @@ NAS and NUC readers/writers are stopped. Restore the normal Git-controlled servi
 entrypoint afterward. Do not run host-native CLI against container DB paths, create
 a parallel helper owner, clone authentication or invent path mapping.
 
-Parent's intended steady-state bindings/settings (not applied by this documentation):
+### Historical proposed shared-byte bindings (verify against live inventory)
+
+The following mapping was a past migration proposal, NOT proof of current mounts.
+Latest live Ops verification reports MEDIA_SHARED_CACHE_READ_ENABLED=true and
+MEDIA_SHARED_PERSISTENT_CACHE_ENABLED=false. Those flags do not establish exact
+root bindings or permissions. Redis rate/delivery coordination is independent. Do not
+add, remove or replace mounts from this historical example without fresh inventory
+and separately authorized normal Git/CI deployment:
+
+Historical proposed bindings (never applied by this documentation):
 - Both services: MEDIA_SHARED_PERSISTENT_CACHE_ENABLED=false.
 - NUC: MEDIA_ARCHIVE_DIR=/media/TG_Download;
   MEDIA_SHARED_ROOT=/media/TG_Download/.tg-media-cache;
@@ -240,9 +252,10 @@ Parent's intended steady-state bindings/settings (not applied by this documentat
 - Retain access to exact old cache/archive paths only through the quiescent explicit
   migration. No resumed post-retirement process should still bind old_root.
 
-Parent verified the existing NAS cache mount/namespace, not a current canonical-root
-mount. Canonical bindings, complete metadata inventory and live service configuration
-still require normal Git/CI deployment. Timezone remains unknown; the current Nov 11
+The earlier NAS cache-mount observation is historical, not proof of current mounts.
+Any shared-byte mapping change needs fresh inventory, authorization and normal
+Git/CI deployment. Current read-enabled NAS requires valid access for references it
+actually consumes; do not infer exact mounts from these examples. Timezone remains unknown; the current Nov 11
 file stays in 2026_11 across the relevant zones, so explicit provisional UTC need not
 block this one file. This is not confirmation of original runtime timezone.
 
@@ -272,3 +285,65 @@ narrow explicit-plan extension/operator procedure. That procedure must inventory
 private state, verify reverse mapping and update known references atomically. The
 old 87.6 MB file is outside that 20-file operation. This source change adds no new
 migration framework and performs no NAS moves, copies, deletes or permission changes.
+
+## URL/received parity and live native progress (source revision after CI24)
+
+Read-only upstream evidence remains pinned, not a claim of copying its entire UI:
+- media_downloader.py::_get_media_meta uses actual message.chat.title, original
+  document filename/photo unique ID and Application.get_file_save_path. Its default
+  date-based folder behavior is not the current service's explicitly requested named
+  chat/topic convention.
+- download_media passes update_download_status as its actual byte callback;
+  module/download_stat.py computes observed deltas over >=1 second.
+- module/pyrogram_extension.py::report_bot_status renders current bytes/speed/percent;
+  TaskNode.should_reply in module/app.py limits replies to >1 second. This service
+  instead coalesces one owned update per task at >=3 seconds and respects Bot 429.
+  Upstream evidence establishes bytes/speed/percent, NOT an original download ETA
+  guarantee; the measured per-file ETA described below is this native UI's addition.
+
+With CONTROL_ARCHIVE_NAMED=true, FUTURE fresh native URL and received-copy downloads
+already share Engine.primary_destination/flat_destination and the pinned filename
+codec: one confirmed chat/topic folder, media directly inside. URL main media uses
+its channel title/identity; discussion media uses its linked group's title/identity,
+not the channel's title. Newly handled legacy source payloads missing metadata obtain
+that metadata from their exact source entity; forum names must be verified through the
+existing bounded resolver before a new destination is selected. Received forwards use
+only their genuine channel-origin label or authorized receiving-chat label, never
+invented hidden-source names or MTProto lookups. Existing collision bindings, no-clobber,
+protection, principal/owner and physical-alias guards are unchanged.
+
+Old nested/root-flat files and cache rows stay where they are. Explicit missing-only
+repair remains pinned to the recorded original path and its publication receipts.
+Reposting a URL is not a migration or permission to replay a completed historical task.
+The historical 53-file task with missing files is not automatically repaired. Moving
+old files requires a separate exact inventory/plan, quiescence and explicit approval;
+this change neither designs an implicit relocation nor runs the existing migration CLI.
+
+Live URL download callbacks retain only ephemeral attempt/file-bound byte samples.
+Displayed speed is a measured >=1-second byte delta; ETA is for that FILE only, never
+an invented batch ETA. Unknown total/zero elapsed show size unknown/measuring; stale
+samples (>10s) stop claiming current speed/ETA. Item completion, fresh/reused counts,
+missing files and errors remain distinct. Restart/retry resets samples, not task history
+or cumulative attempts. Compact cards retain secondary details/location/native controls;
+historical last-run statistics are labelled as historical, not a new duplicate download.
+
+Telegram edits run in at most one owned background notification per executing task;
+bytes continue while a slow edit is pending. Final completion joins it before the final
+card, so an older in-flight edit cannot overwrite the terminal card. 429 creates an
+independent notification cooldown, without resending media or delaying source transfers.
+The terminal update may wait for that cooldown and retries a known task-card EDIT at
+most once; ambiguous first sends and durable inbound/operation notice delivery are
+never retried through this helper. A second 429 leaves the truthful task state durable
+and available through native details rather than looping or re-uploading.
+This is not a new transport: PTB's existing bounded received-file adapter buffers its
+cloud response and exposes only a final byte callback; no live network-byte granularity
+is claimed for that API. Cached reuse emits no fake network speed. No production calls,
+NAS writes/migrations, authorization/config changes or automatic repair are performed.
+
+## Legacy visible-folder alignment (proposal, not implemented)
+
+See [legacy-named-alignment-plan.md](legacy-named-alignment-plan.md) for exact native
+inventory/mapping, required source/title/topic authority, separate existing-file versus
+missing-only operations, receipt/reference preservation, and stop conditions. The current
+missing repair still pins old paths; future named alignment alone does not reorganize
+historical workbench files. Nothing in this documentation performs that organization.
