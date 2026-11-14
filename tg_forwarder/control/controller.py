@@ -229,7 +229,65 @@ class Controller:
                  [self.back_button(owner, chat, reply, base, "actions")]])
             return
         task = self.store.create_task(owner, chat, reply, payload)
+        task = await self.resubmit_download(owner,chat,reply,task,payload)
         await self.render_task(owner, chat, reply, task)
+
+    async def resubmit_download(self,owner,chat,reply,task,requested):
+        """Only explicit query action reaches here; rendering/startup never repairs."""
+        source=json.loads(task['payload'])
+        if task['state']!='done' or source['action'] not in ('download','both') or source.get('missing_repair') or source.get('source_kind')=='bot-inbound':return task
+        if not self.location_allowed(owner,chat):raise PermissionError('Resubmission owner/bot mismatch')
+        if self.store.get_meta('bot_principal','')!=str(self.engine.bot_id):raise PermissionError('Resubmission bot principal required')
+        headkey='missing-repair-head:'+task['id'];head=self.store.get_meta(headkey,'')
+        if head:
+            previous=self.store.task(head,owner,chat)
+            if previous['state']!='done':return previous  # native retry/cancel/ambiguous controls
+        values=await self.location_inventory(task)
+        if any(v[2] not in ('可用','檔案遺失') for v in values):raise ValueError('快取路徑不安全／未能確認，未自動補下載')
+        if not any(v[2]=='檔案遺失' for v in values):return task
+        if not self.engine.archive.named:raise ValueError('重新提交補下載需要已啟用 NAMED 儲存格式')
+        identity=lambda i:(i['chat'],i['id'],i.get('media_id',''))
+        fresh={identity(i):i for i in requested['items']}
+        if len(fresh)!=len(source['items']):raise ValueError('重新查詢選取範圍已改變')
+        selected=[];entries=[];destinations=set();folders={}
+        for old,value in zip(source['items'],values):
+            if value[2]!='檔案遺失':continue
+            current=fresh.get(identity(old))
+            if current is None or any(current.get(k)!=old.get(k) for k in ('kind','album','size','section')):raise ValueError('來源內容已改變，未補下載')
+            meta=current.get('archive_meta') or {}
+            title=meta.get('folder_title') or meta.get('title')
+            if not title or title==str(meta.get('folder_chat',current['chat'])) or (meta.get('topic_id') and not meta.get('topic_title')):raise ValueError('缺少已確認頻道／話題名稱')
+            # Pure native projection; no archive_folder writes during planning.
+            path=self.engine.archive.file(source['snapshot'],current)
+            relative=str(path.relative_to(self.engine.archive.root))
+            binding=[meta.get('folder_chat',current['chat']),meta.get('topic_id')]
+            if path.parent in folders and folders[path.parent]!=binding:raise ValueError('選取項目命名資料夾身份衝突')
+            folders[path.parent]=binding
+            prior=self.store.get_meta('archive_folder:'+digest(str(path.parent.relative_to(self.engine.archive.root))),'')
+            if prior and json.loads(prior)!=binding:raise ValueError('命名資料夾身份衝突，未補下載')
+            if path in destinations:raise ValueError('重新下載檔名重複，未覆寫')
+            destinations.add(path)
+            # Missing old paths are evidence, not permission to adopt a foreign
+            # canonical destination, even if its size happens to match.
+            try:path.lstat()
+            except FileNotFoundError:pass
+            else:raise ValueError('重新下載目的地已存在，未覆寫／採用')
+            key=digest(list(identity(old)));cached=self.store.db.execute('SELECT * FROM cache WHERE key=?',(key,)).fetchone()
+            if cached is None or cached['path']!=str(self.engine.archive.root/value[1]) or cached['size']!=current.get('size'):raise ValueError('遺失快取記錄已變更')
+            selected.append(current)
+            entries.append({'key':key,'relative':relative,'previous_relative':value[1],'size':cached['size']})
+        payload={'action':'download','target':None,'snapshot':source['snapshot'],'items':selected,
+            'missing_repair':{'origin':task['id'],'revision':digest(task['payload']),'previous':head,'entries':entries,'explicit_resubmit':True}}
+        await _io(self.engine.validate,payload)
+        with self.store.transaction():
+            current_head=self.store.get_meta(headkey,'')
+            if current_head!=head:
+                current=self.store.task(current_head,owner,chat)
+                if current['state']!='done':return current
+                raise ValueError('已有較新已完成下載，請重新提交以檢查檔案')
+            derived=self.store.insert_task(owner,chat,reply,payload)
+            self.store.meta(headkey,derived['id'])
+        return derived
 
     @staticmethod
     def media_counts(values):

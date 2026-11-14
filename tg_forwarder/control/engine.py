@@ -611,15 +611,31 @@ class Engine:
         if task['owner']!=OWNER or task['chat']!=OWNER:raise PermissionError('Missing repair owner private chat required')
         original=self.store.task(repair['origin'],task['owner'],task['chat'])
         source=json.loads(original['payload'])
-        if original['state']!='done' or digest(original['payload'])!=repair['revision'] or source.get('source_kind')=='bot-inbound' or source.get('missing_repair') or payload['action']!='download' or payload.get('target') is not None or selected not in source['items'] or payload['snapshot']!=source['snapshot']:raise PermissionError('Missing repair original/task binding mismatch')
+        explicit=repair.get('explicit_resubmit') is True
+        original_item=next((i for i in source['items'] if (i['chat'],i['id'],i.get('media_id',''))==(selected['chat'],selected['id'],selected.get('media_id',''))),None)
+        selection_ok=selected in source['items']
+        if explicit and original_item is not None:
+            selection_ok=all(selected.get(k)==original_item.get(k) for k in ('chat','id','media_id','kind','album','size','section'))
+            if not self.archive.named or self.store.get_meta('bot_principal','')!=str(self.bot_id):raise PermissionError('Explicit resubmission principal/layout mismatch')
+        if original['state']!='done' or digest(original['payload'])!=repair['revision'] or source.get('source_kind')=='bot-inbound' or source.get('missing_repair') or payload['action']!='download' or payload.get('target') is not None or not selection_ok or payload['snapshot']!=source['snapshot']:raise PermissionError('Missing repair original/task binding mismatch')
         key=digest([selected['chat'],selected['id'],selected.get('media_id','')])
         matches=[entry for entry in repair['entries'] if entry['key']==key]
         if len(matches)!=1:raise ValueError('Missing repair selection binding mismatch')
         entry=matches[0];cached=self.store.db.execute('SELECT * FROM cache WHERE key=?',(key,)).fetchone()
-        if cached is None or cached['path']!=str(self.archive.root/entry['relative']) or cached['size']!=entry['size'] or entry['size']<=0 or (selected.get('size') is not None and selected['size']!=entry['size']):raise ValueError('Missing repair cache binding changed')
+        old_relative=entry.get('previous_relative',entry['relative']) if explicit else entry['relative']
+        allowed_paths={str(self.archive.root/old_relative)}
+        if explicit:allowed_paths.add(str(self.archive.root/entry['relative']))
+        if cached is None or cached['path'] not in allowed_paths or cached['size']!=entry['size'] or entry['size']<=0 or (selected.get('size') is not None and selected['size']!=entry['size']):raise ValueError('Missing repair cache binding changed')
         record=json.loads(self.store.get_meta('repair-publication:'+task['id']+':'+key,'null'))
         def validate():
             path=self.archive.path(*Path(entry['relative']).parts)
+            if explicit:
+                if path!=self.archive.file(payload['snapshot'],selected):raise ValueError('Resubmission canonical destination changed')
+                old_path=self.archive.path(*Path(old_relative).parts)
+                if old_path!=path:
+                    try:old_path.lstat()
+                    except FileNotFoundError:pass
+                    else:raise ValueError('Previously missing source path is now occupied')
             try:path.lstat()
             except FileNotFoundError:
                 if require_existing:raise ValueError('Verified repair publication is missing') from None
@@ -628,13 +644,21 @@ class Engine:
             binding={'task':task['id'],'origin':repair['origin'],'revision':repair['revision'],'key':key,'path':str(path),'size':entry['size']}
             if not record or record.get('binding')!=binding:
                 raise ValueError('Originally missing repair path is now occupied; no verified own publication')
+            if cached['path']!=str(path):raise ValueError('Repair publication cache path mismatch')
             self._cached_path(dict(cached),selected,0)
             info=path.lstat()
             if [info.st_dev,info.st_ino]!=record.get('identity'):raise ValueError('Repair publication inode changed')
             if fingerprint(path)!=record.get('proof'):
                 raise ValueError('Repair publication bytes changed; no source fallback')
             return path
-        return await _io(validate)
+        path=await _io(validate)
+        if explicit:
+            meta=selected['archive_meta'];name='archive_folder:'+digest(str(path.parent.relative_to(self.archive.root)))
+            binding=[meta.get('folder_chat',selected['chat']),meta.get('topic_id')]
+            prior=self.store.get_meta(name,'')
+            if prior and json.loads(prior)!=binding:raise ValueError('Resubmission folder identity collision')
+            self.store.meta(name,encode(binding))
+        return path
 
     async def download(self, task, payload, i, used):
         self.download_outcomes[task['id']]='reused'
