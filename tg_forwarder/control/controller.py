@@ -256,11 +256,11 @@ class Controller:
             if current is None or any(current.get(k)!=old.get(k) for k in ('kind','album','size','section')):raise ValueError('來源內容已改變，未補下載')
             meta=current.get('archive_meta') or {}
             title=meta.get('folder_title') or meta.get('title')
-            if not title or title==str(meta.get('folder_chat',current['chat'])) or (meta.get('topic_id') and not meta.get('topic_title')):raise ValueError('缺少已確認頻道／話題名稱')
+            if not title or title==str(meta.get('folder_chat',current['chat'])) or (meta.get('folder_topic_id',meta.get('topic_id')) and not meta.get('folder_topic_title',meta.get('topic_title'))):raise ValueError('缺少已確認頻道／話題名稱')
             # Pure native projection; no archive_folder writes during planning.
             path=self.engine.archive.file(source['snapshot'],current)
             relative=str(path.relative_to(self.engine.archive.root))
-            binding=[meta.get('folder_chat',current['chat']),meta.get('topic_id')]
+            binding=[meta.get('folder_chat',current['chat']),meta.get('folder_topic_id',meta.get('topic_id'))]
             if path.parent in folders and folders[path.parent]!=binding:raise ValueError('選取項目命名資料夾身份衝突')
             folders[path.parent]=binding
             prior=self.store.get_meta('archive_folder:'+digest(str(path.parent.relative_to(self.engine.archive.root))),'')

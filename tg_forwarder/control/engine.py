@@ -110,11 +110,16 @@ class Archive:
                 meta=i['archive_meta']
                 title=meta.get('folder_title') or meta.get('title')
                 if not title:raise ValueError('Confirmed chat title required')
-                topic=meta.get('topic_title')
-                if meta.get('topic_id') and not topic:raise ValueError('Confirmed topic title required')
+                topic=meta.get('folder_topic_title',meta.get('topic_title'))
+                if meta.get('folder_topic_id',meta.get('topic_id')) and not topic:raise ValueError('Confirmed topic title required')
                 label=title+(' - '+topic if topic else '')
                 label=truncate_filename(validate_title(label))
-                return self.path(label,original_filename(i))
+                name=original_filename(i)
+                if meta.get('folder_collision') is True:
+                    suffix=' - '+digest([i['chat'],i['id'],i.get('media_id','')])[:16]
+                    base=Path(truncate_filename(name,230-len(suffix)))
+                    name=base.stem+suffix+base.suffix
+                return self.path(label,name)
             return self.path(original_filename(i))
         if i.get("archive_meta"):
             rel = original_relative(i,self.timezone)
@@ -411,7 +416,7 @@ class Engine:
         primary=await _io(self.archive.file,snapshot,selected)
         if self.archive.named:
             meta=selected['archive_meta']
-            binding=[meta.get('folder_chat',selected['chat']),meta.get('topic_id')]
+            binding=[meta.get('folder_chat',selected['chat']),meta.get('folder_topic_id',meta.get('topic_id'))]
             relative=primary.parent.relative_to(self.archive.root)
             name='archive_folder:'+digest(str(relative))
             prior=self.store.get_meta(name,'')
@@ -654,7 +659,7 @@ class Engine:
         path=await _io(validate)
         if explicit:
             meta=selected['archive_meta'];name='archive_folder:'+digest(str(path.parent.relative_to(self.archive.root)))
-            binding=[meta.get('folder_chat',selected['chat']),meta.get('topic_id')]
+            binding=[meta.get('folder_chat',selected['chat']),meta.get('folder_topic_id',meta.get('topic_id'))]
             prior=self.store.get_meta(name,'')
             if prior and json.loads(prior)!=binding:raise ValueError('Resubmission folder identity collision')
             self.store.meta(name,encode(binding))

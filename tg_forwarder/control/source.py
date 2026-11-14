@@ -61,6 +61,28 @@ class Resolver:
         if any(tid not in names for tid in unique):raise Unavailable('Confirmed topic title unavailable')
         for value,tid in zip(values,ids):value['archive_meta'].update(topic_id=tid,topic_title=names[tid])
 
+    def archive_group(self, snap, entity):
+        """Authoritative URL root owns naming only, never media source authority."""
+        if not self.named_folders:return
+        from tg_forwarder.canonical_media import filename
+        peer=utils.get_peer_id(entity);title=getattr(entity,'title',None)
+        if peer!=snap['peer'] or not title or title==str(peer) or not snap['main'] or any(i['chat']!=peer for i in snap['main']):
+            raise Unavailable('Confirmed main-source archive title unavailable')
+        root=snap['main'][0]['archive_meta']
+        group={'chat':peer,'title':title,'topic_id':root.get('topic_id'),'topic_title':root.get('topic_title')}
+        if group['topic_id'] and not group['topic_title']:raise Unavailable('Confirmed main-source topic title unavailable')
+        snap['archive_group']=group
+        names={}
+        for value in snap['main']+snap['discussion']:
+            meta=value['archive_meta']
+            meta.update(folder_chat=peer,folder_title=title,folder_topic_id=group['topic_id'],folder_topic_title=group['topic_title'])
+            meta.pop('folder_collision',None)
+            if value.get('kind'):names.setdefault(filename(value),[]).append(value)
+        for values in names.values():
+            identities={(v['chat'],v['id'],v.get('media_id','')) for v in values}
+            if len(identities)>1:
+                for value in values:value['archive_meta']['folder_collision']=True
+
     async def album(self, peer, seed):
         gid = getattr(seed, "grouped_id", None)
         if not gid:
@@ -136,6 +158,9 @@ class Resolver:
         snap["partial"], snap["warning"] = partial, "新留言超過增量掃描上限" if partial else ""
         snap["cursor"] = max(messages, default=cursor)
         snap["captured"] = datetime.now(timezone.utc).isoformat()
+        if self.named_folders:
+            main_entity=await self.call(self.client.get_entity,snap["peer"])
+            self.archive_group(snap,main_entity)
         return snap
 
     async def resolve(self, ref):
@@ -156,6 +181,7 @@ class Resolver:
                 "main": main, "discussion": [], "selected": [m for m in main if m["id"] == seed.id],
                 "selected_album": main, "partial": False, "warning": "", "thread": None,
                 "captured": datetime.now(timezone.utc).isoformat(), "cursor": 0}
+        self.archive_group(snap,entity)
         try:
             discussion = await self.call(self.client, functions.messages.GetDiscussionMessageRequest(entity, seed.id))
             # Find the linked-group forwarded root, NOT a channel copy.
@@ -203,6 +229,7 @@ class Resolver:
                 raise Unavailable("留言來源無法完整解析：" + type(exc).__name__) from exc
             # A genuinely disabled discussion is not an unavailable count of zero.
             snap["partial"], snap["warning"] = True, "討論串不可用／未完整：" + type(exc).__name__
+        self.archive_group(snap,entity)
         return snap
 
 

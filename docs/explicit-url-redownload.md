@@ -31,3 +31,28 @@ offline regression tests.
 This feature does not migrate existing files. Partial alignment.py,
 test_alignment.py and the unstaged alignment-plan checkpoint are separate,
 unreleased work, not part of this release or its completion evidence.
+
+## Main-source folder grouping (new downloads only)
+
+For a source URL, the resolver's authoritative main entity owns the archive
+folder: main-post media and its linked discussion/comment attachments use the
+same confirmed main-channel title (and main-source topic when applicable).
+A comment URL still resolves its main post first; the discussion group's title
+is not a fallback archive root. A standalone group URL keeps that group's own
+confirmed title/topic. Missing main title/topic authority fails closed rather
+than guessing a folder. Incremental comment snapshots revalidate main authority.
+
+Grouping changes naming metadata only. Each attachment retains its actual source
+chat/message/media identity, access hash, protection flag, source topic and
+original filename metadata. A separate folder-topic binding prevents a discussion
+forum topic from splitting the main-source archive. Identical projected original
+filenames from distinct source identities receive deterministic identity suffixes
+in the same folder. Existing native occupied-name disambiguation and no-clobber
+publication remain in force; an occupied second candidate fails closed.
+
+Existing completed files/cache rows are neither moved nor re-downloaded. An
+explicit resubmission with all files present keeps those historical locations.
+If files are safely missing, the previously documented download-only round uses
+the newly resolved common main-source root. No migration or operator repair is
+triggered automatically. Paths shown by location controls remain actual verified
+cache paths, not an invented new location for historical files.
