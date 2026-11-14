@@ -94,6 +94,8 @@ class Store:
         key = digest([owner, chat, sorted((i["chat"], i["id"], i.get("media_id", "")) for i in payload["items"]), payload["action"], payload.get("target")])
         if payload["action"] == "cached_photos":
             key = digest(["cached-photos-v1",payload["origin_task"],key])
+        if payload.get('missing_repair'):
+            repair=payload['missing_repair'];key=digest(['missing-files-repair-v1',repair['origin'],repair['previous'],key])
         return key
 
     def insert_task(self, owner, chat, reply, payload):

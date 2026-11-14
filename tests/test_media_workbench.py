@@ -1329,7 +1329,7 @@ class ControlSharedBridgeTests(Base):
             self.assertEqual(os.environ['MEDIA_SHARED_ENABLED'],'true')
             return self.bridge
         engine=NS(worker=AsyncMock())
-        controller=NS(watch_loop=AsyncMock(),preview_loop=AsyncMock(),refresh_inbound_templates=lambda:None)
+        controller=NS(watch_loop=AsyncMock(),preview_loop=AsyncMock(),refresh_inbound_templates=lambda:None,refresh_task_location_cards=AsyncMock())
         with patch.dict(os.environ,{'CONTROL_ENV_FILE':str(secret)},clear=True), \
              patch.object(runtime.Config,'from_env',return_value=self.config), \
              patch.object(runtime,'client_from_env',return_value=client), \

@@ -179,6 +179,7 @@ class Engine:
         if bridge is not None and (not isinstance(bot_id, int) or bot_id <= 0):
             raise ValueError("Shared control delivery requires verified bot identity")
         self.last_notice = {}
+        self.download_outcomes = {}
         # Different concurrent tasks can reference the same disk identity.
         self.download_lock = asyncio.Lock()
         self.send_lock = asyncio.Lock()
@@ -548,7 +549,40 @@ class Engine:
                 return await self.alias_file(identity,selected,key,used)
         return None
 
+    async def repair_destination(self,task,payload,selected,require_existing=False):
+        repair=payload.get('missing_repair')
+        if not repair:return None
+        from .inbound import OWNER
+        if task['owner']!=OWNER or task['chat']!=OWNER:raise PermissionError('Missing repair owner private chat required')
+        original=self.store.task(repair['origin'],task['owner'],task['chat'])
+        source=json.loads(original['payload'])
+        if original['state']!='done' or digest(original['payload'])!=repair['revision'] or source.get('source_kind')=='bot-inbound' or source.get('missing_repair') or payload['action']!='download' or payload.get('target') is not None or selected not in source['items'] or payload['snapshot']!=source['snapshot']:raise PermissionError('Missing repair original/task binding mismatch')
+        key=digest([selected['chat'],selected['id'],selected.get('media_id','')])
+        matches=[entry for entry in repair['entries'] if entry['key']==key]
+        if len(matches)!=1:raise ValueError('Missing repair selection binding mismatch')
+        entry=matches[0];cached=self.store.db.execute('SELECT * FROM cache WHERE key=?',(key,)).fetchone()
+        if cached is None or cached['path']!=str(self.archive.root/entry['relative']) or cached['size']!=entry['size'] or entry['size']<=0 or (selected.get('size') is not None and selected['size']!=entry['size']):raise ValueError('Missing repair cache binding changed')
+        record=json.loads(self.store.get_meta('repair-publication:'+task['id']+':'+key,'null'))
+        def validate():
+            path=self.archive.path(*Path(entry['relative']).parts)
+            try:path.lstat()
+            except FileNotFoundError:
+                if require_existing:raise ValueError('Verified repair publication is missing') from None
+                return path
+            from tg_forwarder.canonical_media import fingerprint
+            binding={'task':task['id'],'origin':repair['origin'],'revision':repair['revision'],'key':key,'path':str(path),'size':entry['size']}
+            if not record or record.get('binding')!=binding:
+                raise ValueError('Originally missing repair path is now occupied; no verified own publication')
+            self._cached_path(dict(cached),selected,0)
+            info=path.lstat()
+            if [info.st_dev,info.st_ino]!=record.get('identity'):raise ValueError('Repair publication inode changed')
+            if fingerprint(path)!=record.get('proof'):
+                raise ValueError('Repair publication bytes changed; no source fallback')
+            return path
+        return await _io(validate)
+
     async def download(self, task, payload, i, used):
+        self.download_outcomes[task['id']]='reused'
         inbound = i.get("source_kind") == "bot-inbound"
         if inbound:
             from .inbound import OWNER
@@ -562,6 +596,17 @@ class Engine:
                 validate_video(i,self.bot_id)
         key = digest([i["chat"], i["id"], i.get("media_id", "")])
         async with self.download_lock:
+            # Missing-repair authority must be checked AFTER acquiring the lock.
+            # Repairs never enter ordinary size-only cache/alias/shared adoption.
+            repair_path=await self.repair_destination(task,payload,i)
+            if repair_path is not None and await _io(repair_path.exists):
+                await self.repair_destination(task,payload,i,require_existing=True)
+                size=next(entry['size'] for entry in payload['missing_repair']['entries'] if entry['key']==key)
+                if used+size>self.config.max_bytes:raise ValueError("媒體大小超過上限")
+                self.check(task)
+                await self.publish(i,repair_path)
+                await self.repair_destination(task,payload,i,require_existing=True)
+                return repair_path,size
             identity=self.photo_alias_identity(task,payload,i) if inbound else None
             stale_alias=None
             observed_alias=self.store.get_meta('flat_photo_alias:'+digest(identity),'') if identity is not None else None
@@ -576,7 +621,7 @@ class Engine:
                         await self.publish(i,path)
                         return path,size
                 cached = self.store.db.execute("SELECT * FROM cache WHERE key=?", (key,)).fetchone()
-                if cached:
+                if cached and repair_path is None:
                     def lookup():
                         path=Path(cached["path"])
                         try:path=self.archive.path(*path.relative_to(self.archive.root).parts)
@@ -602,7 +647,7 @@ class Engine:
                 stale_alias=observed_alias
             self.check(task)
             # Original downloader skips a valid finalized destination before downloading.
-            if i.get("archive_meta") and not self.archive.flat:
+            if i.get("archive_meta") and not self.archive.flat and repair_path is None:
                 candidate = await _io(self.archive.file,payload["snapshot"],i)
                 def existing():
                     if not candidate.exists():return None
@@ -619,11 +664,12 @@ class Engine:
                     self.store.db.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)",(key,str(path),size))
                     await self.publish(i,path)
                     return path,size
-            if self.bridge is not None and not inbound and (not self.archive.flat or i.get("archive_meta")):
+            if self.bridge is not None and not inbound and repair_path is None and (not self.archive.flat or i.get("archive_meta")):
                 imported = await self.import_shared(task, payload, i, key, used)
                 if imported is not None:
                     return imported
             await self.gate.wait()
+            self.download_outcomes[task['id']]='fresh'
             if inbound:
                 current = i
                 msg = await self.inbound_media(task, i, used)
@@ -644,7 +690,8 @@ class Engine:
                 entity = await self.client.get_entity(self.peer(i))
                 metadata = {**current["archive_meta"],"title":getattr(entity,"title",None) or str(i["chat"])}
                 naming = {**i,"archive_meta":metadata}
-            if self.archive.flat:
+            if repair_path is not None:path=repair_path
+            elif self.archive.flat:
                 path = await self.flat_destination(payload['snapshot'],naming,key)
             else:
                 path = await _io(self.archive.file,payload["snapshot"], naming)
@@ -682,18 +729,35 @@ class Engine:
                     raise ValueError("媒體大小超過上限")
                 self.check(task)
                 await _io(self.archive.space)
+                repair_proof=None
+                if repair_path is not None:
+                    from tg_forwarder.canonical_media import fingerprint
+                    repair_proof=await _io(fingerprint,temp)
                 # link() is atomic no-clobber; then remove ONLY this task-owned tempfile.
                 await _io(self.finalize,temp,path,owned_identity)
                 if inbound and i['kind']=='video':await self.commit_video_cache(key,path,size,i)
                 else:await self.remember_photo(key,path,size,identity,stale_alias=stale_alias)
+                if repair_path is not None:
+                    from tg_forwarder.canonical_media import fingerprint
+                    repair=payload['missing_repair']
+                    binding={'task':task['id'],'origin':repair['origin'],'revision':repair['revision'],'key':key,'path':str(path),'size':size}
+                    def verify_publication():
+                        info=path.lstat()
+                        if (info.st_dev,info.st_ino)!=owned_identity or fingerprint(path)!=repair_proof:
+                            raise ValueError('Repair publication changed before receipt')
+                    await _io(verify_publication)
+                    self.store.meta('repair-publication:'+task['id']+':'+key,encode({'binding':binding,'proof':repair_proof,'identity':list(owned_identity)}))
                 await self.publish(i, path)
-                return path, size
             finally:
                 def cleanup():
                     try:current=os.lstat(temp)
                     except FileNotFoundError:return
                     if stat.S_ISREG(current.st_mode) and (current.st_dev,current.st_ino)==owned_identity:os.unlink(temp)
                 await _io(cleanup)
+            # Publication and cleanup can both yield. Revalidate the exact receipt
+            # afterwards so replacement/removal during either await cannot count DONE.
+            if repair_path is not None:await self.repair_destination(task,payload,i,require_existing=True)
+            return path,size
 
     async def inbound_media(self, task, selected, used):
         """PTB reads directly into the existing task-owned tempfile lifecycle."""
@@ -889,6 +953,8 @@ class Engine:
     async def execute(self, task):
         payload = json.loads(task["payload"])
         inbound = payload.get("source_kind") == "bot-inbound"
+        run={'attempt':task['attempt'],'fresh':0,'reused':0}
+        self.store.meta('task-last-run:'+task['id'],encode(run))
         manifest = {"task": task["id"], "snapshot": payload["snapshot"], "action": payload["action"],
                     "target": payload.get("target"), "selection": payload["items"], "items": [], "state": "running"}
         try:
@@ -912,6 +978,9 @@ class Engine:
                         path,size = await self.cached_file_async(i,used)
                     else:
                         path, size = await self.download(task, payload, i, used)
+                    outcome='reused' if payload['action']=='cached_photos' else self.download_outcomes.get(task['id'],'fresh')
+                    run[outcome]+=1
+                    self.store.meta('task-last-run:'+task['id'],encode(run))
                     used += size
                     files.append(path)
                     entry={**i,"path":str(path.relative_to(self.archive.root)),"download":"done","bytes":size}
@@ -930,7 +999,14 @@ class Engine:
                             entry["forward"] = "done"
                             entry["destination_ids"] = ids
                 await _io(self.archive.manifest,payload["snapshot"], task["id"], manifest)
-            self.store.set_task(task["id"], state="done", error="")
+            if payload.get('missing_repair'):
+                # Manifest/progress notices may yield after download() returns.
+                async with self.download_lock:
+                    for selected in payload['items']:
+                        await self.repair_destination(task,payload,selected,require_existing=True)
+                    self.check(task)
+                    self.store.set_task(task["id"], state="done", error="")
+            else:self.store.set_task(task["id"], state="done", error="")
         except asyncio.CancelledError:
             raise
         except Cancelled as exc:

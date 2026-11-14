@@ -162,6 +162,7 @@ async def run(inspect_url=None, health=False):
                 engine = Engine(config, store, client, gate, delivery=BotDelivery(bot, positive(os.getenv("CONTROL_BOT_UPLOAD_MAX_BYTES", str(49*1024*1024)))), bridge=bridge, bot_id=bot_id)
                 controller = Controller(config, store, resolver, engine, bot)
                 controller.refresh_inbound_templates()
+                await controller.refresh_task_location_cards()
                 async def notify(task):
                     if json.loads(task['payload']).get('inbound_notice') or json.loads(task['payload']).get('origin_notice'):
                         await controller.notify_task(task)

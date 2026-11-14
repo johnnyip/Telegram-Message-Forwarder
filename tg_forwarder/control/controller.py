@@ -1,6 +1,7 @@
 """Actual Bot API update handlers: auth is checked before parsing ANY input."""
 import asyncio
 import json
+from pathlib import Path
 from tg_forwarder.shared_media import _io
 import logging
 import time
@@ -281,6 +282,8 @@ class Controller:
                 pass
             else:
                 buttons.append(self.button("📤 傳送已下載圖片到此對話（"+str(len(payload["items"]))+"）",owner,chat,reply,{**base,"do":"cached_photos"}))
+        if self.location_allowed(owner,chat) and json.loads(task['payload']).get('action') in ('download','both') and (task['progress'] or task['state']=='done'):
+            buttons.append(self.button('📂 下載位置',owner,chat,reply,{**base,'do':'locations','revision':digest(task['payload']),'bot':self.engine.bot_id,'page':0}))
         return buttons
 
     async def notify_task(self, task):
@@ -425,6 +428,152 @@ class Controller:
             self.store.db.execute("UPDATE inbound_notices SET state='pending',generation=generation+1 WHERE key IN (SELECT key FROM inbound_notices WHERE owner=? AND chat=? AND bot=? AND reply>0 AND state NOT IN ('sending','ambiguous','failed') ORDER BY rowid DESC LIMIT 2)",(OWNER,OWNER,self.engine.bot_id))
             self.store.meta(marker,'album-actions-video-v3')
 
+    def location_allowed(self,owner,chat):
+        from .inbound import OWNER
+        bot=self.engine.bot_id
+        return (owner==OWNER and chat==owner and owner in self.config.allowed and type(bot) is int and bot>0
+            and self.store.get_meta('bot_principal','') in ('',str(bot)))
+
+    async def location_inventory(self,task):
+        payload=json.loads(task['payload'])
+        cache=[]
+        for item in payload['items']:
+            key=digest([item['chat'],item['id'],item.get('media_id','')])
+            row=self.store.db.execute('SELECT * FROM cache WHERE key=?',(key,)).fetchone()
+            cache.append((item,dict(row) if row else None))
+        def inspect():
+            values=[]
+            for item,row in cache:
+                relative=None;status='未有快取路徑'
+                if row:
+                    try:
+                        relative=Path(row['path']).relative_to(self.engine.archive.root)
+                        path=self.engine.archive.path(*relative.parts)
+                        try:path.lstat()
+                        except FileNotFoundError:status='檔案遺失'
+                        else:
+                            try:self.engine._cached_path(row,item,0)
+                            except (ValueError,OSError):status='不安全／大小不符'
+                            else:status='可用'
+                    except (ValueError,OSError):relative=None;status='不安全路徑'
+                values.append((item['kind'],str(relative) if relative is not None else None,status))
+            return values
+        return await _io(inspect)  # metadata/stat ONLY, no content/source calls.
+
+    async def render_locations(self,owner,chat,reply,task,data):
+        if not self.location_allowed(owner,chat) or data.get('bot')!=self.engine.bot_id:raise PermissionError('下載位置的擁有人／Bot 不符')
+        task=self.store.task(task['id'],owner,chat)
+        payload=json.loads(task['payload'])
+        if data.get('revision')!=digest(task['payload']) or payload.get('action') not in ('download','both'):raise ValueError('任務內容已更新，請重新開啟下載位置')
+        page=data.get('page',0)
+        if type(page) is not int or page<0:raise ValueError('Invalid location page')
+        values=await self.location_inventory(task)
+        per_page=10;pages=max(1,(len(values)+per_page-1)//per_page)
+        if page>=pages:raise ValueError('Invalid location page')
+        clean=lambda value:''.join(c if c.isprintable() else '�' for c in str(value))
+        available=sum(v[2]=='可用' for v in values);missing=sum(v[2]=='檔案遺失' for v in values)
+        text='📂 下載位置 · '+task['id']+'\n'+self.media_counts(payload['items'])+'；可用 '+str(available)+'/'+str(len(values))+'；檔案遺失 '+str(missing)+'；其餘未確認 '+str(len(values)-available-missing)
+        if task['state']=='done':text+='\n歷史任務已完成；以上是目前檔案檢查，並非本次重新下載。'
+        text+='\n程式／Docker 內根目錄：'+clean(self.engine.archive.root)[:180]+'\n以下為相對下載路徑（不代表 NAS 主機掛載點）：'
+        groups={}
+        for _,relative,status in values:
+            if relative is not None:
+                parent=str(Path(relative).parent);counts=groups.setdefault(parent,[0,0]);counts[0]+=1;counts[1]+=status=='可用'
+        for folder,counts in list(sorted(groups.items()))[:6]:text+='\n📁 '+clean(folder)[:150]+'：'+str(counts[1])+'/'+str(counts[0])+' 可用'
+        if len(groups)>6:text+='\n另有 '+str(len(groups)-6)+' 個資料夾（見檔案分頁）'
+        text+='\n\n第 '+str(page+1)+'/'+str(pages)+' 頁'
+        for index,(kind,relative,status) in enumerate(values[page*per_page:(page+1)*per_page],page*per_page+1):
+            text+='\n'+str(index)+'. '+('相片' if kind=='photo' else '影片' if kind=='video' else kind)+' ['+status+'] '+clean(relative if relative is not None else '未顯示未驗證路徑')[:180]
+        base={'kind':'task','task':task['id'],'do':'locations','revision':data['revision'],'bot':data['bot']}
+        nav=[]
+        if page:nav.append(self.button('← 上頁',owner,chat,reply,{**base,'page':page-1}))
+        if page+1<pages:nav.append(self.button('下頁 →',owner,chat,reply,{**base,'page':page+1}))
+        repair=[]
+        if missing and payload.get('source_kind')!='bot-inbound' and task['state']=='done' and not payload.get('missing_repair'):
+            repair=[[self.button('🔄 補下載遺失項目（'+str(missing)+'）',owner,chat,reply,{**base,'do':'missing_repair','inventory':digest(values),'head':self.store.get_meta('missing-repair-head:'+task['id'],'')})]]
+        rows=([nav] if nav else [])+repair+[[self.button('← 任務詳情',owner,chat,reply,{'kind':'task','task':task['id'],'do':'details'})]]
+        await self.bot.edit_message_text(chat_id=chat,message_id=reply,text=text.encode('utf-16-le')[:7800].decode('utf-16-le',errors='ignore'),parse_mode=None,reply_markup=Markup(rows))
+
+    async def repair_missing(self,owner,chat,reply,task,data):
+        if not self.location_allowed(owner,chat) or data.get('bot')!=self.engine.bot_id:raise PermissionError('Repair principal mismatch')
+        task=self.store.task(task['id'],owner,chat);original=json.loads(task['payload'])
+        if task['state']!='done' or original.get('source_kind')=='bot-inbound' or original.get('missing_repair') or original['action'] not in ('download','both') or data.get('revision')!=digest(task['payload']):raise ValueError('Only an exact historical source download may repair missing files')
+        headkey='missing-repair-head:'+task['id'];head=self.store.get_meta(headkey,'')
+        if data.get('head')!=head:raise ValueError('已有較新的補下載任務，請更新詳情；不會重複建立')
+        if head:
+            previous=self.store.task(head,owner,chat)
+            if previous['state']!='done':
+                await self.render_task(owner,chat,reply,previous)
+                return  # Active/failed/cancelled/ambiguous uses native existing controls, never reset.
+        values=await self.location_inventory(task)
+        if data.get('inventory')!=digest(values):raise ValueError('檔案狀態已變更，請更新下載位置再確認補下載')
+        selected=[item for item,value in zip(original['items'],values) if value[2]=='檔案遺失' and value[1] is not None]
+        if not selected:raise ValueError('目前沒有已驗證遺失檔案；不會覆寫現有／不安全檔案')
+        entries=[]
+        for item,value in zip(original['items'],values):
+            if value[2]!='檔案遺失' or value[1] is None:continue
+            key=digest([item['chat'],item['id'],item.get('media_id','')])
+            cached=self.store.db.execute('SELECT * FROM cache WHERE key=?',(key,)).fetchone()
+            if cached is None or cached['path']!=str(self.engine.archive.root/Path(value[1])) or cached['size']<=0 or (item.get('size') is not None and cached['size']!=item['size']):raise ValueError('Missing-file cache binding changed')
+            entries.append({'key':key,'relative':value[1],'size':cached['size']})
+        payload={'action':'download','target':None,'snapshot':original['snapshot'],'items':selected,
+            'missing_repair':{'origin':task['id'],'revision':data['revision'],'previous':head,'entries':entries}}
+        await _io(self.engine.validate,payload)
+        with self.store.transaction():
+            if self.store.get_meta(headkey,'')!=head:raise ValueError('Repair changed concurrently')
+            repair=self.store.insert_task(owner,chat,reply,payload)
+            self.store.meta(headkey,repair['id'])
+        await self.render_task(owner,chat,reply,repair)
+
+    async def refresh_task_location_cards(self):
+        from .inbound import OWNER
+        if not self.location_allowed(OWNER,OWNER):return
+        marker='task-location-ui:'+str(self.engine.bot_id)+':'+str(OWNER)+':v2:'
+        rows=self.store.db.execute("SELECT * FROM tasks WHERE owner=? AND chat=? AND reply>0 AND state IN ('done','failed','cancelled') ORDER BY rowid DESC LIMIT 32",(OWNER,OWNER)).fetchall()
+        blocked={r[0] for r in self.store.db.execute("SELECT DISTINCT reply FROM tasks WHERE owner=? AND chat=? AND reply>0 AND state IN ('ambiguous','queued','running','delayed')",(OWNER,OWNER))}
+        candidates={}
+        def eligible(task):
+            payload=json.loads(task['payload'])
+            return payload.get('action') in ('download','both') and not payload.get('inbound_notice') and not payload.get('origin_notice')
+        for task in rows:
+            if eligible(task):candidates.setdefault(task['reply'],task)
+        # Persisted native capabilities also identify deduplicated submission cards.
+        # Legacy navigation predates revision fields; permit it only under the retained
+        # verified principal. Explicit bot/revision fields must always match exactly.
+        principal=self.store.get_meta('bot_principal','')==str(self.engine.bot_id)
+        caps=self.store.db.execute("SELECT * FROM callbacks WHERE owner=? AND chat=? AND reply>0 ORDER BY rowid DESC LIMIT 256",(OWNER,OWNER)).fetchall()
+        for cap in caps:
+            try:
+                data=json.loads(cap['payload'])
+                if data.get('kind')!='task' or data.get('do') not in ('details','locations','cancel','retry','resume','cached_photos','missing_repair'):continue
+                task=self.store.task(data['task'],OWNER,OWNER)
+                if task['state'] not in ('done','failed','cancelled') or not eligible(task):continue
+                if data.get('bot',self.engine.bot_id)!=self.engine.bot_id or data.get('revision',digest(task['payload']))!=digest(task['payload']):continue
+                if ('bot' not in data or 'revision' not in data) and not principal:continue
+                candidates.setdefault(cap['reply'],task)
+            except (KeyError,ValueError,PermissionError,TypeError):continue
+        for reply,task in list(candidates.items())[:32]:
+            if reply in blocked:continue
+            # A capability for an active operation must also protect its anchor.
+            conflict=False
+            for cap in caps:
+                if cap['reply']!=reply:continue
+                try:
+                    data=json.loads(cap['payload'])
+                    other=self.store.task(data['task'],OWNER,OWNER) if data.get('kind')=='task' and data.get('task') else None
+                    if other and other['state'] in ('ambiguous','queued','running','delayed'):conflict=True;break
+                except (KeyError,ValueError,PermissionError,TypeError):continue
+            if conflict:continue
+            stamp=digest([task['id'],task['payload'],task['state'],task['progress']])
+            cardmarker=marker+str(reply)
+            if self.store.get_meta(cardmarker,'')==stamp:continue
+            try:await self.render_task(OWNER,OWNER,reply,task)
+            except RetryAfter as exc:
+                seconds=exc.retry_after.total_seconds() if hasattr(exc.retry_after,'total_seconds') else exc.retry_after
+                self.engine.gate.delay(float(seconds));return
+            except Exception:continue  # Failed cards remain retryable; never send replacements.
+            self.store.meta(cardmarker,stamp)
+
     async def render_task(self, owner, chat, reply, task):
         # Re-read by owner/chat; notification payloads and stale buttons are not authority.
         task = self.store.task(task["id"], owner, chat)
@@ -434,7 +583,16 @@ class Controller:
             reply = sent.message_id
         action = {"download": "下載", "forward": "轉發", "both": "下載＋轉發", "cached_photos": "傳送已下載圖片（不重新下載）"}[p["action"]]
         text = "任務 "+task["id"]+"："+task["state"]+"\n"+action+"；"+self.media_counts(p["items"])
-        text += "\n已完成 "+str(completed)+"/"+str(total)+"；已下載 "+str(downloaded)+"/"+str(total)
+        if task['state']=='done' and p['action'] in ('download','both'):
+            text+='\n歷史已完成 '+str(completed)+'/'+str(total)+'；不代表目前檔案仍存在或本次有重新下載。'
+            if self.location_allowed(owner,chat):
+                inventory=await self.location_inventory(task)
+                text+='\n目前可用 '+str(sum(v[2]=='可用' for v in inventory))+'/'+str(total)+'；遺失 '+str(sum(v[2]=='檔案遺失' for v in inventory))+'（📂 下載位置查看／補下載）'
+        else:text += "\n已完成 "+str(completed)+"/"+str(total)+"；已下載 "+str(downloaded)+"/"+str(total)
+        if p.get('missing_repair'):text+='\n補下載遺失項目；原歷史任務 '+p['missing_repair']['origin']+' 保留；不會重新轉發。'
+        stats=json.loads(self.store.get_meta('task-last-run:'+task['id'],'null'))
+        if stats:text+='\n最近一次執行（attempt '+str(stats['attempt'])+'）：新下載 '+str(stats['fresh'])+'；重用／略過 '+str(stats['reused'])
+        elif task['state']=='done':text+='\n沒有本次重新下載紀錄；並非新下載成功。'
         if task["state"] in ("done", "failed", "cancelled", "ambiguous"):
             text += "\n失敗／未完成餘下 "+str(total-completed)+" 項"
         text += "\n嘗試 "+str(task["attempt"])
@@ -483,9 +641,15 @@ class Controller:
         if data.get("do") == "list":
             await self.render_tasks(owner, chat, reply)
             return
-        if data.get("do") not in ("details", "cancel", "retry", "resume", "cached_photos"):
+        if data.get("do") not in ("details", "cancel", "retry", "resume", "cached_photos", "locations", "missing_repair"):
             raise ValueError("不支援任務動作")
         task = self.store.task(data.get("task"), owner, chat)
+        if data['do']=='missing_repair':
+            await self.repair_missing(owner,chat,reply,task,data)
+            return
+        if data['do']=='locations':
+            await self.render_locations(owner,chat,reply,task,data)
+            return
         if data["do"] == "cached_photos":
             payload = self.engine.cached_photo_payload(task)
             cached = self.store.create_task(owner,chat,reply,payload)
