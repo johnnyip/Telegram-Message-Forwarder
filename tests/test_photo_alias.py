@@ -100,11 +100,11 @@ class PhotoAliasTests(unittest.IsolatedAsyncioTestCase):
             row=await self.receive(80002)
         self.assertNotEqual(row['state'],'done');self.assertEqual(self.bot.get_file.await_count,1)
 
-    async def test_missing_indexed_alias_cache_binding_never_downloads_fallback(self):
+    async def test_missing_indexed_alias_reference_allows_current_fresh_download(self):
         _,_,item,_=await self.first()
         self.store.db.execute('DELETE FROM cache')
         row=await self.receive(80002)
-        self.assertNotEqual(row['state'],'done');self.assertEqual(self.bot.get_file.await_count,1)
+        self.assertEqual(row['state'],'done',row['error']);self.assertEqual(self.bot.get_file.await_count,2)
 
     async def test_bounded_old_task_bootstrap_reuses_existing_known_file_no_rpc(self):
         old,payload,_,path=await self.first()
@@ -115,11 +115,12 @@ class PhotoAliasTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row['state'],'done',row['error']);self.assertEqual(self.bot.get_file.await_count,1)
         self.assertEqual({r[0] for r in self.store.db.execute('SELECT path FROM cache')},{str(path)})
 
-    async def test_named_requests_hold_old_root_file_for_verified_migration_no_duplicate(self):
+    async def test_named_fresh_request_downloads_current_copy_without_moving_old_root_file(self):
         _,_,_,path=await self.first();self.engine.archive.named=True
         row=await self.receive(80002)
-        self.assertNotEqual(row['state'],'done');self.assertEqual(self.bot.get_file.await_count,1)
+        self.assertEqual(row['state'],'done',row['error']);self.assertEqual(self.bot.get_file.await_count,2)
         self.assertEqual(path.read_bytes(),b'data');self.assertEqual(len(list(self.config.root.glob('*.jpg'))),1)
+        self.assertEqual(len(list((self.config.root/'owner').glob('*.jpg'))),1)
 
     async def test_different_named_source_classification_does_not_alias_across_folders(self):
         self.engine.archive.named=True
@@ -129,6 +130,48 @@ class PhotoAliasTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row['state'],'done',row['error']);self.assertEqual(self.bot.get_file.await_count,2)
         parents={Path(r[0]).parent.name for r in self.store.db.execute('SELECT path FROM cache')}
         self.assertEqual(parents,{'owner','Other channel'})
+
+    async def test_missing_old_file_fresh_copy_rebinds_alias_preserves_old_cache_then_reuses(self):
+        _,_,old,path=await self.first()
+        oldkey=digest([old['chat'],old['id'],old['media_id']])
+        before=tuple(self.store.db.execute('SELECT * FROM cache WHERE key=?',(oldkey,)).fetchone())
+        path.unlink()
+        row=await self.receive(80002);self.assertEqual(row['state'],'done',row['error'])
+        self.assertEqual(self.bot.get_file.await_count,2)
+        self.assertEqual(tuple(self.store.db.execute('SELECT * FROM cache WHERE key=?',(oldkey,)).fetchone()),before)
+        row=await self.receive(80003);self.assertEqual(row['state'],'done',row['error'])
+        self.assertEqual(self.bot.get_file.await_count,2)
+        paths=[r[0] for r in self.store.db.execute('SELECT path FROM cache WHERE key!=?',(oldkey,))]
+        self.assertEqual(len(set(paths)),1);self.assertFalse(path.exists())
+        with self.assertRaises(ValueError):await self.engine.cached_file_async(old)
+        self.assertEqual(self.bot.get_file.await_count,2)
+
+    async def test_stale_alias_cas_refuses_concurrent_change_and_rolls_back_new_message(self):
+        row,payload,item,path=await self.first()
+        identity=self.engine.photo_alias_identity(row,payload,item)
+        name='flat_photo_alias:'+digest(identity);observed=self.store.get_meta(name)
+        changed=json.loads(observed);changed['proof']['sha256']='concurrent-change'
+        self.store.meta(name,json.dumps(changed))
+        with self.assertRaisesRegex(ValueError,'changed concurrently'):
+            self.engine.commit_photo_cache('new-message',path,4,identity,json.loads(observed),stale_alias=observed)
+        self.assertIsNone(self.store.db.execute("SELECT * FROM cache WHERE key='new-message'").fetchone())
+        self.assertEqual(json.loads(self.store.get_meta(name)),changed)
+
+    async def test_missing_bootstrap_candidate_fetches_only_current_photo(self):
+        _,_,old,path=await self.first()
+        self.store.db.execute("DELETE FROM meta WHERE key LIKE 'flat_photo_alias:%'")
+        path.unlink();row=await self.receive(80002)
+        self.assertEqual(row['state'],'done',row['error']);self.assertEqual(self.bot.get_file.await_count,2)
+        self.assert_no_source()
+
+    async def test_same_size_corrupt_root_flat_proof_blocks_named_fresh_download(self):
+        _,_,_,path=await self.first();path.write_bytes(b'evil')
+        self.engine.archive.named=True
+        row=await self.receive(80002)
+        self.assertEqual(row['state'],'failed');self.assertEqual(self.bot.get_file.await_count,1)
+        self.assertEqual(path.read_bytes(),b'evil')
+        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM cache').fetchone()[0],1)
+        self.assertFalse((self.config.root/'owner').exists())
 
     async def test_cache_and_alias_commit_are_atomic_on_binding_conflict(self):
         row,payload,item,path=await self.first()

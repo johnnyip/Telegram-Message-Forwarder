@@ -303,7 +303,9 @@ class Controller:
             errors=sum(t['state'] in ('failed','ambiguous','cancelled') for t in tasks)
             text='收到相簿' if json.loads(tasks[0]['payload'])['items'][0].get('album') else '收到相片'
             text+='：'+str(len(tasks))+' 相；已完成 '+str(done)+'/'+str(len(tasks))+'；錯誤／取消 '+str(errors)
-            text+='\n'+('下載完成' if done==len(tasks) else '下載處理中／可在任務詳情查看')
+            terminal=done+errors==len(tasks)
+            outcome='下載完成' if done==len(tasks) else ('部分完成' if done else '下載失敗') if terminal else '下載處理中／可在任務詳情查看'
+            text+='\n'+outcome
             reply=row['reply']
             try:
                 if not reply:
@@ -381,7 +383,7 @@ class Controller:
         elif action in ("retry", "resume"):
             if task["state"] not in ("failed", "cancelled"):
                 raise ValueError("只可重試 failed／cancelled；ambiguous 必須先人工核對，禁止盲目重送")
-            self.store.set_task(tid, state="queued", due=0, attempt=0, error="")
+            self.store.retry(tid,owner,chat)
         return self.store.task(tid, owner, chat)
 
     async def task_callback(self, owner, chat, reply, data):

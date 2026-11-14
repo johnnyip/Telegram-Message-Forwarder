@@ -176,3 +176,46 @@ never blindly sent again. A known anchor can be edited after restart without ano
 send. Cancellation/shutdown leaves durable membership/state for recovery. Existing
 DONE tasks/old status messages are not re-enqueued or deleted retroactively. Progress
 notification failure cannot cause a media re-download/send.
+
+
+## Fresh received download versus cached resend
+
+A current authenticated incoming photo is explicit permission to download that current
+Bot copy; historical missing files or old-layout records do not require trash restore
+or an original-post link. Only typed missing-file/reference or old-layout reuse failures
+permit this path. Corrupt/truncated, symlink, foreign/group-writable, wrong namespace or
+identity-binding failures still reject BEFORE get_file. Cached-send/forward guards and
+zero-source-fetch behavior are unchanged. No MTProto lookup is introduced.
+
+All-terminal album statuses now say download failed / partially complete as appropriate;
+queued/delayed retry tasks say processing. The existing single status anchor is reused.
+
+### Retry exactly existing FAILED incoming tasks (operator, quiescent)
+
+The existing recover_inbound CLI now accepts --retry-failed; no new bot/poller/API:
+
+    python -m tg_forwarder.control.recover_inbound --plan <private-plan.json> --retry-failed
+    python -m tg_forwarder.control.recover_inbound --plan <private-plan.json> --retry-failed --apply --quiescent
+
+The plan remains version=1 with owner_uid, bot_id, exact configured db and 1..32 updates.
+Each retry entry MUST contain exactly:
+
+    {"update_id":123,"payload_sha256":"<SHA256 of retained updates.payload>",
+     "task_id":"<existing failed task ID>",
+     "task_payload_sha256":"<SHA256 of exact tasks.payload>","expected_attempt":1}
+
+The example placeholders are NOT a deployable plan. Use exact observed private rows.
+The CLI requires a process-owned regular plan file with no group/other access; apply
+requires the configured bot-token principal, exact state DB, quiescence and the SAME
+nonblocking state flock as runtime. It verifies the DONE retained update hash, decoded
+authorized inbound payload, owner/chat/bot, exact task key and payload hash, FAILED
+state/attempt, plus persisted album membership. ALL rows validate before a single
+transaction invokes Store.retry. Existing task IDs, payloads, progress, received updates,
+offset, files, receipts and album reply anchor remain unchanged. Only native failed-task
+retry state/due/error fields reset; cumulative attempt is preserved, so the worker
+claim advances attempt 1 to 2. The identical expected-attempt-1 plan also refuses
+a later FAILED attempt 2, not merely queued/running replay. DONE, ambiguous, active, wrong-owner/bot or
+changed rows refuse; replaying a plan cannot reset queued/running work. Apply does not
+send messages or execute downloads: restart the same service to process the same tasks
+and edit their existing album anchor. This is NOT restoration/re-enqueue of old DONE
+photos, and no production retry was performed by source tests.

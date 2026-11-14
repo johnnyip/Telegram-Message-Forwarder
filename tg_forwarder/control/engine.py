@@ -27,6 +27,18 @@ class Ambiguous(RuntimeError):
     pass
 
 
+class PhotoReuseUnavailable(ValueError):
+    """Only a NEW authenticated inbound download may fetch its current Bot copy."""
+
+
+class PhotoReuseMissing(PhotoReuseUnavailable):
+    pass
+
+
+class PhotoReuseLegacyLayout(PhotoReuseUnavailable):
+    pass
+
+
 class RateGate:
     """Persisted local delay plus optional fail-closed Redis account admission gate."""
     def __init__(self, store, bridge=None):
@@ -355,6 +367,16 @@ class Engine:
             namespace=['named',meta.get('folder_chat',selected['chat']),meta.get('topic_id'),title,meta.get('topic_title')]
         return [task['owner'],self.bot_id,unique,photo,'photo',size,variant,namespace]
 
+    async def reusable_photo_path(self, cached, selected, used):
+        def lookup():
+            path=self.archive.path(*Path(cached['path']).relative_to(self.archive.root).parts)
+            try:path.lstat()
+            except FileNotFoundError:raise PhotoReuseMissing('Known photo missing; current received copy required') from None
+            # Permission, symlink, ownership, writable mode, size and corruption
+            # errors remain HARD failures. Never infer missing from ValueError.
+            return self._cached_path(cached,selected,used)
+        return await _io(lookup)
+
     async def alias_file(self, identity, selected, key, used):
         name='flat_photo_alias:'+digest(identity)
         raw=self.store.get_meta(name,'')
@@ -362,38 +384,47 @@ class Engine:
         record=json.loads(raw)
         if record.get('identity')!=identity:raise ValueError('Physical photo alias identity mismatch')
         cached=self.store.db.execute('SELECT * FROM cache WHERE key=?',(record['cache_key'],)).fetchone()
-        if cached is None or cached['path']!=record['path'] or cached['size']!=record['size']:
+        if cached is None:
+            # Missing DB reference does not excuse corruption of still-present
+            # bytes for which this exact identity retains a physical proof.
+            path,_=await self.reusable_photo_path({'path':record['path'],'size':record['size']},selected,used)
+            from tg_forwarder.canonical_media import fingerprint
+            if await _io(fingerprint,path)!=record['proof']:raise ValueError('Physical photo alias bytes changed; no download fallback')
+            raise PhotoReuseMissing('Known photo cache reference missing')
+        if cached['path']!=record['path'] or cached['size']!=record['size']:
             raise ValueError('Physical photo alias cache binding missing/changed; no download fallback')
-        path,size=await _io(self._cached_path,dict(cached),selected,used)
-        if self.archive.named:
-            intended=await self.primary_destination({},selected)
-            if path.parent!=intended.parent:
-                raise ValueError('Known photo needs verified named-folder migration; no copy/download fallback')
+        path,size=await self.reusable_photo_path(dict(cached),selected,used)
         from tg_forwarder.canonical_media import fingerprint
         proof=await _io(fingerprint,path)
         if proof!=record['proof']:raise ValueError('Physical photo alias bytes changed; no download fallback')
+        if self.archive.named:
+            intended=await self.primary_destination({},selected)
+            if path.parent!=intended.parent:
+                raise PhotoReuseLegacyLayout('Known photo uses old layout; current received copy required')
         self.commit_photo_cache(key,path,size,identity,record)
         return path,size
 
-    def commit_photo_cache(self, key, path, size, identity=None, alias=None):
+    def commit_photo_cache(self, key, path, size, identity=None, alias=None, *, stale_alias=None):
         with self.store.transaction():
             self.store.db.execute('INSERT OR REPLACE INTO cache VALUES(?,?,?)',(key,str(path),size))
             if identity is not None:
                 name='flat_photo_alias:'+digest(identity)
                 existing=self.store.get_meta(name,'')
+                if stale_alias is not None and existing!=stale_alias:
+                    raise ValueError('Stale physical alias changed concurrently; fresh rebind refused')
                 if existing:
                     value=json.loads(existing)
-                    if value.get('identity')!=identity or value['path']!=str(path) or value['proof']!=alias['proof']:
+                    if value.get('identity')!=identity or (stale_alias is None and (value['path']!=str(path) or value['proof']!=alias['proof'])):
                         raise ValueError('Physical photo alias already bound to another canonical file')
                 self.store.meta(name,encode(alias))
 
-    async def remember_photo(self, key, path, size, identity):
+    async def remember_photo(self, key, path, size, identity, *, stale_alias=None):
         if identity is None:
             self.store.db.execute('INSERT OR REPLACE INTO cache VALUES(?,?,?)',(key,str(path),size))
             return
         from tg_forwarder.canonical_media import fingerprint
         proof=await _io(fingerprint,path)
-        self.commit_photo_cache(key,path,size,identity,dict(identity=identity,cache_key=key,path=str(path),size=size,proof=proof))
+        self.commit_photo_cache(key,path,size,identity,dict(identity=identity,cache_key=key,path=str(path),size=size,proof=proof),stale_alias=stale_alias)
 
     async def bootstrap_photo_alias(self, task, payload, selected, identity, key, used):
         # Bounded private DB evidence only: last 32 task rows, at most 10 items
@@ -414,10 +445,24 @@ class Engine:
                 oldkey=digest([item['chat'],item['id'],item.get('media_id','')])
                 cached=self.store.db.execute('SELECT * FROM cache WHERE key=?',(oldkey,)).fetchone()
                 if cached is None:continue
-                path,size=await _io(self._cached_path,dict(cached),selected,used)
+                path,size=await self.reusable_photo_path(dict(cached),selected,used)
+                # A retained old-layout proof is optional, never invented for legacy
+                # rows. When present it MUST pass before classifying layout stale.
+                for candidate in (previous,previous[:7]+[['root-flat']]):
+                    raw=self.store.get_meta('flat_photo_alias:'+digest(candidate),'')
+                    if not raw:continue
+                    retained=json.loads(raw)
+                    if retained.get('identity')!=candidate or retained.get('path')!=str(path) or retained.get('size')!=size:
+                        raise ValueError('Retained physical alias binding mismatch')
+                    from tg_forwarder.canonical_media import fingerprint
+                    if await _io(fingerprint,path)!=retained['proof']:
+                        raise ValueError('Retained physical alias bytes changed; no download fallback')
+                    proof_cache=self.store.db.execute('SELECT path,size FROM cache WHERE key=?',(retained['cache_key'],)).fetchone()
+                    if proof_cache is None:raise PhotoReuseMissing('Retained physical alias cache reference missing')
+                    if proof_cache['path']!=str(path) or proof_cache['size']!=size:raise ValueError('Retained physical alias cache binding mismatch')
                 if self.archive.named:
                     intended=await self.primary_destination({},selected)
-                    if path.parent!=intended.parent:raise ValueError('Known photo needs verified named-folder migration; no copy/download fallback')
+                    if path.parent!=intended.parent:raise PhotoReuseLegacyLayout('Known photo uses old layout; current received copy required')
                 await self.remember_photo(oldkey,path,size,identity)
                 return await self.alias_file(identity,selected,key,used)
         return None
@@ -434,36 +479,42 @@ class Engine:
         key = digest([i["chat"], i["id"], i.get("media_id", "")])
         async with self.download_lock:
             identity=self.photo_alias_identity(task,payload,i) if inbound else None
-            if identity is not None:
-                self.check(task)
-                found=await self.alias_file(identity,i,key,used)
-                if found is None:
-                    found=await self.bootstrap_photo_alias(task,payload,i,identity,key,used)
-                if found is not None:
-                    path,size=found
-                    await self.publish(i,path)
-                    return path,size
-            cached = self.store.db.execute("SELECT * FROM cache WHERE key=?", (key,)).fetchone()
-            if cached:
-                def lookup():
-                    path=Path(cached["path"])
-                    try:path=self.archive.path(*path.relative_to(self.archive.root).parts)
-                    except ValueError:raise ValueError("unsafe cache path") from None
-                    if path.exists():path=secure_path(self.archive.root,path.relative_to(self.archive.root),existing=True)
-                    if path.is_file() and cached["size"]>0 and path.stat().st_size==cached["size"] and (not i.get("size") or i["size"]==cached["size"]):
-                        return path,cached["size"]
-                    return None
-                found=await _io(lookup)
-                if found:
-                    path,size=found
-                    if used+size>self.config.max_bytes:raise ValueError("媒體大小超過上限")
-                    if identity is not None:
-                        if self.archive.named:
-                            intended=await self.primary_destination({},i)
-                            if path.parent!=intended.parent:raise ValueError('Known photo needs verified named-folder migration; no copy/download fallback')
-                        await self.remember_photo(key,path,size,identity)
-                    await self.publish(i,path)
-                    return path,size
+            stale_alias=None
+            observed_alias=self.store.get_meta('flat_photo_alias:'+digest(identity),'') if identity is not None else None
+            try:
+                if identity is not None:
+                    self.check(task)
+                    found=await self.alias_file(identity,i,key,used)
+                    if found is None:
+                        found=await self.bootstrap_photo_alias(task,payload,i,identity,key,used)
+                    if found is not None:
+                        path,size=found
+                        await self.publish(i,path)
+                        return path,size
+                cached = self.store.db.execute("SELECT * FROM cache WHERE key=?", (key,)).fetchone()
+                if cached:
+                    def lookup():
+                        path=Path(cached["path"])
+                        try:path=self.archive.path(*path.relative_to(self.archive.root).parts)
+                        except ValueError:raise ValueError("unsafe cache path") from None
+                        if path.exists():path=secure_path(self.archive.root,path.relative_to(self.archive.root),existing=True)
+                        if path.is_file() and cached["size"]>0 and path.stat().st_size==cached["size"] and (not i.get("size") or i["size"]==cached["size"]):
+                            return path,cached["size"]
+                        return None
+                    found=await self.reusable_photo_path(dict(cached),i,used) if identity is not None else await _io(lookup)
+                    if found:
+                        path,size=found
+                        if used+size>self.config.max_bytes:raise ValueError("媒體大小超過上限")
+                        if identity is not None:
+                            if self.archive.named:
+                                intended=await self.primary_destination({},i)
+                                if path.parent!=intended.parent:raise PhotoReuseLegacyLayout('Known photo uses old layout; current received copy required')
+                            await self.remember_photo(key,path,size,identity)
+                        await self.publish(i,path)
+                        return path,size
+            except PhotoReuseUnavailable:
+                if not inbound or payload['action']!='download':raise
+                stale_alias=observed_alias
             self.check(task)
             # Original downloader skips a valid finalized destination before downloading.
             if i.get("archive_meta") and not self.archive.flat:
@@ -548,7 +599,7 @@ class Engine:
                 await _io(self.archive.space)
                 # link() is atomic no-clobber; then remove ONLY this task-owned tempfile.
                 await _io(self.finalize,temp,path,owned_identity)
-                await self.remember_photo(key,path,size,identity)
+                await self.remember_photo(key,path,size,identity,stale_alias=stale_alias)
                 await self.publish(i, path)
                 return path, size
             finally:

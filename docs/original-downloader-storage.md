@@ -66,8 +66,9 @@ are checked before lookup. Unknown-size input conservatively does not use aliase
 The private existing SQLite meta/cache transaction commits the new message cache row
 and alias binding together. Local size/hash proof detects later file alteration; it
 is NOT an upstream Telegram hash assertion or a global content-dedup index. Existing
-secure cache path/UID/mode/regular-file checks apply. Missing, truncated, changed or
-foreign/group-writable indexed data fails closed with NO download fallback. No unknown
+secure cache path/UID/mode/regular-file checks apply. Corrupt/truncated/changed, symlink, foreign-owner/group-writable or identity-mismatched
+indexed data fails closed with NO download fallback. Missing data/reference and old
+layout are typed reuse-unavailable outcomes, not corruption. No unknown
 file is adopted because its name or size happens to match.
 
 A one-time bounded bootstrap checks only the latest 32 private task rows (at most 10
@@ -75,9 +76,15 @@ items each), requiring an authorized DONE inbound payload and exact existing cac
 binding. Pre-alias tasks without dimensions additionally need exact selected unique
 ID, size and verified immutable photo ID. It never scans the NAS or all task history;
 older unindexed sources may download once before gaining an alias. Existing duplicate
-files are not moved/deleted. A known file in an old root-flat/wrong named folder
-blocks NEW named-layout reuse with a verified-migration prerequisite: it is not copied
-or redownloaded merely to seed an alias. Existing task UI/cache reads remain usable. MTProto cross-message aliasing is deliberately NOT claimed:
+files are not moved/deleted. A NEW authenticated received-photo download is independent of restoring historical
+files: if a known reuse candidate is missing or uses the old root-flat layout, the
+current received Bot file_id may be downloaded through existing principal/unique-ID/
+size validation into the intended named folder. It does not restore/copy/move old
+data. Its new message cache row and observed-stale alias CAS update are atomic; old
+per-message cache rows, receipts and files/trash remain unchanged. Concurrent alias
+changes refuse replacement. Another fresh message for the same valid photo then
+reuses that new canonical file without another get_file/download. Cached-send/UI
+old-cache actions remain strict zero-source-fetch and fail if old data is missing. MTProto cross-message aliasing is deliberately NOT claimed:
 its existing authenticated cache/source-revision flow remains unchanged.
 
 ## Historical root-flat option (superseded for current service)

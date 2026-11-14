@@ -89,11 +89,16 @@ class Store:
         with self.transaction():
             return self.insert_task(owner, chat, reply, payload)
 
-    def insert_task(self, owner, chat, reply, payload):
-        """Caller holds BEGIN IMMEDIATE; permits task+watch cursor atomic commit."""
+    @staticmethod
+    def task_key(owner,chat,payload):
         key = digest([owner, chat, sorted((i["chat"], i["id"], i.get("media_id", "")) for i in payload["items"]), payload["action"], payload.get("target")])
         if payload["action"] == "cached_photos":
             key = digest(["cached-photos-v1",payload["origin_task"],key])
+        return key
+
+    def insert_task(self, owner, chat, reply, payload):
+        """Caller holds BEGIN IMMEDIATE; permits task+watch cursor atomic commit."""
+        key=self.task_key(owner,chat,payload)
         task = secrets.token_hex(8)
         self.db.execute("INSERT OR IGNORE INTO tasks(id,owner,chat,reply,key,payload,state) VALUES(?,?,?,?,?,?,?)",
                         (task, owner, chat, reply, key, encode(payload), "queued"))
@@ -112,6 +117,16 @@ class Store:
         if not set(fields) <= {"state", "attempt", "due", "error", "progress"}:
             raise ValueError("invalid task fields")
         self.db.execute("UPDATE tasks SET " + ",".join(k+"=?" for k in fields) + " WHERE id=?", (*fields.values(), tid))
+
+    def retry(self, tid, owner, chat, *, expected_attempt=None, failed_only=False):
+        row=self.task(tid,owner,chat)
+        allowed=('failed',) if failed_only else ('failed','cancelled')
+        if row['state'] not in allowed or (expected_attempt is not None and row['attempt']!=expected_attempt):
+            raise ValueError('Task retry state/attempt mismatch; ambiguous or active tasks cannot reset')
+        changed=self.db.execute("UPDATE tasks SET state='queued',due=0,error='' WHERE id=? AND owner=? AND chat=? AND state=? AND attempt=?",
+            (tid,owner,chat,row['state'],row['attempt'])).rowcount
+        if changed!=1:raise ValueError('Task changed concurrently; retry refused')
+        return self.task(tid,owner,chat)
 
     def claim(self):
         with self.transaction():

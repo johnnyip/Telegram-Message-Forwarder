@@ -187,12 +187,26 @@ class NamedAlbumTests(unittest.IsolatedAsyncioTestCase):
         task=await self.execute();self.assertNotEqual(task['state'],'done')
         self.mature();await self.controller.inbound_notice_tick()
         self.assertEqual(self.bot.send_message.await_count,1)
+        self.assertIn('下載失敗',self.bot.edit_message_text.call_args.kwargs['text'])
+        self.assertNotIn('下載處理中',self.bot.edit_message_text.call_args.kwargs['text'])
 
     async def test_recovery_after_known_reply_only_edits_no_new_send(self):
         await self.add(89600);self.mature();await self.controller.inbound_notice_tick()
         self.store.db.execute("UPDATE inbound_notices SET state='sending'")
         self.controller=Controller(self.config,self.store,self.resolver,self.engine,self.bot)
         await self.controller.inbound_notice_tick();await self.controller.inbound_notice_tick()
+        self.assertEqual(self.bot.send_message.await_count,1)
+
+    async def test_album_partial_terminal_and_retry_pending_labels(self):
+        await self.add(89610);await self.add(89611)
+        rows=self.store.db.execute('SELECT id FROM tasks ORDER BY rowid').fetchall()
+        self.store.set_task(rows[0]['id'],state='done');self.store.set_task(rows[1]['id'],state='failed')
+        self.mature();await self.controller.inbound_notice_tick()
+        self.assertIn('部分完成',self.bot.edit_message_text.call_args.kwargs['text'])
+        self.store.set_task(rows[1]['id'],state='delayed')
+        await self.controller.notify_task(self.store.task(rows[1]['id'],inbound.OWNER,inbound.OWNER))
+        await self.controller.inbound_notice_tick()
+        self.assertIn('下載處理中',self.bot.edit_message_text.call_args.kwargs['text'])
         self.assertEqual(self.bot.send_message.await_count,1)
 
     async def test_actual_installed_forum_api_preserves_topic_names(self):
