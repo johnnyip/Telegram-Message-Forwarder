@@ -143,7 +143,7 @@ async def run(inspect_url=None, health=False):
             from tg_forwarder.shared_media import configured_bridge
             bridge = await configured_bridge()
             gate = RateGate(store, bridge)
-            resolver = Resolver(client, config.scan_limit, gate)
+            resolver = Resolver(client, config.scan_limit, gate,named_folders=config.archive_named)
             if inspect_url:
                 snap = await resolver.resolve(parse_url(inspect_url))
                 print(json.dumps(summary(snap), ensure_ascii=False))
@@ -162,7 +162,9 @@ async def run(inspect_url=None, health=False):
                 engine = Engine(config, store, client, gate, delivery=BotDelivery(bot, positive(os.getenv("CONTROL_BOT_UPLOAD_MAX_BYTES", str(49*1024*1024)))), bridge=bridge, bot_id=bot_id)
                 controller = Controller(config, store, resolver, engine, bot)
                 async def notify(task):
-                    if task["reply"] or task["state"] in ("done", "failed", "ambiguous"):
+                    if json.loads(task['payload']).get('inbound_notice'):
+                        await controller.notify_task(task)
+                    elif task["reply"] or task["state"] in ("done", "failed", "ambiguous"):
                         await controller.render_task(task["owner"], task["chat"], task["reply"] or None, task)
                 engine.notify = notify
                 store.recover()

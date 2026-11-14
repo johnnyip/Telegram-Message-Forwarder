@@ -13,7 +13,7 @@ from telethon.errors import FloodWaitError, RPCError
 from telegram.error import BadRequest, Forbidden, RetryAfter
 from .store import digest, encode
 from .filesystems import guard_archive
-from tg_forwarder.canonical_media import relative as original_relative, filename as original_filename, truncate_filename, secure_path
+from tg_forwarder.canonical_media import relative as original_relative, filename as original_filename, truncate_filename, validate_title, secure_path
 from tg_forwarder.shared_media import _io, _join
 from types import SimpleNamespace
 from tg_forwarder.shared_media import media_identity, AmbiguousDelivery, SharedUnavailable, definite_rejection
@@ -51,9 +51,10 @@ class RateGate:
 
 
 class Archive:
-    def __init__(self, root, reserve_bytes, expected_mount=None, expected_fstypes=("nfs","nfs4"), archive_timezone="UTC", *, flat=False, metadata_dir=None):
-        self.flat, self.metadata_dir = flat, Path(metadata_dir).absolute() if metadata_dir else None
-        if flat and self.metadata_dir is None:raise ValueError("Flat archive requires private metadata directory")
+    def __init__(self, root, reserve_bytes, expected_mount=None, expected_fstypes=("nfs","nfs4"), archive_timezone="UTC", *, flat=False, metadata_dir=None, named=False):
+        self.named=named
+        self.flat, self.metadata_dir = flat or named, Path(metadata_dir).absolute() if metadata_dir else None
+        if self.flat and self.metadata_dir is None:raise ValueError("Flat archive requires private metadata directory")
         self.timezone = archive_timezone
         self.expected_mount, self.expected_fstypes = expected_mount, expected_fstypes
         self.root = Path(root).absolute()
@@ -93,6 +94,15 @@ class Archive:
         if self.flat:
             if not i.get('archive_meta'):
                 raise ValueError('Original filename metadata required for flat layout')
+            if self.named:
+                meta=i['archive_meta']
+                title=meta.get('folder_title') or meta.get('title')
+                if not title:raise ValueError('Confirmed chat title required')
+                topic=meta.get('topic_title')
+                if meta.get('topic_id') and not topic:raise ValueError('Confirmed topic title required')
+                label=title+(' - '+topic if topic else '')
+                label=truncate_filename(validate_title(label))
+                return self.path(label,original_filename(i))
             return self.path(original_filename(i))
         if i.get("archive_meta"):
             rel = original_relative(i,self.timezone)
@@ -148,7 +158,7 @@ class Archive:
 class Engine:
     def __init__(self, config, store, client, gate, notify=None, delivery=None, bridge=None, bot_id=None):
         self.config, self.store, self.client, self.gate = config, store, client, gate
-        self.archive = Archive(config.root, config.reserve_bytes, config.expected_archive_mount, config.expected_archive_fstypes, config.archive_timezone, flat=getattr(config,"archive_flat",False), metadata_dir=config.db.parent/"manifests")
+        self.archive = Archive(config.root, config.reserve_bytes, config.expected_archive_mount, config.expected_archive_fstypes, config.archive_timezone, flat=getattr(config,"archive_flat",False), metadata_dir=config.db.parent/"manifests", named=getattr(config,"archive_named",False))
         self.notify = notify
         self.delivery = delivery
         self.bridge, self.bot_id = bridge, bot_id
@@ -248,8 +258,26 @@ class Engine:
             _,size = await self.cached_file_async(selected,used)
             used += size
 
-    async def flat_destination(self, snapshot, selected, key):
+    async def primary_destination(self, snapshot, selected):
         primary=await _io(self.archive.file,snapshot,selected)
+        if self.archive.named:
+            meta=selected['archive_meta']
+            binding=[meta.get('folder_chat',selected['chat']),meta.get('topic_id')]
+            relative=primary.parent.relative_to(self.archive.root)
+            name='archive_folder:'+digest(str(relative))
+            prior=self.store.get_meta(name,'')
+            if prior and json.loads(prior)!=binding:
+                suffix=' - '+digest(binding)[:12]
+                label=truncate_filename(str(relative),230-len(suffix))+suffix
+                primary=await _io(self.archive.path,label,primary.name)
+                name='archive_folder:'+digest(label)
+                prior=self.store.get_meta(name,'')
+                if prior and json.loads(prior)!=binding:raise ValueError('Named folder identity collision')
+            self.store.meta(name,encode(binding))
+        return primary
+
+    async def flat_destination(self, snapshot, selected, key):
+        primary=await self.primary_destination(snapshot,selected)
         # Existing cached identities are handled before this path. Unknown existing
         # names are NEVER adopted by size; preserve them and disambiguate only once.
         occupied = await _io(lambda:primary.exists() or primary.is_symlink()) or self.store.db.execute('SELECT 1 FROM cache WHERE path=? AND key!=?',(str(primary),key)).fetchone()
@@ -257,7 +285,7 @@ class Engine:
         suffix=' - '+key[:16]
         stem=truncate_filename(primary.stem+primary.suffix,230-len(suffix))
         base=Path(stem)
-        alternate=await _io(self.archive.path,base.stem+suffix+base.suffix)
+        alternate=await _io(self.archive.path,*primary.parent.relative_to(self.archive.root).parts,base.stem+suffix+base.suffix)
         if await _io(lambda:alternate.exists() or alternate.is_symlink()) or self.store.db.execute('SELECT 1 FROM cache WHERE path=? AND key!=?',(str(alternate),key)).fetchone():
             raise ValueError('Flat filename collision requires verification; existing file not overwritten')
         return alternate
@@ -304,6 +332,96 @@ class Engine:
             await _join(asyncio.create_task(_io(discard)))
             raise
 
+    def photo_alias_identity(self, task, payload, selected):
+        # Caller performs the strict owner/bot/action/media_id binding FIRST.
+        if not self.archive.flat or selected.get('source_kind') != 'bot-inbound' or selected.get('kind')!='photo':return None
+        from .inbound import photo_id_from_file_id
+        size=selected.get('size')
+        unique=selected.get('file_unique_id')
+        if type(size) is not int or size<=0 or not isinstance(unique,str) or not unique:return None
+        photo=photo_id_from_file_id(selected['file_id'])
+        declared=selected.get('archive_meta',{}).get('photo_id')
+        if declared is not None and photo!=declared:
+            raise PermissionError('Received photo immutable file binding mismatch')
+        # file_unique_id identifies the selected Telegram PhotoSize variant; size
+        # and decoded immutable ID further narrow it, never changing file_reference.
+        variant=selected.get('photo_variant')
+        if variant is not None and (not isinstance(variant,list) or len(variant)!=2 or any(type(v) is not int or v<=0 for v in variant)):
+            raise ValueError('Invalid received photo variant')
+        meta=selected.get('archive_meta',{})
+        namespace=['root-flat']
+        if self.archive.named:
+            title=meta.get('folder_title') or meta.get('title')
+            namespace=['named',meta.get('folder_chat',selected['chat']),meta.get('topic_id'),title,meta.get('topic_title')]
+        return [task['owner'],self.bot_id,unique,photo,'photo',size,variant,namespace]
+
+    async def alias_file(self, identity, selected, key, used):
+        name='flat_photo_alias:'+digest(identity)
+        raw=self.store.get_meta(name,'')
+        if not raw:return None
+        record=json.loads(raw)
+        if record.get('identity')!=identity:raise ValueError('Physical photo alias identity mismatch')
+        cached=self.store.db.execute('SELECT * FROM cache WHERE key=?',(record['cache_key'],)).fetchone()
+        if cached is None or cached['path']!=record['path'] or cached['size']!=record['size']:
+            raise ValueError('Physical photo alias cache binding missing/changed; no download fallback')
+        path,size=await _io(self._cached_path,dict(cached),selected,used)
+        if self.archive.named:
+            intended=await self.primary_destination({},selected)
+            if path.parent!=intended.parent:
+                raise ValueError('Known photo needs verified named-folder migration; no copy/download fallback')
+        from tg_forwarder.canonical_media import fingerprint
+        proof=await _io(fingerprint,path)
+        if proof!=record['proof']:raise ValueError('Physical photo alias bytes changed; no download fallback')
+        self.commit_photo_cache(key,path,size,identity,record)
+        return path,size
+
+    def commit_photo_cache(self, key, path, size, identity=None, alias=None):
+        with self.store.transaction():
+            self.store.db.execute('INSERT OR REPLACE INTO cache VALUES(?,?,?)',(key,str(path),size))
+            if identity is not None:
+                name='flat_photo_alias:'+digest(identity)
+                existing=self.store.get_meta(name,'')
+                if existing:
+                    value=json.loads(existing)
+                    if value.get('identity')!=identity or value['path']!=str(path) or value['proof']!=alias['proof']:
+                        raise ValueError('Physical photo alias already bound to another canonical file')
+                self.store.meta(name,encode(alias))
+
+    async def remember_photo(self, key, path, size, identity):
+        if identity is None:
+            self.store.db.execute('INSERT OR REPLACE INTO cache VALUES(?,?,?)',(key,str(path),size))
+            return
+        from tg_forwarder.canonical_media import fingerprint
+        proof=await _io(fingerprint,path)
+        self.commit_photo_cache(key,path,size,identity,dict(identity=identity,cache_key=key,path=str(path),size=size,proof=proof))
+
+    async def bootstrap_photo_alias(self, task, payload, selected, identity, key, used):
+        # Bounded private DB evidence only: last 32 task rows, at most 10 items
+        # per pure inbound task. No filesystem walk, filename adoption or API call.
+        rows=self.store.db.execute('SELECT owner,chat,state,payload FROM tasks ORDER BY rowid DESC LIMIT 32').fetchall()
+        for row in rows:
+            if row['owner']!=task['owner'] or row['chat']!=task['chat'] or row['state']!='done':continue
+            old=json.loads(row['payload'])
+            if old.get('source_kind')!='bot-inbound' or old.get('bot_id')!=self.bot_id or old.get('action')!='download':continue
+            items=old.get('items',[])
+            if not isinstance(items,list) or len(items)>10:continue
+            for item in items:
+                if item.get('chat')!=task['owner'] or item.get('bot_id')!=self.bot_id or item.get('media_id')!='bot-inbound:'+str(self.bot_id)+':'+str(item.get('file_unique_id')):continue
+                previous=self.photo_alias_identity(task,old,item)
+                if not previous or previous[:6]!=identity[:6]:continue
+                if previous[6]!=identity[6] and (previous[6] is not None or previous[3] is None):continue
+                if previous[7][:3]!=identity[7][:3]:continue
+                oldkey=digest([item['chat'],item['id'],item.get('media_id','')])
+                cached=self.store.db.execute('SELECT * FROM cache WHERE key=?',(oldkey,)).fetchone()
+                if cached is None:continue
+                path,size=await _io(self._cached_path,dict(cached),selected,used)
+                if self.archive.named:
+                    intended=await self.primary_destination({},selected)
+                    if path.parent!=intended.parent:raise ValueError('Known photo needs verified named-folder migration; no copy/download fallback')
+                await self.remember_photo(oldkey,path,size,identity)
+                return await self.alias_file(identity,selected,key,used)
+        return None
+
     async def download(self, task, payload, i, used):
         inbound = i.get("source_kind") == "bot-inbound"
         if inbound:
@@ -315,6 +433,16 @@ class Engine:
                 raise PermissionError("Received photo principal/action mismatch")
         key = digest([i["chat"], i["id"], i.get("media_id", "")])
         async with self.download_lock:
+            identity=self.photo_alias_identity(task,payload,i) if inbound else None
+            if identity is not None:
+                self.check(task)
+                found=await self.alias_file(identity,i,key,used)
+                if found is None:
+                    found=await self.bootstrap_photo_alias(task,payload,i,identity,key,used)
+                if found is not None:
+                    path,size=found
+                    await self.publish(i,path)
+                    return path,size
             cached = self.store.db.execute("SELECT * FROM cache WHERE key=?", (key,)).fetchone()
             if cached:
                 def lookup():
@@ -329,6 +457,11 @@ class Engine:
                 if found:
                     path,size=found
                     if used+size>self.config.max_bytes:raise ValueError("媒體大小超過上限")
+                    if identity is not None:
+                        if self.archive.named:
+                            intended=await self.primary_destination({},i)
+                            if path.parent!=intended.parent:raise ValueError('Known photo needs verified named-folder migration; no copy/download fallback')
+                        await self.remember_photo(key,path,size,identity)
                     await self.publish(i,path)
                     return path,size
             self.check(task)
@@ -415,7 +548,7 @@ class Engine:
                 await _io(self.archive.space)
                 # link() is atomic no-clobber; then remove ONLY this task-owned tempfile.
                 await _io(self.finalize,temp,path,owned_identity)
-                self.store.db.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)", (key, str(path), size))
+                await self.remember_photo(key,path,size,identity)
                 await self.publish(i, path)
                 return path, size
             finally:

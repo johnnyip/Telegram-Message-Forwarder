@@ -132,7 +132,7 @@ class InboundTests(unittest.IsolatedAsyncioTestCase):
             row=await self.execute();self.assertEqual(row['state'],'done',row['error'])
         self.assertEqual(len(list(self.config.root.rglob('*.jpg'))),10)
         self.assertEqual(self.bot.get_file.await_count,10)
-        await self.queue(raw_update(73273))
+        await self.queue(raw_update(73273,group="second-album"))
         self.assertEqual((await self.execute())['state'],'done')
         self.assertEqual(self.bot.get_file.await_count,11)
         self.assert_no_source();self.bot.send_photo.assert_not_awaited();self.bot.send_media_group.assert_not_awaited()

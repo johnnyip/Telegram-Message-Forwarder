@@ -18,6 +18,7 @@ LABELS = {"single": "單項", "album": "所選相簿", "discussion": "整串留�
 class Controller:
     def __init__(self, config, store, resolver, engine, bot):
         self.config, self.store, self.resolver, self.engine, self.bot = config, store, resolver, engine, bot
+        self.inbound_notice_lock=asyncio.Lock()
 
     def button(self, text, owner, chat, reply, payload):
         return Button(text, callback_data=self.store.capability(owner, chat, reply, payload))
@@ -153,6 +154,7 @@ class Controller:
         while True:
             try:
                 await self.preview_tick()
+                await self.inbound_notice_tick()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -272,6 +274,61 @@ class Controller:
             else:
                 buttons.append(self.button("📤 傳送已下載圖片到此對話（"+str(len(payload["items"]))+"）",owner,chat,reply,{**base,"do":"cached_photos"}))
         return buttons
+
+    async def notify_task(self, task):
+        payload=json.loads(task['payload'])
+        key=payload.get('inbound_notice')
+        if key:
+            self.store.db.execute("UPDATE inbound_notices SET state=CASE WHEN state='sending' THEN 'sending' ELSE 'pending' END,generation=generation+1 WHERE key=? AND owner=? AND chat=? AND bot=? AND state NOT IN ('ambiguous','failed')",
+                (key,task['owner'],task['chat'],self.engine.bot_id))
+            return
+        if task['reply'] or task['state'] in ('done','failed','ambiguous'):
+            await self.render_task(task['owner'],task['chat'],task['reply'] or None,task)
+
+    async def inbound_notice_tick(self):
+        async with self.inbound_notice_lock:
+            row=self.store.db.execute("SELECT * FROM inbound_notices WHERE state IN ('pending','sending') AND due<=? AND bot=? ORDER BY due LIMIT 1",(time.time(),self.engine.bot_id)).fetchone()
+            if row is None:return
+            if row['owner'] not in self.config.allowed or row['chat']!=row['owner']:
+                self.store.db.execute("UPDATE inbound_notices SET state='failed' WHERE key=?",(row['key'],));return
+            if row['state']=='sending':
+                self.store.db.execute("UPDATE inbound_notices SET state=? WHERE key=?",('pending' if row['reply'] else 'ambiguous',row['key']));return
+            ids=json.loads(row['payload'])
+            if not ids or len(ids)>10:raise ValueError('Invalid inbound notification membership')
+            tasks=[self.store.task(tid,row['owner'],row['chat']) for tid in ids]
+            for task in tasks:
+                p=json.loads(task['payload'])
+                if p.get('inbound_notice')!=row['key'] or p.get('bot_id')!=row['bot'] or p.get('source_kind')!='bot-inbound':raise PermissionError('Inbound notice binding mismatch')
+            done=sum(t['state']=='done' for t in tasks)
+            errors=sum(t['state'] in ('failed','ambiguous','cancelled') for t in tasks)
+            text='收到相簿' if json.loads(tasks[0]['payload'])['items'][0].get('album') else '收到相片'
+            text+='：'+str(len(tasks))+' 相；已完成 '+str(done)+'/'+str(len(tasks))+'；錯誤／取消 '+str(errors)
+            text+='\n'+('下載完成' if done==len(tasks) else '下載處理中／可在任務詳情查看')
+            reply=row['reply']
+            try:
+                if not reply:
+                    # Persist uncertainty BEFORE first send. Crash/unknown outcome
+                    # never triggers another first-send attempt on recovery.
+                    self.store.db.execute("UPDATE inbound_notices SET state='sending' WHERE key=?",(row['key'],))
+                    sent=await self.bot.send_message(chat_id=row['chat'],text=text)
+                    reply=getattr(sent,'message_id',None)
+                    if type(reply) is not int or reply<=0:raise RuntimeError('Unconfirmed inbound notice send')
+                    self.store.db.execute('UPDATE inbound_notices SET reply=? WHERE key=?',(reply,row['key']))
+                rows=[]
+                for task in tasks:
+                    buttons=await self.task_buttons(row['owner'],row['chat'],reply,task)
+                    buttons[0]=self.button('詳情 '+task['id'][-6:],row['owner'],row['chat'],reply,{'kind':'task','task':task['id'],'do':'details'})
+                    rows.append(buttons)
+                await self.edit(row['chat'],reply,text,rows)
+                self.store.db.execute("UPDATE inbound_notices SET state=CASE WHEN generation=? THEN 'sent' ELSE 'pending' END WHERE key=?",(row['generation'],row['key']))
+            except RetryAfter as exc:
+                seconds=exc.retry_after.total_seconds() if hasattr(exc.retry_after,'total_seconds') else exc.retry_after
+                self.engine.gate.delay(float(seconds))
+                self.store.db.execute("UPDATE inbound_notices SET state='pending',due=? WHERE key=?",(time.time()+float(seconds)+1,row['key']))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.store.db.execute("UPDATE inbound_notices SET state=? WHERE key=?",('failed' if reply else 'ambiguous',row['key']))
 
     async def render_task(self, owner, chat, reply, task):
         # Re-read by owner/chat; notification payloads and stale buttons are not authority.

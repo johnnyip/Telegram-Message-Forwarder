@@ -3,6 +3,9 @@ import base64
 import hashlib
 import re
 import struct
+import json
+import time
+from .store import digest, encode
 from .config import actor, positive
 
 OWNER = 5268216341
@@ -91,13 +94,22 @@ def payload_for(update, allowed, bot_id):
     if photo.file_size is not None and (photo.file_size <= 0 or photo.file_size > CLOUD_DOWNLOAD_LIMIT):
         raise ValueError('收到相片超過 Bot API 20 MB 下載上限')
     photo_id = photo_id_from_file_id(photo.file_id)
-    meta = {'title':str(owner),'datetime':message.date.isoformat(),'extension':'.jpg'}
+    receiving=(getattr(message.chat,'title',None) or getattr(message.chat,'full_name',None)
+        or ' '.join(v for v in (getattr(message.from_user,'first_name',None),getattr(message.from_user,'last_name',None)) if v)
+        or getattr(message.chat,'username',None) or '私人對話')
+    meta = {'title':str(owner),'folder_title':receiving,'folder_chat':owner,'datetime':message.date.isoformat(),'extension':'.jpg'}
+    origin=getattr(message,'forward_origin',None)
+    source=getattr(origin,'chat',None)
+    if source is not None and type(getattr(source,'id',None)) is int and getattr(source,'type',None) in ('channel','supergroup','group') and getattr(source,'title',None):
+        meta.update(folder_title=source.title,folder_chat=source.id,origin_chat_id=source.id,origin_title=source.title)
+    # Origin affects a label ONLY; actor/bot namespace remain the receiving owner.
     if photo_id:meta['photo_id'] = photo_id
     else:
         # Deliberately NOT labelled original-compatible when a codec is unknown.
         meta['filename'] = 'bot-photo-'+hashlib.sha256(photo.file_unique_id.encode()).hexdigest()[:24]+'.jpg'
     item = {'chat':owner,'id':message.message_id,'media_id':'bot-inbound:'+str(bot_id)+':'+photo.file_unique_id,
             'source_kind':'bot-inbound','bot_id':bot_id,'file_id':photo.file_id,'file_unique_id':photo.file_unique_id,
+            'photo_variant':[photo.width,photo.height],
             'update_id':update.update_id,'kind':'photo','size':photo.file_size,'album':message.media_group_id,
             'date':message.date.date().isoformat(),'section':'main','caption':message.caption or '',
             'protected':bool(message.has_protected_content),'archive_meta':meta,
@@ -109,4 +121,19 @@ def payload_for(update, allowed, bot_id):
 
 def enqueue(store, config, update, bot_id):
     payload = payload_for(update, config.allowed, bot_id)
-    return store.create_task(OWNER, OWNER, 0, payload)
+    album=payload['items'][0].get('album')
+    if album is not None and (not isinstance(album,str) or not album or len(album)>256):raise ValueError('Invalid incoming album')
+    key=digest(['inbound-notice',OWNER,bot_id,OWNER,album if album else 'single:'+str(update.message.message_id)])
+    payload['inbound_notice']=key
+    with store.transaction():
+        existing=store.db.execute('SELECT * FROM inbound_notices WHERE key=?',(key,)).fetchone()
+        members=json.loads(existing['payload']) if existing else []
+        task=store.insert_task(OWNER,OWNER,0,payload)
+        # An already-DONE historical task is never replayed/notified retroactively.
+        if json.loads(task['payload']).get('inbound_notice')!=key:return task
+        if task['id'] in members:return task
+        if len(members)>=10:raise ValueError('Incoming album exceeds 10 items')
+        members.append(task['id'])
+        store.db.execute("INSERT INTO inbound_notices(key,owner,chat,bot,payload,due,state) VALUES(?,?,?,?,?,?,'pending') ON CONFLICT(key) DO UPDATE SET payload=excluded.payload,due=excluded.due,generation=inbound_notices.generation+1,state=CASE WHEN inbound_notices.state IN ('sending','ambiguous','failed') THEN inbound_notices.state ELSE 'pending' END",
+            (key,OWNER,OWNER,bot_id,encode(members),time.time()+(2 if album else 0)))
+        return task

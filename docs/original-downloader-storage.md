@@ -25,7 +25,62 @@ CONTROL_ARCHIVE_TIMEZONE defaults explicitly to UTC provisionally; original runt
 local timezone, historical chat titles and installed configuration still need parent
 confirmation. Do not silently switch to HKT or guess missing historical names.
 
-## Current owner-requested flat layout (supersedes new nested downloads)
+## Current correction: chat/topic folder, media directly inside
+
+Set CONTROL_ARCHIVE_NAMED=true for the current service. It implies flat media
+INSIDE one named folder, not flat directly in TG_Download. Existing
+CONTROL_ARCHIVE_FLAT=true may remain; NAMED selects the new layout. Library/other
+roles retain default false. Folder is sanitized original chat title; when a verified
+forum topic exists it is "chat title - topic title" in ONE directory component.
+There are no year/month/post/album/owner subdirectories. Original filename() remains
+unchanged. The name and 230-byte truncation use the pinned sanitizer/formatter above.
+Distinct source/topic identities that sanitize to the same directory label get a
+collision-only deterministic suffix, bound in private existing SQLite meta.
+
+MTProto forum names are retrieved by the existing authorized client's bounded
+messages.GetForumTopicsByID request (verified against installed Telethon). Missing
+verified topic names fail closed rather than merging topics into the chat folder.
+Received Bot API photos never trigger MTProto lookup: a genuine Telegram channel
+forward_origin.chat provides a folder label ONLY, never actor authority. Hidden/user
+origins use the already received, authorized private-chat display name. Missing names
+use a neutral private-chat label, not invented original-source identity. Original
+origin metadata remains distinct from receiving owner/bot authorization.
+
+All existing root-flat files, nested 87.6 MB original, cache paths, manifests,
+per-message task IDs and receipts remain untouched/readable. No relocation, deletion,
+renaming, ACL/chmod/chown or mass migration occurs. A preexisting named directory that
+is not writable remains an explicit operator access blocker, not permission to bypass
+it. New manifests remain in private local CONTROL_DB parent /manifests.
+
+### Received-photo physical aliases (not content/name deduplication)
+
+With flat or named mode, exact owner + authenticated bot + selected file_unique_id +
+verified decoded immutable photo ID (when supported) + size + dimensions + intended
+chat/topic classification identifies a
+physical photo variant independently of message ID and changing file references.
+Repeated received messages keep separate durable tasks and cache keys but reuse ONE
+known canonical path without another get_file/download. Different bot/owner/variant,
+size or revision cannot hit that alias. Authorization and declared/decoded file binding
+are checked before lookup. Unknown-size input conservatively does not use aliases.
+
+The private existing SQLite meta/cache transaction commits the new message cache row
+and alias binding together. Local size/hash proof detects later file alteration; it
+is NOT an upstream Telegram hash assertion or a global content-dedup index. Existing
+secure cache path/UID/mode/regular-file checks apply. Missing, truncated, changed or
+foreign/group-writable indexed data fails closed with NO download fallback. No unknown
+file is adopted because its name or size happens to match.
+
+A one-time bounded bootstrap checks only the latest 32 private task rows (at most 10
+items each), requiring an authorized DONE inbound payload and exact existing cache
+binding. Pre-alias tasks without dimensions additionally need exact selected unique
+ID, size and verified immutable photo ID. It never scans the NAS or all task history;
+older unindexed sources may download once before gaining an alias. Existing duplicate
+files are not moved/deleted. A known file in an old root-flat/wrong named folder
+blocks NEW named-layout reuse with a verified-migration prerequisite: it is not copied
+or redownloaded merely to seed an alias. Existing task UI/cache reads remain usable. MTProto cross-message aliasing is deliberately NOT claimed:
+its existing authenticated cache/source-revision flow remains unchanged.
+
+## Historical root-flat option (superseded for current service)
 
 Set CONTROL_ARCHIVE_FLAT=true for the current control service. All NEW MTProto
 and private inbound photo downloads then publish directly in MEDIA_ARCHIVE_DIR
@@ -194,3 +249,19 @@ nonregular files and group/other writable files remain rejected. No chmod/chown/
 changes or parent-owner inference. Existing original directories may still require
 an independently approved narrow write grant; the whitelist does not grant access.
 See [inbound-photo-downloads.md](inbound-photo-downloads.md).
+
+
+### Current 20-file organization: existing migration CLI gap
+
+No organization was executed by this change. The existing storage_migration.Migration
+constructor currently hardcodes canonical_media.relative() (chat/month), canonical
+.metadata manifest relocation, and an exact legacy v1 shared-object path. Therefore
+it does NOT directly support the current 20 root-flat inbound files -> new named
+folder + existing private-state manifests/physical aliases as-is. Do not invent a
+plan that pretends those v1 objects exist. Its established hash/no-clobber/quiescent/
+SQLite/reference-verification primitives can be reused by a separately authorized
+narrow explicit-plan extension/operator procedure. That procedure must inventory all
+20 distinct files/keys/manifests, preserve every duplicate (no dedup deletion), backup
+private state, verify reverse mapping and update known references atomically. The
+old 87.6 MB file is outside that 20-file operation. This source change adds no new
+migration framework and performs no NAS moves, copies, deletes or permission changes.

@@ -16,11 +16,13 @@ def item(msg, section):
     kind = "photo" if getattr(msg, "photo", None) else "video" if getattr(msg, "video", None) else None
     date = getattr(msg, "date", None) or datetime.now(timezone.utc)
     file = getattr(msg, "file", None)
+    reply=getattr(msg,'reply_to',None)
+    topic=(getattr(reply,'reply_to_top_id',None) or getattr(reply,'reply_to_msg_id',None)) if getattr(reply,'forum_topic',False) else None
     return {"chat": msg.chat_id, "id": msg.id, "album": str(getattr(msg, "grouped_id", None) or ""),
             "media_id": str(getattr(getattr(msg, "photo", None) or getattr(msg, "document", None), "id", "")),
             "kind": kind, "size": getattr(file, "size", None), "caption": clean(getattr(msg, "message", "")),
             "date": date.date().isoformat(), "section": section,
-            "archive_meta": {"datetime":getattr(msg,"date",None).isoformat() if getattr(msg,"date",None) else None, "title":str(msg.chat_id),
+            "archive_meta": {"topic_id":topic,"datetime":getattr(msg,"date",None).isoformat() if getattr(msg,"date",None) else None, "title":str(msg.chat_id),
                 "photo_id":getattr(getattr(msg,"photo",None),"id",None),
                 "extension":getattr(file,"ext",None) or (".jpg" if kind=="photo" else ".mp4"),
                 "filename":next((a.file_name for a in getattr(getattr(msg,"document",None),"attributes",[]) if hasattr(a,"file_name")),None)},
@@ -32,8 +34,9 @@ def identity(i):
 
 
 class Resolver:
-    def __init__(self, client, limit=10000, gate=None):
+    def __init__(self, client, limit=10000, gate=None, *, named_folders=False):
         self.client, self.limit, self.gate = client, limit, gate
+        self.named_folders=named_folders
 
     async def call(self, fn, *args, **kwargs):
         if self.gate:
@@ -44,6 +47,19 @@ class Resolver:
             if self.gate:
                 self.gate.delay(exc.seconds)
             raise
+
+    async def topics(self, entity, messages, values):
+        if not self.named_folders or not getattr(entity,'forum',False):return
+        ids=[]
+        for msg in messages:
+            reply=getattr(msg,'reply_to',None)
+            ids.append((getattr(reply,'reply_to_top_id',None) or getattr(reply,'reply_to_msg_id',None) or 1) if getattr(reply,'forum_topic',False) else 1)
+        unique=sorted(set(ids))
+        if len(unique)>100:raise Unavailable('Topic metadata exceeds bound')
+        result=await self.call(self.client,functions.messages.GetForumTopicsByIDRequest(entity,unique))
+        names={topic.id:topic.title for topic in result.topics if getattr(topic,'title',None)}
+        if any(tid not in names for tid in unique):raise Unavailable('Confirmed topic title unavailable')
+        for value,tid in zip(values,ids):value['archive_meta'].update(topic_id=tid,topic_title=names[tid])
 
     async def album(self, peer, seed):
         gid = getattr(seed, "grouped_id", None)
@@ -116,6 +132,7 @@ class Resolver:
             value["protected"] |= bool(getattr(entity, "noforwards", False))
             value["access_hash"] = getattr(entity, "access_hash", None)
             value["archive_meta"]["title"] = getattr(entity,"title",None) or str(value["chat"])
+        await self.topics(entity,replies,snap["discussion"])
         snap["partial"], snap["warning"] = partial, "新留言超過增量掃描上限" if partial else ""
         snap["cursor"] = max(messages, default=cursor)
         snap["captured"] = datetime.now(timezone.utc).isoformat()
@@ -134,6 +151,7 @@ class Resolver:
             m["protected"] |= protected
             m["access_hash"] = getattr(entity, "access_hash", None)
             m["archive_meta"]["title"] = getattr(entity,"title",None) or str(m["chat"])
+        await self.topics(entity,main_messages,main)
         snap = {"ref": ref.as_dict(), "peer": peer, "post": min(m.id for m in main_messages),
                 "main": main, "discussion": [], "selected": [m for m in main if m["id"] == seed.id],
                 "selected_album": main, "partial": False, "warning": "", "thread": None,
@@ -168,6 +186,7 @@ class Resolver:
                 m["protected"] |= group_protected
                 m["access_hash"] = getattr(root_peer, "access_hash", None)
                 m["archive_meta"]["title"] = getattr(root_peer,"title",None) or str(m["chat"])
+            await self.topics(root_peer,replies,snap["discussion"])
             if ref.comment:
                 selected = messages.get(ref.comment)
                 if selected is None or selected.id in root_ids:

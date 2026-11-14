@@ -153,3 +153,26 @@ filenames. No new owner/month/group subfolders. New manifests stay in private lo
 control state, not that public root. Existing nested cache files remain compatible;
 there is no automatic historical migration/deletion. See original-downloader-storage.md
 for deterministic collision-only suffixes and exact-owned-inode cleanup.
+
+
+## Latest correction: one named folder and one status message per album
+
+CONTROL_ARCHIVE_NAMED=true supersedes root-flat output for the current service:
+chat/topic named folder with media directly inside; no month/post/album hierarchy.
+Private state/manifests remain outside the public media root. Original naming and
+physical alias behavior are documented in original-downloader-storage.md.
+
+Each received item remains its own bounded durable download task, but status is grouped
+by exact owner + bot + private chat + Telegram media_group_id. Singles use message ID.
+A persisted 2-second quiet window coalesces natural arrivals; late members edit the
+SAME stored anchor (maximum Telegram album size 10). Two albums yield two status
+messages, never 20 per-item notifications and never a time-only merge. Aggregate text
+shows total/done/errors, and owner/chat/reply-bound task action buttons remain available.
+The existing preview worker ticks this persisted UI queue; no extra timer service.
+
+The first-send intent is committed before Telegram RPC. Unknown/failed first-send
+outcomes or a process death before message-ID persistence are marked ambiguous and
+never blindly sent again. A known anchor can be edited after restart without another
+send. Cancellation/shutdown leaves durable membership/state for recovery. Existing
+DONE tasks/old status messages are not re-enqueued or deleted retroactively. Progress
+notification failure cannot cause a media re-download/send.
