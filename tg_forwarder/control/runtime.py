@@ -161,8 +161,9 @@ async def run(inspect_url=None, health=False):
                 store.meta("bot_principal", bot_id)
                 engine = Engine(config, store, client, gate, delivery=BotDelivery(bot, positive(os.getenv("CONTROL_BOT_UPLOAD_MAX_BYTES", str(49*1024*1024)))), bridge=bridge, bot_id=bot_id)
                 controller = Controller(config, store, resolver, engine, bot)
+                controller.refresh_inbound_templates()
                 async def notify(task):
-                    if json.loads(task['payload']).get('inbound_notice'):
+                    if json.loads(task['payload']).get('inbound_notice') or json.loads(task['payload']).get('origin_notice'):
                         await controller.notify_task(task)
                     elif task["reply"] or task["state"] in ("done", "failed", "ambiguous"):
                         await controller.render_task(task["owner"], task["chat"], task["reply"] or None, task)

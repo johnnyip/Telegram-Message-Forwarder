@@ -219,3 +219,87 @@ changed rows refuse; replaying a plan cannot reset queued/running work. Apply do
 send messages or execute downloads: restart the same service to process the same tasks
 and edit their existing album anchor. This is NOT restoration/re-enqueue of old DONE
 photos, and no production retry was performed by source tests.
+
+
+## Album-level actions and mixed received media
+
+The primary album card now has ONE aggregate details control and, only when every
+member is a safely cached completed photo, ONE send-whole-album control. Tokens bind
+owner, authenticated bot, chat, exact stored anchor, member task IDs and payload revision.
+Late media membership invalidates older controls. Details update the SAME album card;
+no ten per-item button rows/messages. Cached-upload tasks have a distinct stable album
+origin (not the first member's task ID), retaining the existing send claims/receipts,
+protection/target guards and zero source/GetFile fallback. 2..10 compatible photos use
+one send_media_group. The user must click; nothing uploads automatically. One separate
+durable upload-status card stores its reply ID; unknown first-send outcomes never
+blindly create another card, and the original download card is not overwritten.
+
+Owned incoming grouped video/document/animation/audio is classified BEFORE original-post
+parsing. Unsupported message IDs/type/size/group are stored in private metadata, not
+fake download tasks. The same exact album status includes them: e.g. two photos done
+plus five videos not downloaded is 2/7, never a completed 2/2 album and never a partial
+"send whole album (2)" control. Genuine hidden text/original-link warnings remain; no
+text association is inferred from timing. Received typed videos up to the existing Cloud 20 MB limit now use the SAME Bot
+get_file transport; no new credentials/endpoints/MTProto lookup or size-limit workaround.
+
+Runtime invokes Controller.refresh_inbound_templates once per album-actions-video-v3 revision:
+only the TWO most recent existing known owner/bot anchors (reply>0, not ambiguous/sending/
+failed) are marked for edit. At most 32 retained DONE received updates are inspected to
+backfill unsupported media ONLY for those exact groups. This changes no update/offset/
+task/download state and creates no unknown anchors; it does not replay updates or delete
+old warnings. Verify the actual mixed card denominator after deployment; if relevant raw
+updates are outside that bounded retained window, stop and request an explicit targeted
+metadata plan rather than silently scanning history or inventing membership.
+
+
+### Received videos and mixed cached albums
+
+Typed SDK message.video is accepted only in the authorized owner private chat with
+verified runtime bot ID. A bounded known-version file-ID header checks video type/DC
+ONLY; it does NOT decode a bot ID or claim an immutable media ID. The exact received
+SDK fields (including file_id, unique ID, size, message/update principal, dimensions,
+duration, filename/MIME) are bound by the private payload digest. Current get_file must
+match unique ID/size and return a video-type header. Cloud >20,000,000-byte input is
+rejected before get_file and shown once in its exact album diagnostic. Photos retain
+their existing payload/naming/binding format unchanged. No document/animation support
+is added. Video naming uses the existing document/video formatter with SDK filename;
+absent filenames use a bounded video_<message-id>.mp4 fallback, labelled truthfully.
+
+Videos use no photo physical alias. Exact-message video caches have an atomic private
+per-message fingerprint/binding record; cached reuse/upload verifies it with existing
+path/UID/mode/size checks, and successful private manifests include SHA256. New downloads
+retain the existing owned temp, bounded response, fsync and no-clobber publication.
+Aggregate cached uploads validate ALL completed typed members (photo/video), order by
+received message ID, and use the existing mixed InputMediaPhoto/InputMediaVideo group
+transport and durable operation receipts. They never call get_file/source RPC.
+
+Recovery for the five already-retained received videos uses the EXISTING version-1
+plan/CLI, WITHOUT --retry-failed and without any new config:
+
+    python -m tg_forwarder.control.recover_inbound --plan <private-exact-five-plan.json>
+    python -m tg_forwarder.control.recover_inbound --plan <private-exact-five-plan.json> --apply --quiescent
+
+Entries remain exactly {update_id,payload_sha256}; owner_uid/bot_id/db and existing
+quiescence/token/flock guards remain required. ALL retained hashes/media payloads
+validate before mutation. Controller and CLI share register_payload under their native
+transaction: five new queued video tasks attach to the existing photo album notice,
+clear ONLY those same video IDs from unsupported metadata, retain its known reply ID,
+and bump generation. Repeating apply creates no duplicate tasks/members. Original two
+photo jobs, retained raw updates and polling offset remain unchanged. Apply registers
+only; restart the SAME service to download the five current Bot copies and edit the
+existing seven-member anchor. The startup template refresh must not reclassify supported
+videos as unsupported. Apply the exact five plan while quiescent BEFORE service restart;
+verify five real DONE/video files and the existing 7/7 card, not health alone. No media
+is uploaded unless the user clicks the complete mixed-album cached-send button.
+
+
+The v3 template refresh also persists exact supported-but-unqueued retained video
+membership placeholders (message/update IDs, raw payload SHA256, received binding),
+without creating tasks/updates or changing offsets. Thus the historical two-photo +
+five-retained-video card is 2/7 awaiting recovery, with NO partial whole-album button.
+Native registration verifies and clears those exact pending bindings atomically; already
+registered video tasks are never counted twice. Cached access now checks every AVAILABLE
+exact photo alias proof (owner/bot/variant/namespace, canonical alias cache reference,
+path/size/fingerprint), including legitimate aliases referencing a different message's
+cache key on the SAME canonical path. No proof is invented for legacy unindexed rows,
+no aliases are rebound during validation, and corruption blocks before any upload claim.

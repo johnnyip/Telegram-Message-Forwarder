@@ -74,10 +74,15 @@ class Controller:
             if command in ("/watches", "/unwatch"):
                 await self.watch_command(owner, chat, command, parts[1:])
                 return
-            if getattr(message, "photo", None):
-                from .inbound import enqueue
-                enqueue(self.store, self.config, update, self.engine.bot_id)
+            if getattr(message, "photo", None) or getattr(message,'video',None):
+                from .inbound import enqueue,ReceivedMediaLimit,record_unsupported
+                try:enqueue(self.store,self.config,update,self.engine.bot_id)
+                except ReceivedMediaLimit:
+                    if not record_unsupported(self.store,self.config,update,self.engine.bot_id):raise
                 return
+            if getattr(message,'media_group_id',None):
+                from .inbound import record_unsupported
+                if record_unsupported(self.store,self.config,update,self.engine.bot_id):return
             ref = from_message(message)
             media_group = getattr(message, "media_group_id", None)
             group_key = "input-album:"+str(owner)+":"+str(chat)+":"+str(media_group) if media_group else None
@@ -163,6 +168,9 @@ class Controller:
 
     async def callback(self, owner, chat, reply, data):
         # Every entry comes exclusively through actor + bound persisted capability.
+        if data.get('kind')=='inbound_album':
+            await self.album_callback(owner,chat,reply,data)
+            return
         if data.get("kind") == "task":
             await self.task_callback(owner, chat, reply, data)
             return
@@ -277,7 +285,7 @@ class Controller:
 
     async def notify_task(self, task):
         payload=json.loads(task['payload'])
-        key=payload.get('inbound_notice')
+        key=('cached-operation:'+task['id']) if payload.get('origin_notice') else payload.get('inbound_notice')
         if key:
             self.store.db.execute("UPDATE inbound_notices SET state=CASE WHEN state='sending' THEN 'sending' ELSE 'pending' END,generation=generation+1 WHERE key=? AND owner=? AND chat=? AND bot=? AND state NOT IN ('ambiguous','failed')",
                 (key,task['owner'],task['chat'],self.engine.bot_id))
@@ -293,19 +301,18 @@ class Controller:
                 self.store.db.execute("UPDATE inbound_notices SET state='failed' WHERE key=?",(row['key'],));return
             if row['state']=='sending':
                 self.store.db.execute("UPDATE inbound_notices SET state=? WHERE key=?",('pending' if row['reply'] else 'ambiguous',row['key']));return
-            ids=json.loads(row['payload'])
-            if not ids or len(ids)>10:raise ValueError('Invalid inbound notification membership')
-            tasks=[self.store.task(tid,row['owner'],row['chat']) for tid in ids]
-            for task in tasks:
-                p=json.loads(task['payload'])
-                if p.get('inbound_notice')!=row['key'] or p.get('bot_id')!=row['bot'] or p.get('source_kind')!='bot-inbound':raise PermissionError('Inbound notice binding mismatch')
-            done=sum(t['state']=='done' for t in tasks)
-            errors=sum(t['state'] in ('failed','ambiguous','cancelled') for t in tasks)
-            text='收到相簿' if json.loads(tasks[0]['payload'])['items'][0].get('album') else '收到相片'
-            text+='：'+str(len(tasks))+' 相；已完成 '+str(done)+'/'+str(len(tasks))+'；錯誤／取消 '+str(errors)
-            terminal=done+errors==len(tasks)
-            outcome='下載完成' if done==len(tasks) else ('部分完成' if done else '下載失敗') if terminal else '下載處理中／可在任務詳情查看'
-            text+='\n'+outcome
+            operation=row['key'].startswith('cached-operation:')
+            if operation:
+                ids=json.loads(row['payload'])
+                if len(ids)!=1:raise ValueError('Invalid cached operation notice')
+                tasks=[self.store.task(ids[0],row['owner'],row['chat'])]
+                payload=json.loads(tasks[0]['payload'])
+                if payload.get('action')!='cached_photos' or not payload.get('origin_notice') or row['key']!='cached-operation:'+tasks[0]['id']:raise PermissionError('Cached operation notice mismatch')
+                _,total,completed,_=self.task_counts(tasks[0])
+                text='傳送已下載相簿：'+tasks[0]['state']+'；已傳送 '+str(completed)+'/'+str(total)
+            else:
+                _,tasks,unsupported,revision=self.engine.album_snapshot(row['owner'],row['chat'],row['key'])
+                text=await self.album_text(row,tasks,unsupported)
             reply=row['reply']
             try:
                 if not reply:
@@ -316,11 +323,11 @@ class Controller:
                     reply=getattr(sent,'message_id',None)
                     if type(reply) is not int or reply<=0:raise RuntimeError('Unconfirmed inbound notice send')
                     self.store.db.execute('UPDATE inbound_notices SET reply=? WHERE key=?',(reply,row['key']))
-                rows=[]
-                for task in tasks:
-                    buttons=await self.task_buttons(row['owner'],row['chat'],reply,task)
-                    buttons[0]=self.button('詳情 '+task['id'][-6:],row['owner'],row['chat'],reply,{'kind':'task','task':task['id'],'do':'details'})
-                    rows.append(buttons)
+                if operation:
+                    self.store.set_task(tasks[0]['id'],reply=reply)
+                    rows=[await self.task_buttons(row['owner'],row['chat'],reply,tasks[0])]
+                else:
+                    rows=await self.album_buttons(row,tasks,unsupported,revision,reply)
                 await self.edit(row['chat'],reply,text,rows)
                 self.store.db.execute("UPDATE inbound_notices SET state=CASE WHEN generation=? THEN 'sent' ELSE 'pending' END WHERE key=?",(row['generation'],row['key']))
             except RetryAfter as exc:
@@ -331,6 +338,92 @@ class Controller:
                 raise
             except Exception:
                 self.store.db.execute("UPDATE inbound_notices SET state=? WHERE key=?",('failed' if reply else 'ambiguous',row['key']))
+
+    async def album_text(self,row,tasks,unsupported):
+        total=len(tasks)+len(unsupported);done=sum(t['state']=='done' for t in tasks)
+        errors=sum(t['state'] in ('failed','ambiguous','cancelled') for t in tasks)
+        text='收到相簿／相片：'+str(total)+' 項；已完成 '+str(done)+'/'+str(total)+'；錯誤／取消 '+str(errors)
+        if unsupported:
+            counts={kind:sum(v['kind']==kind for v in unsupported) for kind in sorted({v['kind'] for v in unsupported})}
+            names={'video':'影片','document':'文件','animation':'動畫','audio':'音訊'}
+            text+='\n'+ '；'.join('未下載'+names.get(k,k)+' '+str(v) for k,v in counts.items())
+            awaiting=sum(v.get('state')=='awaiting-task' for v in unsupported)
+            if awaiting:text+='\n影片尚未下載／待補做 '+str(awaiting)
+            if awaiting<len(unsupported):text+='\n其餘媒體超過影片 Cloud 20 MB 上限／類型未支援。'
+            text+='\n不會當作整組完成或只傳送部分媒體。'
+        terminal=done+errors+len(unsupported)==total and not any(v.get('state')=='awaiting-task' for v in unsupported)
+        text+='\n'+('下載完成' if done==total else ('部分完成' if done else '下載失敗／尚未下載') if terminal else '下載處理中／可在相簿詳情查看')
+        if self.store.get_meta('album-view:'+row['key'],'')=='details':
+            for task in sorted(tasks,key=lambda t:json.loads(t['payload'])['items'][0]['id']):
+                item=json.loads(task['payload'])['items'][0]
+                line=str(item['id'])+' '+task['state']
+                if task['state']=='done':
+                    try:
+                        path,_=await self.engine.cached_file_async(item)
+                        line+=' '+str(path.relative_to(self.engine.archive.root))[:220]
+                    except (ValueError,OSError):line+=' 快取不可用（不重新下載）'
+                text+='\n'+line
+            for item in unsupported:text+='\n'+str(item['id'])+' '+item['kind']+' 尚未下載'
+        return text[:3900]
+
+    async def album_buttons(self,row,tasks,unsupported,revision,reply):
+        base={'kind':'inbound_album','notice':row['key'],'revision':revision}
+        detail=self.store.get_meta('album-view:'+row['key'],'')=='details'
+        buttons=[self.button('相簿摘要' if detail else '相簿詳情',row['owner'],row['chat'],reply,{**base,'do':'summary' if detail else 'details'})]
+        if tasks and not unsupported and all(t['state']=='done' for t in tasks):
+            try:
+                payload=self.engine.cached_album_payload(row['owner'],row['chat'],row['key'],revision)
+                used=0
+                for item in payload['items']:
+                    _,size=await self.engine.cached_file_async(item,used);used+=size
+            except (ValueError,PermissionError,OSError):pass
+            else:buttons.append(self.button('📤 傳送已下載相簿到此對話（'+str(len(payload['items']))+'）',row['owner'],row['chat'],reply,{**base,'do':'cached_photos'}))
+        return [buttons]
+
+    async def album_callback(self,owner,chat,reply,data):
+        revision=data.get('revision')
+        if not isinstance(revision,str) or len(revision)!=64:raise ValueError('Exact album revision required')
+        row,tasks,unsupported,revision=self.engine.album_snapshot(owner,chat,data.get('notice'),reply=reply,revision=data.get('revision'))
+        action=data.get('do')
+        if action in ('details','summary'):
+            self.store.meta('album-view:'+row['key'],'details' if action=='details' else '')
+            await self.edit(chat,reply,await self.album_text(row,tasks,unsupported),await self.album_buttons(row,tasks,unsupported,revision,reply))
+        elif action=='cached_photos':
+            payload=self.engine.cached_album_payload(owner,chat,row['key'],revision)
+            used=0
+            for item in payload['items']:
+                _,size=await self.engine.cached_file_async(item,used);used+=size
+            # One operation, one separate durable status anchor. No upload occurs
+            # in this callback; only the existing worker may execute cached_photos.
+            with self.store.transaction():
+                task=self.store.insert_task(owner,chat,0,payload)
+                key='cached-operation:'+task['id']
+                self.store.db.execute("INSERT OR IGNORE INTO inbound_notices(key,owner,chat,bot,payload,due,state) VALUES(?,?,?,?,?,0,'pending')",(key,owner,chat,self.engine.bot_id,encode([task['id']])))
+        else:raise ValueError('Unsupported album action')
+
+    def refresh_inbound_templates(self):
+        from telegram import Update
+        from .inbound import OWNER,record_unsupported,record_pending_video
+        if OWNER not in self.config.allowed or not self.engine.bot_id:return
+        marker='inbound-ui-template:'+str(self.engine.bot_id)+':'+str(OWNER)
+        if self.store.get_meta(marker,'')=='album-actions-video-v3':return
+        known={r['key'] for r in self.store.db.execute("SELECT key FROM inbound_notices WHERE owner=? AND chat=? AND bot=? AND reply>0 AND state NOT IN ('sending','ambiguous','failed') ORDER BY rowid DESC LIMIT 2",(OWNER,OWNER,self.engine.bot_id))}
+        # Exact persisted received updates only; never poll/replay/execute media.
+        rows=self.store.db.execute("SELECT payload FROM updates WHERE state='done' ORDER BY id DESC LIMIT 32").fetchall()
+        for item in rows:
+            try:
+                update=Update.de_json(json.loads(item['payload']),None)
+                msg=update.message
+                if msg is None or not msg.media_group_id:continue
+                key=digest(['inbound-notice',OWNER,self.engine.bot_id,OWNER,msg.media_group_id])
+                if key not in known:continue
+                if msg.video and (msg.video.file_size is None or 0<msg.video.file_size<=20_000_000):
+                    record_pending_video(self.store,self.config,item['payload'],self.engine.bot_id)
+                else:record_unsupported(self.store,self.config,update,self.engine.bot_id,require_existing=True)
+            except (ValueError,PermissionError):continue
+        with self.store.transaction():
+            self.store.db.execute("UPDATE inbound_notices SET state='pending',generation=generation+1 WHERE key IN (SELECT key FROM inbound_notices WHERE owner=? AND chat=? AND bot=? AND reply>0 AND state NOT IN ('sending','ambiguous','failed') ORDER BY rowid DESC LIMIT 2)",(OWNER,OWNER,self.engine.bot_id))
+            self.store.meta(marker,'album-actions-video-v3')
 
     async def render_task(self, owner, chat, reply, task):
         # Re-read by owner/chat; notification payloads and stale buttons are not authority.

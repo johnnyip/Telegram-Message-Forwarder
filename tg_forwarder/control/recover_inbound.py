@@ -10,7 +10,7 @@ import stat
 from telegram import Update
 from .config import Config, positive
 from .filesystems import guard_state
-from .inbound import OWNER, payload_for
+from .inbound import OWNER, payload_for, register_payload
 from .store import Store, encode, digest
 
 
@@ -78,7 +78,7 @@ def recover(config, plan, *, apply=False, quiescent=False, retry_failed=False):
         try:
             with store.transaction():
                 payloads = prepare(store.db)
-                tasks = [store.retry(v['task_id'],OWNER,OWNER,expected_attempt=v['expected_attempt'],failed_only=True) for v in entries] if retry_failed else [store.insert_task(OWNER,OWNER,0,p) for p in payloads]
+                tasks = [store.retry(v['task_id'],OWNER,OWNER,expected_attempt=v['expected_attempt'],failed_only=True) for v in entries] if retry_failed else [register_payload(store,p,bot_id) for p in payloads]
             return {'mode':'retry-failed-only' if retry_failed else 'enqueue-only','validated_updates':len(tasks),'task_ids':[t['id'] for t in tasks]}
         finally:store.close()
 

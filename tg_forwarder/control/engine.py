@@ -221,6 +221,46 @@ class Engine:
             return types.InputPeerChannel(-i["chat"]-1000000000000, i["access_hash"])
         return i["chat"]
 
+    def album_snapshot(self, owner, chat, key, *, reply=None, revision=None):
+        from .inbound import OWNER
+        if owner!=OWNER or chat!=owner or owner not in self.config.allowed:raise PermissionError('Private owner album required')
+        row=self.store.db.execute('SELECT * FROM inbound_notices WHERE key=? AND owner=? AND chat=? AND bot=?',(key,owner,chat,self.bot_id)).fetchone()
+        if row is None or (reply is not None and row['reply']!=reply):raise PermissionError('Album anchor binding mismatch')
+        ids=json.loads(row['payload']);unsupported=json.loads(self.store.get_meta('inbound-unsupported:'+key,'[]'))
+        if not 1<=len(ids)+len(unsupported)<=10 or len(ids)!=len(set(ids)):raise ValueError('Invalid album membership')
+        tasks=[self.store.task(tid,owner,chat) for tid in ids]
+        albums=set()
+        for task in tasks:
+            p=json.loads(task['payload'])
+            if p.get('inbound_notice')!=key or p.get('bot_id')!=self.bot_id or p.get('source_kind')!='bot-inbound' or p.get('action')!='download' or len(p['items'])!=1:raise PermissionError('Album task binding mismatch')
+            item=p['items'][0]
+            if item['chat']!=owner or item.get('bot_id')!=self.bot_id or item['kind'] not in ('photo','video') or item.get('source_kind')!='bot-inbound' or item.get('media_id')!=('bot-inbound-video:' if item['kind']=='video' else 'bot-inbound:')+str(self.bot_id)+':'+str(item.get('file_unique_id')):raise PermissionError('Album photo binding mismatch')
+            if item['kind']=='video':
+                from .inbound import validate_video
+                validate_video(item,self.bot_id)
+            albums.add(item.get('album'))
+        albums.update(item.get('album') for item in unsupported)
+        if len(albums)>1:raise ValueError('Mixed album identity')
+        album=next(iter(albums))
+        single=json.loads(tasks[0]['payload'])['items'][0]['id'] if tasks else None
+        if key!=digest(['inbound-notice',owner,self.bot_id,chat,album if album else 'single:'+str(single)]):raise PermissionError('Album namespace mismatch')
+        if len({json.loads(t['payload'])['items'][0]['id'] for t in tasks}|{i['id'] for i in unsupported})!=len(tasks)+len(unsupported):raise ValueError('Duplicate album message membership')
+        current=digest([key,[(t['id'],digest(t['payload'])) for t in tasks],unsupported])
+        if revision is not None and revision!=current:raise ValueError('相簿內容已更新，請用最新按鈕')
+        return row,tasks,unsupported,current
+
+    def cached_album_payload(self,owner,chat,key,revision):
+        if not isinstance(revision,str) or not re.fullmatch(r'[0-9a-f]{64}',revision):raise ValueError('Exact album revision required')
+        row,tasks,unsupported,current=self.album_snapshot(owner,chat,key,revision=revision)
+        if unsupported or not tasks or any(t['state']!='done' for t in tasks):raise ValueError('相簿未完整下載，不會只傳送部分相片')
+        sources=[json.loads(t['payload']) for t in tasks]
+        photos=sorted([p['items'][0] for p in sources],key=lambda i:i['id'])
+        if chat!=owner or (chat,None) not in self.config.targets:raise PermissionError('Private destination not allowed')
+        payload={'action':'cached_photos','origin_task':'inbound-album:'+digest([key,current]),'origin_notice':key,'origin_revision':current,
+            'origin_tasks':[t['id'] for t in tasks],'target':[chat,None],'snapshot':sources[0]['snapshot'],'items':photos}
+        self.validate(payload,check_space=False)
+        return payload
+
     def cached_photo_payload(self, task):
         original = self.store.task(task["id"],task["owner"],task["chat"])
         source = json.loads(original["payload"])
@@ -254,15 +294,56 @@ class Engine:
             raise ValueError("媒體大小超過上限")
         return path,size
 
+    async def cached_photo_proof(self,selected,path,size):
+        if selected.get('source_kind')!='bot-inbound' or selected.get('kind')!='photo':return
+        from .inbound import OWNER
+        if selected.get('chat')!=OWNER or selected.get('bot_id')!=self.bot_id or selected.get('media_id')!='bot-inbound:'+str(self.bot_id)+':'+str(selected.get('file_unique_id')):raise PermissionError('Cached photo principal mismatch')
+        identity=self.photo_alias_identity({'owner':OWNER},{},selected)
+        if identity is None:return
+        candidates={encode(identity):identity,encode(identity[:7]+[['root-flat']]):identity[:7]+[['root-flat']]}
+        from tg_forwarder.canonical_media import fingerprint
+        for candidate in candidates.values():
+            raw=self.store.get_meta('flat_photo_alias:'+digest(candidate),'')
+            if not raw:continue  # Legacy rows without a retained proof keep baseline policy.
+            record=json.loads(raw)
+            if record.get('identity')!=candidate or record.get('path')!=str(path) or record.get('size')!=size:raise ValueError('Cached photo alias proof binding mismatch')
+            reference=self.store.db.execute('SELECT path,size FROM cache WHERE key=?',(record['cache_key'],)).fetchone()
+            if reference is None or reference['path']!=str(path) or reference['size']!=size:raise ValueError('Cached photo alias reference missing/changed')
+            if await _io(fingerprint,path)!=record['proof']:raise ValueError('Cached photo bytes changed; no source fallback')
+            return  # A verified current namespace supersedes an obsolete-layout alias.
+
+    async def video_proof(self,selected,path,size):
+        if selected.get('source_kind')!='bot-inbound' or selected.get('kind')!='video':return
+        from .inbound import validate_video
+        validate_video(selected,self.bot_id)
+        key=digest([selected['chat'],selected['id'],selected['media_id']])
+        record=json.loads(self.store.get_meta('inbound-video-proof:'+key,'null'))
+        if not record or record['binding']!=selected['received_binding'] or record['path']!=str(path) or record['size']!=size:raise ValueError('Received video cache proof binding missing/changed')
+        from tg_forwarder.canonical_media import fingerprint
+        if await _io(fingerprint,path)!=record['proof']:raise ValueError('Received video cached bytes changed; no source fallback')
+
+    async def commit_video_cache(self,key,path,size,selected):
+        from tg_forwarder.canonical_media import fingerprint
+        proof=await _io(fingerprint,path)
+        with self.store.transaction():
+            self.store.db.execute('INSERT OR REPLACE INTO cache VALUES(?,?,?)',(key,str(path),size))
+            self.store.meta('inbound-video-proof:'+key,encode({'binding':selected['received_binding'],'path':str(path),'size':size,'proof':proof}))
+
     async def cached_file_async(self,selected,used=0):
         key=digest([selected["chat"],selected["id"],selected.get("media_id","")])
         cached=self.store.db.execute("SELECT * FROM cache WHERE key=?",(key,)).fetchone()
         if cached is None:raise ValueError("已下載圖片快取記錄遺失；此動作不會重新下載")
-        return await _io(self._cached_path,dict(cached),selected,used)
+        path,size=await _io(self._cached_path,dict(cached),selected,used)
+        await self.cached_photo_proof(selected,path,size)
+        await self.video_proof(selected,path,size)
+        return path,size
 
     async def validate_cached_task(self, task, payload):
-        original = self.store.task(payload.get("origin_task"),task["owner"],task["chat"])
-        expected = self.cached_photo_payload(original)
+        if payload.get('origin_notice'):
+            expected=self.cached_album_payload(task['owner'],task['chat'],payload['origin_notice'],payload.get('origin_revision'))
+        else:
+            original = self.store.task(payload.get("origin_task"),task["owner"],task["chat"])
+            expected = self.cached_photo_payload(original)
         if encode(expected) != encode(payload):
             raise ValueError("已下載圖片任務與原始任務不符")
         used = 0
@@ -473,9 +554,12 @@ class Engine:
             from .inbound import OWNER
             if (task["owner"] != OWNER or task["chat"] != OWNER or i["chat"] != OWNER
                     or i.get("bot_id") != self.bot_id or payload.get("bot_id") != self.bot_id
-                    or payload["action"] != "download" or i["kind"] != "photo"
-                    or i["media_id"] != "bot-inbound:"+str(self.bot_id)+":"+i["file_unique_id"]):
-                raise PermissionError("Received photo principal/action mismatch")
+                    or payload["action"] != "download" or i["kind"] not in ('photo','video')
+                    or i["media_id"] != ("bot-inbound-video:" if i['kind']=='video' else "bot-inbound:")+str(self.bot_id)+":"+i["file_unique_id"]):
+                raise PermissionError("Received media principal/action mismatch")
+            if i['kind']=='video':
+                from .inbound import validate_video
+                validate_video(i,self.bot_id)
         key = digest([i["chat"], i["id"], i.get("media_id", "")])
         async with self.download_lock:
             identity=self.photo_alias_identity(task,payload,i) if inbound else None
@@ -501,9 +585,10 @@ class Engine:
                         if path.is_file() and cached["size"]>0 and path.stat().st_size==cached["size"] and (not i.get("size") or i["size"]==cached["size"]):
                             return path,cached["size"]
                         return None
-                    found=await self.reusable_photo_path(dict(cached),i,used) if identity is not None else await _io(lookup)
+                    found=await self.reusable_photo_path(dict(cached),i,used) if inbound else await _io(lookup)
                     if found:
                         path,size=found
+                        await self.video_proof(i,path,size)
                         if used+size>self.config.max_bytes:raise ValueError("媒體大小超過上限")
                         if identity is not None:
                             if self.archive.named:
@@ -599,7 +684,8 @@ class Engine:
                 await _io(self.archive.space)
                 # link() is atomic no-clobber; then remove ONLY this task-owned tempfile.
                 await _io(self.finalize,temp,path,owned_identity)
-                await self.remember_photo(key,path,size,identity,stale_alias=stale_alias)
+                if inbound and i['kind']=='video':await self.commit_video_cache(key,path,size,i)
+                else:await self.remember_photo(key,path,size,identity,stale_alias=stale_alias)
                 await self.publish(i, path)
                 return path, size
             finally:
@@ -614,14 +700,15 @@ class Engine:
         from .inbound import CLOUD_DOWNLOAD_LIMIT
         bot = getattr(self.delivery, "bot", None)
         if bot is None or self.bot_id is None:
-            raise ValueError("Received photo bot transport unavailable")
+            raise ValueError("Received media bot transport unavailable")
+        from .inbound import video_header
         remote = await bot.get_file(selected["file_id"])
-        if remote.file_unique_id != selected["file_unique_id"]:
-            raise ValueError("Received photo file identity mismatch")
+        if remote.file_unique_id != selected["file_unique_id"] or (selected['kind']=='video' and video_header(getattr(remote,'file_id',None)) is None):
+            raise ValueError("Received media file identity mismatch")
         expected = remote.file_size
         if expected is not None and (expected <= 0 or expected > CLOUD_DOWNLOAD_LIMIT
                 or (selected.get("size") is not None and expected != selected["size"])):
-            raise ValueError("Received photo size mismatch / Bot API 20 MB limit")
+            raise ValueError("Received media size mismatch / Bot API 20 MB limit")
         await _io(self.archive.space, expected or 0)
         engine = self
         class Media:
@@ -827,7 +914,11 @@ class Engine:
                         path, size = await self.download(task, payload, i, used)
                     used += size
                     files.append(path)
-                    manifest["items"].append({**i, "path": str(path.relative_to(self.archive.root)), "download": "done", "bytes": size})
+                    entry={**i,"path":str(path.relative_to(self.archive.root)),"download":"done","bytes":size}
+                    if i.get('source_kind')=='bot-inbound' and i['kind']=='video':
+                        proof=json.loads(self.store.get_meta('inbound-video-proof:'+digest([i['chat'],i['id'],i['media_id']]),'null'))
+                        if proof:entry['sha256']=proof['proof']['sha256']
+                    manifest['items'].append(entry)
                     count += 1
                     self.store.set_task(task["id"], progress=count)
                     await _io(self.archive.manifest,payload["snapshot"], task["id"], manifest)
@@ -852,10 +943,10 @@ class Engine:
             state = "delayed" if task["attempt"] < self.config.retries else "failed"
             self.store.set_task(task["id"], state=state, due=due, error="FloodWait: "+str(delay)+" 秒")
         except (Forbidden, BadRequest) as exc:
-            self.store.set_task(task["id"], state="failed", error=(("收到相片下載被拒絕（"+type(exc).__name__+"）；Bot API 單檔上限 20 MB，原接收記錄保留") if inbound else "目的地權限／媒體限制拒絕（"+type(exc).__name__+"）；下載檔保留，未改用原生轉發"))
+            self.store.set_task(task["id"], state="failed", error=(("收到媒體下載被拒絕（"+type(exc).__name__+"）；Bot API 單檔上限 20 MB，原接收記錄保留") if inbound else "目的地權限／媒體限制拒絕（"+type(exc).__name__+"）；下載檔保留，未改用原生轉發"))
         except Exception as exc:
             state = "delayed" if task["attempt"] < self.config.retries and not isinstance(exc, (ValueError, PermissionError, OSError, BadRequest, Forbidden)) else "failed"
-            self.store.set_task(task["id"], state=state, due=time.time()+min(60, 2**task["attempt"]), error=(("Received photo download failed ("+type(exc).__name__+"); private API details omitted") if inbound else (str(exc)[:300] if isinstance(exc, (ValueError, PermissionError, OSError)) else type(exc).__name__)))
+            self.store.set_task(task["id"], state=state, due=time.time()+min(60, 2**task["attempt"]), error=(("Received media download failed ("+type(exc).__name__+"); private API details omitted") if inbound else (str(exc)[:300] if isinstance(exc, (ValueError, PermissionError, OSError)) else type(exc).__name__)))
         finally:
             row = self.store.task(task["id"], task["owner"], task["chat"])
             manifest["state"], manifest["error"] = row["state"], row["error"]
