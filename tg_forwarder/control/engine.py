@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import tempfile
 import time
 from telethon import types
@@ -12,7 +13,7 @@ from telethon.errors import FloodWaitError, RPCError
 from telegram.error import BadRequest, Forbidden, RetryAfter
 from .store import digest, encode
 from .filesystems import guard_archive
-from tg_forwarder.canonical_media import relative as original_relative, secure_path
+from tg_forwarder.canonical_media import relative as original_relative, filename as original_filename, truncate_filename, secure_path
 from tg_forwarder.shared_media import _io, _join
 from types import SimpleNamespace
 from tg_forwarder.shared_media import media_identity, AmbiguousDelivery, SharedUnavailable, definite_rejection
@@ -50,7 +51,9 @@ class RateGate:
 
 
 class Archive:
-    def __init__(self, root, reserve_bytes, expected_mount=None, expected_fstypes=("nfs","nfs4"), archive_timezone="UTC"):
+    def __init__(self, root, reserve_bytes, expected_mount=None, expected_fstypes=("nfs","nfs4"), archive_timezone="UTC", *, flat=False, metadata_dir=None):
+        self.flat, self.metadata_dir = flat, Path(metadata_dir).absolute() if metadata_dir else None
+        if flat and self.metadata_dir is None:raise ValueError("Flat archive requires private metadata directory")
         self.timezone = archive_timezone
         self.expected_mount, self.expected_fstypes = expected_mount, expected_fstypes
         self.root = Path(root).absolute()
@@ -87,6 +90,10 @@ class Archive:
         return self.path(str(int(snapshot["peer"])), date+"_"+str(int(snapshot["post"])))
 
     def file(self, snapshot, i):
+        if self.flat:
+            if not i.get('archive_meta'):
+                raise ValueError('Original filename metadata required for flat layout')
+            return self.path(original_filename(i))
         if i.get("archive_meta"):
             rel = original_relative(i,self.timezone)
             return self.path(*rel.parts)
@@ -102,9 +109,22 @@ class Archive:
             raise OSError("磁碟可用空間不足（保留空間限制）")
 
     def manifest(self, snapshot, tid, data):
-        base = self.path(".metadata")
-        base.mkdir(parents=True, exist_ok=True,mode=0o700)
-        path = self.path(".metadata", "manifest_"+tid+".json")
+        if self.flat:
+            from .filesystems import guard_state
+            base = self.metadata_dir
+            guard_state(base)
+            if base.is_relative_to(self.root):raise ValueError('Flat metadata must be outside public media root')
+            base.mkdir(parents=True,exist_ok=True,mode=0o700)
+            for private in (base.parent,base):
+                info=private.lstat()
+                if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode & 0o077:
+                    raise ValueError('Manifest state directory must be private and owned')
+            if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}',tid):raise ValueError('Invalid manifest task ID')
+            path=base/('manifest_'+tid+'.json')
+        else:
+            base = self.path(".metadata")
+            base.mkdir(parents=True, exist_ok=True,mode=0o700)
+            path = self.path(".metadata", "manifest_"+tid+".json")
         fd, temp = tempfile.mkstemp(prefix=".manifest-", dir=base)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -128,7 +148,7 @@ class Archive:
 class Engine:
     def __init__(self, config, store, client, gate, notify=None, delivery=None, bridge=None, bot_id=None):
         self.config, self.store, self.client, self.gate = config, store, client, gate
-        self.archive = Archive(config.root, config.reserve_bytes, config.expected_archive_mount, config.expected_archive_fstypes, config.archive_timezone)
+        self.archive = Archive(config.root, config.reserve_bytes, config.expected_archive_mount, config.expected_archive_fstypes, config.archive_timezone, flat=getattr(config,"archive_flat",False), metadata_dir=config.db.parent/"manifests")
         self.notify = notify
         self.delivery = delivery
         self.bridge, self.bot_id = bridge, bot_id
@@ -228,9 +248,31 @@ class Engine:
             _,size = await self.cached_file_async(selected,used)
             used += size
 
-    def finalize(self, temporary, path):
+    async def flat_destination(self, snapshot, selected, key):
+        primary=await _io(self.archive.file,snapshot,selected)
+        # Existing cached identities are handled before this path. Unknown existing
+        # names are NEVER adopted by size; preserve them and disambiguate only once.
+        occupied = await _io(lambda:primary.exists() or primary.is_symlink()) or self.store.db.execute('SELECT 1 FROM cache WHERE path=? AND key!=?',(str(primary),key)).fetchone()
+        if not occupied:return primary
+        suffix=' - '+key[:16]
+        stem=truncate_filename(primary.stem+primary.suffix,230-len(suffix))
+        base=Path(stem)
+        alternate=await _io(self.archive.path,base.stem+suffix+base.suffix)
+        if await _io(lambda:alternate.exists() or alternate.is_symlink()) or self.store.db.execute('SELECT 1 FROM cache WHERE path=? AND key!=?',(str(alternate),key)).fetchone():
+            raise ValueError('Flat filename collision requires verification; existing file not overwritten')
+        return alternate
+
+    def finalize(self, temporary, path, identity=None):
         self.archive.path(*path.relative_to(self.archive.root).parts)
+        if identity is not None:
+            current=os.lstat(temporary)
+            if not stat.S_ISREG(current.st_mode) or (current.st_dev,current.st_ino)!=identity:
+                raise ValueError('Owned download temporary replaced')
         os.link(temporary,path,follow_symlinks=False)
+        if identity is not None:
+            published=os.lstat(path)
+            if not stat.S_ISREG(published.st_mode) or (published.st_dev,published.st_ino)!=identity:
+                raise ValueError('Finalized download inode changed; not registered')
         directory=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
         try:os.fsync(directory)
         finally:os.close(directory)
@@ -291,7 +333,7 @@ class Engine:
                     return path,size
             self.check(task)
             # Original downloader skips a valid finalized destination before downloading.
-            if i.get("archive_meta"):
+            if i.get("archive_meta") and not self.archive.flat:
                 candidate = await _io(self.archive.file,payload["snapshot"],i)
                 def existing():
                     if not candidate.exists():return None
@@ -308,7 +350,7 @@ class Engine:
                     self.store.db.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)",(key,str(path),size))
                     await self.publish(i,path)
                     return path,size
-            if self.bridge is not None and not inbound:
+            if self.bridge is not None and not inbound and (not self.archive.flat or i.get("archive_meta")):
                 imported = await self.import_shared(task, payload, i, key, used)
                 if imported is not None:
                     return imported
@@ -333,14 +375,20 @@ class Engine:
                 entity = await self.client.get_entity(self.peer(i))
                 metadata = {**current["archive_meta"],"title":getattr(entity,"title",None) or str(i["chat"])}
                 naming = {**i,"archive_meta":metadata}
-            path = await _io(self.archive.file,payload["snapshot"], naming)
+            if self.archive.flat:
+                path = await self.flat_destination(payload['snapshot'],naming,key)
+            else:
+                path = await _io(self.archive.file,payload["snapshot"], naming)
             await _io(lambda:path.parent.mkdir(parents=True,exist_ok=True))
-            # Recheck every component after mkdir; archive is operator-owned, not shared-writable.
+            # Recheck components after mkdir; flat roots may be public-writable, so
+            # publication/cleanup additionally bind to this task-owned temporary inode.
             await _io(lambda:self.archive.path(*path.relative_to(self.archive.root).parts))
             if await _io(path.exists):
                 # Orphan (crash before cache commit): do not overwrite unverifiable bytes.
                 raise ValueError("未記錄既有檔案，需管理員核對，未覆寫")
             fd, temp = await self.download_temporary(path.parent)
+            owned_info=os.fstat(fd)
+            owned_identity=(owned_info.st_dev,owned_info.st_ino)
             expected_total = [None]
             async def progress(done, total):
                 if total and total > 0:
@@ -366,13 +414,15 @@ class Engine:
                 self.check(task)
                 await _io(self.archive.space)
                 # link() is atomic no-clobber; then remove ONLY this task-owned tempfile.
-                await _io(self.finalize,temp,path)
+                await _io(self.finalize,temp,path,owned_identity)
                 self.store.db.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)", (key, str(path), size))
                 await self.publish(i, path)
                 return path, size
             finally:
                 def cleanup():
-                    if os.path.isfile(temp) and not os.path.islink(temp):os.unlink(temp)
+                    try:current=os.lstat(temp)
+                    except FileNotFoundError:return
+                    if stat.S_ISREG(current.st_mode) and (current.st_dev,current.st_ino)==owned_identity:os.unlink(temp)
                 await _io(cleanup)
 
     async def inbound_media(self, task, selected, used):
@@ -447,7 +497,7 @@ class Engine:
         if used + size > self.config.max_bytes:
             raise ValueError("媒體大小超過上限")
         await _io(self.archive.space,size)
-        path = await _io(self.archive.file,payload["snapshot"], selected)
+        path = await self.flat_destination(payload['snapshot'],selected,key) if self.archive.flat else await _io(self.archive.file,payload["snapshot"], selected)
         await _io(lambda:path.parent.mkdir(parents=True,exist_ok=True))
         await _io(lambda:self.archive.path(*path.relative_to(self.archive.root).parts))
         staging=await _io(lambda:tempfile.TemporaryDirectory(prefix=".shared-",dir=path.parent))
@@ -463,8 +513,10 @@ class Engine:
                 self.archive.space()
                 with temp.open("rb") as stream:os.fsync(stream.fileno())
             await _io(validate_import)
+            info=await _io(lambda:os.lstat(temp))
+            owned_identity=(info.st_dev,info.st_ino)
             self.check(task)
-            await _io(self.finalize,temp,path)
+            await _io(self.finalize,temp,path,owned_identity)
             self.store.db.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)", (key, str(path), size))
         finally:
             await _io(staging.cleanup)

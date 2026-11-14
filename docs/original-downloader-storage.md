@@ -25,6 +25,40 @@ CONTROL_ARCHIVE_TIMEZONE defaults explicitly to UTC provisionally; original runt
 local timezone, historical chat titles and installed configuration still need parent
 confirmation. Do not silently switch to HKT or guess missing historical names.
 
+## Current owner-requested flat layout (supersedes new nested downloads)
+
+Set CONTROL_ARCHIVE_FLAT=true for the current control service. All NEW MTProto
+and private inbound photo downloads then publish directly in MEDIA_ARCHIVE_DIR
+(the existing TG_Download root): no owner/chat/month/group/discussion directories.
+Other roles/library callers retain their existing default false; this is a strict
+true/false setting, not a new storage framework. No chmod/chown/ACL change is made.
+
+The SAME pinned filename() codec remains authoritative: message-ID prefix, original
+Document filename/extension or decoded photo stable unique ID, original sanitization,
+NFC and 230-byte truncation. Modern minor-61 photos use the existing verified codec;
+unknown versions retain the explicitly labelled stable fallback. Flattening removes
+ONLY directory components, not original filename semantics. On an actual collision
+with an unknown/different physical identity, append " - <16 hex physical-key digest>"
+before the extension, retaining the byte bound. This necessary collision-only
+exception avoids overwriting unrelated same-name documents/photos across chats.
+Unknown same-size files are NOT adopted as completed downloads. A colliding suffixed
+name fails closed, never grows a numbered series and never overwrites it.
+
+Manifest metadata goes to the EXISTING private local control-state parent of
+CONTROL_DB, under manifests/, never the public 0777 media root. The state directories
+must be process-owned/private and local; secrets/file IDs remain sanitized. All
+partial downloads remain task-owned temporary files on the destination filesystem;
+publication is atomic no-clobber and verifies the exact owned inode. Cleanup removes
+only that owned inode, never an unrelated replacement. An untrusted writable root
+can cause denial/replacement, but cannot authorize an unknown file by its size.
+
+Existing cache paths, nested originals (including the known 87,623,746-byte video),
+canonical references, manifests, task IDs and receipts remain readable/unchanged.
+An already cached old path is reused, not copied into a second flat payload. No
+migration, relocation, deletion or historical directory cleanup is performed by
+this setting. The exact migration procedure below remains separately authorized
+operator work and MUST NOT be run merely to enable flat new downloads.
+
 ## One permanent payload
 
 Control canonical files are permanent original-format downloads. Shared indexes point

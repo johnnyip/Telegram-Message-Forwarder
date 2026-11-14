@@ -143,3 +143,13 @@ worker before handoff. Cancellation joins acquisition and shield-joins cleanup,
 closing the FD and unlinking only the matching owned inode. Tests cancel actual
 inbound and MTProto Engine.execute calls after mkstemp creation but before worker
 return, including repeated cancellation, and verify absent temp plus EBADF.
+
+
+### Flat permanent downloads
+
+The current requested layout uses CONTROL_ARCHIVE_FLAT=true: inbound and MTProto
+files share one permanent TG_Download media folder with the pinned original logical
+filenames. No new owner/month/group subfolders. New manifests stay in private local
+control state, not that public root. Existing nested cache files remain compatible;
+there is no automatic historical migration/deletion. See original-downloader-storage.md
+for deterministic collision-only suffixes and exact-owned-inode cleanup.

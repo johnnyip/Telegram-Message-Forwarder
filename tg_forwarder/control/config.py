@@ -46,6 +46,7 @@ class Config:
     archive_timezone: str = "UTC"
     expected_archive_mount: object = None
     expected_archive_fstypes: tuple = ("nfs", "nfs4")
+    archive_flat: bool = False
 
     @classmethod
     def from_env(cls):
@@ -81,6 +82,10 @@ class Config:
         if expected and not Path(expected).is_absolute():
             raise ValueError("expected archive mount must be absolute")
         from zoneinfo import ZoneInfo
+        flat = os.getenv('CONTROL_ARCHIVE_FLAT','false').lower()
+        if flat not in ('true','false'):
+            raise ValueError('CONTROL_ARCHIVE_FLAT must be true or false')
+        kw['archive_flat'] = flat == 'true'
         kw["archive_timezone"] = os.getenv("CONTROL_ARCHIVE_TIMEZONE","UTC")
         ZoneInfo(kw["archive_timezone"])
         kw.update(expected_archive_mount=Path(expected) if expected else None, expected_archive_fstypes=fstypes)
