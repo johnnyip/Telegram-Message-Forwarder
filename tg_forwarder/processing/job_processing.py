@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from telethon import errors
 
 from ..shared_media import legacy_send, native_forward
+from ..spool_lifecycle import begin_job,target_send,owned
 from ..storage.edit_mapping import store_album_mapping, store_message_mapping
 from ..core.utils import tstamp
 
@@ -75,11 +76,20 @@ def resolve_routes(route_map: Dict[str, Dict[str, Any]], route_names: List[str])
 
 async def _run_target_coroutines(coroutines: List[Awaitable[bool]], *, parallel: bool) -> List[bool]:
     if parallel:
-        return await asyncio.gather(*coroutines)
+        tasks=[asyncio.create_task(c) for c in coroutines]
+        try:return await asyncio.gather(*tasks)
+        except BaseException:
+            # A transport error does not detach sibling sends from ownership.
+            from ..shared_media import _join
+            await _join(asyncio.gather(*tasks,return_exceptions=True))
+            raise
     results: List[bool] = []
-    for coroutine in coroutines:
-        results.append(await coroutine)
-    return results
+    try:
+        for coroutine in coroutines:results.append(await coroutine)
+        return results
+    finally:
+        for pending in coroutines[len(results)+1:]:pending.close()
+
 
 
 async def process_text_job(job: dict, ctx: JobProcessingContext) -> List[str]:
@@ -118,6 +128,7 @@ async def process_text_job(job: dict, ctx: JobProcessingContext) -> List[str]:
 
 
 async def process_media_file_job(job: dict, ctx: JobProcessingContext) -> List[str]:
+    if await begin_job(job,ctx):return []
     if job.get("info",{}).get("future_comments"):
         from .future_delivery import validate_files
         await validate_files(job)
@@ -147,7 +158,7 @@ async def process_media_file_job(job: dict, ctx: JobProcessingContext) -> List[s
     preserve_local_copy = False
     current_path = fpath
     for route in routes:
-        coroutines = [legacy_send(lambda r=route, t=target: ctx.send_file_to_target(r, t, current_path, caption, info, job["source_kind"]), [snapshot], target, caption, info, job["source_kind"]) for target in route["targets"]]
+        coroutines = [target_send(job,route['name'],target,lambda r=route,t=target:legacy_send(lambda:ctx.send_file_to_target(r,t,current_path,caption,info,job['source_kind']),[snapshot],t,caption,info,job['source_kind'])) for target in route["targets"]]
         results = await _run_target_coroutines(coroutines, parallel=ctx.media_target_parallel)
         total_count += len(results)
         success_count += sum(1 for ok in results if ok)
@@ -178,6 +189,7 @@ async def process_media_file_job(job: dict, ctx: JobProcessingContext) -> List[s
 
 
 async def process_media_album_file_job(job: dict, ctx: JobProcessingContext) -> List[str]:
+    if await begin_job(job,ctx):return []
     if job.get("info",{}).get("future_comments"):
         from .future_delivery import validate_files
         await validate_files(job)
@@ -189,6 +201,7 @@ async def process_media_album_file_job(job: dict, ctx: JobProcessingContext) -> 
     snapshots = job["snapshots"]
     files = [snapshot["path"] for snapshot in snapshots if Path(snapshot["path"]).exists()]
     info["_album_snapshots"] = snapshots
+    if owned(job) and len(files)!=len(snapshots):raise RuntimeError('Owned album incomplete; retained for recovery')
     if not files:
         ctx.log({"ts": tstamp(), "type": "err", "op": "media_album_files_missing", "chat_id": info["chat_id"], "grouped_id": info.get("grouped_id")})
         return []
@@ -208,7 +221,7 @@ async def process_media_album_file_job(job: dict, ctx: JobProcessingContext) -> 
     preserve_local_copy = False
     current_files = files[:]
     for route in routes:
-        coroutines = [legacy_send(lambda r=route, t=target: ctx.send_album_to_target(r, t, current_files, caption, info, job["source_kind"]), snapshots, target, caption, info, job["source_kind"]) for target in route["targets"]]
+        coroutines = [target_send(job,route['name'],target,lambda r=route,t=target:legacy_send(lambda:ctx.send_album_to_target(r,t,current_files,caption,info,job['source_kind']),snapshots,t,caption,info,job['source_kind'])) for target in route["targets"]]
         results = await _run_target_coroutines(coroutines, parallel=ctx.media_target_parallel)
         total_count += len(results)
         success_count += sum(1 for ok in results if ok)
@@ -316,7 +329,8 @@ async def process_media_forward_job(job: dict, ctx: JobProcessingContext) -> Lis
         if not snapshot:
             return []
         fallback_job = {"job_type": "media_file", "source_kind": job["source_kind"], "route_names": job["route_names"], "info": info, "snapshot": snapshot}
-        return await process_media_file_job(fallback_job, ctx)
+        job.update(fallback_job)
+        return await process_media_file_job(job, ctx)
 
 
 async def process_media_album_forward_job(job: dict, ctx: JobProcessingContext) -> List[str]:
@@ -382,7 +396,8 @@ async def process_media_album_forward_job(job: dict, ctx: JobProcessingContext) 
         if not snapshots:
             return []
         fallback_job = {"job_type": "media_album_file", "source_kind": job["source_kind"], "route_names": job["route_names"], "info": info, "snapshots": snapshots}
-        return await process_media_album_file_job(fallback_job, ctx)
+        job.update(fallback_job)
+        return await process_media_album_file_job(job, ctx)
 
 
 async def dispatch_media_job(job: dict, ctx: JobProcessingContext) -> List[str]:

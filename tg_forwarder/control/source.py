@@ -14,7 +14,8 @@ def clean(text):
 
 def item(msg, section):
     kind = "photo" if getattr(msg, "photo", None) else "video" if getattr(msg, "video", None) else None
-    date = getattr(msg, "date", None) or datetime.now(timezone.utc)
+    date = getattr(msg, "date", None)
+    if not isinstance(date,datetime) or date.tzinfo is None or date.utcoffset() is None:raise Unavailable('Aware original message timestamp unavailable')
     file = getattr(msg, "file", None)
     reply=getattr(msg,'reply_to',None)
     topic=(getattr(reply,'reply_to_top_id',None) or getattr(reply,'reply_to_msg_id',None)) if getattr(reply,'forum_topic',False) else None
@@ -34,9 +35,10 @@ def identity(i):
 
 
 class Resolver:
-    def __init__(self, client, limit=10000, gate=None, *, named_folders=False):
+    def __init__(self, client, limit=10000, gate=None, *, named_folders=False, archive_timezone='UTC'):
         self.client, self.limit, self.gate = client, limit, gate
         self.named_folders=named_folders
+        self.archive_timezone=archive_timezone
 
     async def call(self, fn, *args, **kwargs):
         if self.gate:
@@ -64,7 +66,7 @@ class Resolver:
     def archive_group(self, snap, entity):
         """Authoritative URL root owns naming only, never media source authority."""
         if not self.named_folders:return
-        from tg_forwarder.canonical_media import filename
+        from tg_forwarder.canonical_media import filename,message_month
         peer=utils.get_peer_id(entity);title=getattr(entity,'title',None)
         if peer!=snap['peer'] or not title or title==str(peer) or not snap['main'] or any(i['chat']!=peer for i in snap['main']):
             raise Unavailable('Confirmed main-source archive title unavailable')
@@ -75,9 +77,9 @@ class Resolver:
         names={}
         for value in snap['main']+snap['discussion']:
             meta=value['archive_meta']
-            meta.update(folder_chat=peer,folder_title=title,folder_topic_id=group['topic_id'],folder_topic_title=group['topic_title'])
+            meta.update(folder_chat=peer,folder_title=title,folder_topic_id=group['topic_id'],folder_topic_title=group['topic_title'],folder_month=True)
             meta.pop('folder_collision',None)
-            if value.get('kind'):names.setdefault(filename(value),[]).append(value)
+            if value.get('kind'):names.setdefault((message_month(value,self.archive_timezone),filename(value)),[]).append(value)
         for values in names.values():
             identities={(v['chat'],v['id'],v.get('media_id','')) for v in values}
             if len(identities)>1:

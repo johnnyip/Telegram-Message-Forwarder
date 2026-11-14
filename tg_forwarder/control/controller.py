@@ -244,14 +244,14 @@ class Controller:
             if previous['state']!='done':return previous  # native retry/cancel/ambiguous controls
         values=await self.location_inventory(task)
         if any(v[2] not in ('可用','檔案遺失') for v in values):raise ValueError('快取路徑不安全／未能確認，未自動補下載')
-        if not any(v[2]=='檔案遺失' for v in values):return task
-        if not self.engine.archive.named:raise ValueError('重新提交補下載需要已啟用 NAMED 儲存格式')
+        if not self.engine.archive.named:
+            if not any(v[2]=='檔案遺失' for v in values):return task
+            raise ValueError('重新提交補下載需要已啟用 NAMED 儲存格式')
         identity=lambda i:(i['chat'],i['id'],i.get('media_id',''))
         fresh={identity(i):i for i in requested['items']}
         if len(fresh)!=len(source['items']):raise ValueError('重新查詢選取範圍已改變')
-        selected=[];entries=[];destinations=set();folders={}
+        selected=[];entries=[];destinations=set();folders={};missing=0
         for old,value in zip(source['items'],values):
-            if value[2]!='檔案遺失':continue
             current=fresh.get(identity(old))
             if current is None or any(current.get(k)!=old.get(k) for k in ('kind','album','size','section')):raise ValueError('來源內容已改變，未補下載')
             meta=current.get('archive_meta') or {}
@@ -263,21 +263,34 @@ class Controller:
             binding=[meta.get('folder_chat',current['chat']),meta.get('folder_topic_id',meta.get('topic_id'))]
             if path.parent in folders and folders[path.parent]!=binding:raise ValueError('選取項目命名資料夾身份衝突')
             folders[path.parent]=binding
-            prior=self.store.get_meta('archive_folder:'+digest(str(path.parent.relative_to(self.engine.archive.root))),'')
+            prior=self.store.get_meta('archive_folder:'+digest(str(self.engine.archive.naming_directory(path,current))),'')
             if prior and json.loads(prior)!=binding:raise ValueError('命名資料夾身份衝突，未補下載')
             if path in destinations:raise ValueError('重新下載檔名重複，未覆寫')
             destinations.add(path)
-            # Missing old paths are evidence, not permission to adopt a foreign
-            # canonical destination, even if its size happens to match.
-            try:path.lstat()
-            except FileNotFoundError:pass
-            else:raise ValueError('重新下載目的地已存在，未覆寫／採用')
             key=digest(list(identity(old)));cached=self.store.db.execute('SELECT * FROM cache WHERE key=?',(key,)).fetchone()
             if cached is None or cached['path']!=str(self.engine.archive.root/value[1]) or cached['size']!=current.get('size'):raise ValueError('遺失快取記錄已變更')
+            # Capture ALL original identities, not only the first observed missing
+            # subset. A deletion can continue while planning/transfer is running.
+            def existing_proof():
+                from tg_forwarder.canonical_media import secure_path,fingerprint
+                try:
+                    oldpath=secure_path(self.engine.archive.root,value[1],existing=True)
+                    before=oldpath.lstat();proof=fingerprint(oldpath);after=oldpath.lstat()
+                except FileNotFoundError:return None
+                signature=lambda st:(st.st_dev,st.st_ino,st.st_size,st.st_mtime_ns,st.st_ctime_ns,st.st_uid,st.st_mode)
+                if signature(before)!=signature(after) or proof['size']!=cached['size']:raise ValueError('現有檔案於檢查期間已變更')
+                return {'identity':[after.st_dev,after.st_ino],'mtime_ns':after.st_mtime_ns,'uid':after.st_uid,'mode':after.st_mode,'proof':proof}
+            existing=await _io(existing_proof)
+            if existing is None:
+                missing+=1
+                try:path.lstat()
+                except FileNotFoundError:pass
+                else:raise ValueError('重新下載目的地已存在，未覆寫／採用')
             selected.append(current)
-            entries.append({'key':key,'relative':relative,'previous_relative':value[1],'size':cached['size']})
+            entries.append({'key':key,'relative':relative,'previous_relative':value[1],'size':cached['size'],'existing':existing})
+        if not missing:return task
         payload={'action':'download','target':None,'snapshot':source['snapshot'],'items':selected,
-            'missing_repair':{'origin':task['id'],'revision':digest(task['payload']),'previous':head,'entries':entries,'explicit_resubmit':True}}
+            'missing_repair':{'origin':task['id'],'revision':digest(task['payload']),'previous':head,'entries':entries,'explicit_resubmit':True,'full_scope':True}}
         await _io(self.engine.validate,payload)
         with self.store.transaction():
             current_head=self.store.get_meta(headkey,'')
@@ -650,6 +663,7 @@ class Controller:
                 if uncertain:text+='；待核對 '+str(uncertain)
         else:text += "\n已完成 "+str(completed)+"/"+str(total)+"；已下載 "+str(downloaded)+"/"+str(total)
         if p.get('missing_repair'):text+='\n補下載遺失項目；原歷史任務 '+p['missing_repair']['origin']+' 保留；不會重新轉發。'
+        if (p.get('missing_repair') or {}).get('full_scope'):text+='\n本次核對原完整範圍 '+str(total)+' 項；只重新下載遺失檔案。'
         stats=json.loads(self.store.get_meta('task-last-run:'+task['id'],'null'))
         if stats:text+='\n最近一次執行（attempt '+str(stats['attempt'])+'）：新下載 '+str(stats['fresh'])+'；重用／略過 '+str(stats['reused'])
         elif task['state']=='done':text+='\n沒有本次重新下載紀錄；並非新下載成功。'

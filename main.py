@@ -831,6 +831,7 @@ async def media_consumer_loop(consumer=None, lane="media"):
             fingerprint = None
             try:
                 job = json.loads(record.value.decode("utf-8"))
+                from tg_forwarder.spool_lifecycle import classify as spool_classify
                 maybe_debug_log(log, {
                     "ts": tstamp(),
                     "type": "debug",
@@ -866,6 +867,14 @@ async def media_consumer_loop(consumer=None, lane="media"):
                     commit_batcher.mark_processed(record)
                     await commit_batcher.maybe_commit(reason="future_comments_disabled")
                     continue
+                from tg_forwarder.spool_lifecycle import completed as spool_completed,finish as spool_finish
+                if await spool_completed(job):
+                    if future_lane:await terminal(job,'complete')
+                    commit_batcher.mark_processed(record)
+                    await commit_batcher.maybe_commit(reason='durable_spool_receipts')
+                    try:await spool_finish(job,[v['path'] for v in (job.get('snapshots') or [job.get('snapshot',{})]) if v.get('path')] if DELETE_AFTER_SEND else [])
+                    except Exception as exc:log({'type':'spool_cleanup_pending','error':type(exc).__name__})
+                    continue
                 fingerprint = job_fingerprint(job)
                 existing = journal_get(fingerprint)
                 if future_lane and (evidence.get('status') != 'prepared' or (existing and existing.get('status') in {'processing','done'})):
@@ -887,6 +896,7 @@ async def media_consumer_loop(consumer=None, lane="media"):
                         "grouped_id": job.get("info", {}).get("grouped_id") if isinstance(job.get("info"), dict) else None,
                         "journal_status": existing.get("status"),
                     })
+                    await spool_classify(job,'journal_'+existing.get('status','unknown')+'_unproven_retained')
                     commit_batcher.mark_processed(record)
                     await commit_batcher.maybe_commit(reason="journal_skip")
                     continue
@@ -919,6 +929,7 @@ async def media_consumer_loop(consumer=None, lane="media"):
                         "msg_id": job.get("info", {}).get("msg_id") if isinstance(job.get("info"), dict) else None,
                         "grouped_id": job.get("info", {}).get("grouped_id") if isinstance(job.get("info"), dict) else None,
                     })
+                    await spool_classify(job,'claim_uncertain_retained')
                     commit_batcher.mark_processed(record)
                     await commit_batcher.maybe_commit(reason="claim_skip")
                     continue
@@ -951,8 +962,8 @@ async def media_consumer_loop(consumer=None, lane="media"):
                     "cleanup_count": len(cleanup_paths),
                 })
 
-                if cleanup_paths:
-                    cleanup_files(cleanup_paths, job.get("source_kind", "unknown"), job.get("info", {}).get("msg_id"), log)
+                try:await spool_finish(job,cleanup_paths)
+                except Exception as exc:log({'type':'spool_cleanup_pending','error':type(exc).__name__})
             except Exception as e:
                 if future_lane:
                     if fingerprint:
@@ -983,6 +994,7 @@ async def media_consumer_loop(consumer=None, lane="media"):
                             "grouped_id": job.get("info", {}).get("grouped_id") if isinstance(job, dict) else None,
                             "note": "max failures exceeded; committing offset to unblock partition",
                         })
+                        await spool_classify(job,'poison_failed_recoverable')
                         commit_batcher.mark_processed(record)
                         await commit_batcher.maybe_commit(force=True, reason="poison_skip")
                 log({
@@ -1790,6 +1802,8 @@ async def main():
     LOGGER.info(banner)
 
     consumer_tasks = []
+    from tg_forwarder.spool_lifecycle import configure as configure_spool,gc_loop as spool_gc_loop
+    configure_spool(SPOOL_DIR)
 
     try:
         if APP_MODE == "listen":
@@ -1856,6 +1870,7 @@ async def main():
             await startup_kafka_consumers()
             touch_health("send:running")
             consumer_tasks = [
+                asyncio.create_task(spool_gc_loop(log)),
                 asyncio.create_task(text_consumer_loop()),
                 asyncio.create_task(media_consumer_loop()),
             ]

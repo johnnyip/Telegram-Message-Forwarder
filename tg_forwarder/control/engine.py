@@ -62,6 +62,10 @@ class RateGate:
         return until
 
 
+class RepairMissing(ValueError):
+    """Observed disappearance only; never an unsafe-file retry signal."""
+
+
 class Archive:
     def __init__(self, root, reserve_bytes, expected_mount=None, expected_fstypes=("nfs","nfs4"), archive_timezone="UTC", *, flat=False, metadata_dir=None, named=False):
         self.named=named
@@ -119,6 +123,13 @@ class Archive:
                     suffix=' - '+digest([i['chat'],i['id'],i.get('media_id','')])[:16]
                     base=Path(truncate_filename(name,230-len(suffix)))
                     name=base.stem+suffix+base.suffix
+                if meta.get('folder_batch'):
+                    batch=meta['folder_batch']
+                    if not isinstance(batch,str) or not re.fullmatch(r'[0-9]{8}_[0-9]{6}-[0-9a-f]{8}',batch):raise ValueError('Invalid native batch directory')
+                    return self.path(label,batch,name)
+                if meta.get('folder_month') is True:
+                    from tg_forwarder.canonical_media import message_month
+                    return self.path(label,message_month(i,self.timezone),name)
                 return self.path(label,name)
             return self.path(original_filename(i))
         if i.get("archive_meta"):
@@ -129,6 +140,10 @@ class Archive:
         album = str(int(i["album"])) if i["album"] else "single"
         return self.path(*base.relative_to(self.root).parts, section, album,
                          str(int(i["chat"]))+"_"+str(int(i["id"]))+("_"+str(int(i["media_id"])) if i.get("media_id") else "")+(".jpg" if i["kind"] == "photo" else ".mp4"))
+
+    def naming_directory(self,path,selected):
+        relative=path.parent.relative_to(self.root)
+        return relative.parent if (selected.get('archive_meta') or {}).get('folder_month') is True else relative
 
     def space(self, required=0):
         self.guard()
@@ -412,18 +427,47 @@ class Engine:
             _,size = await self.cached_file_async(selected,used)
             used += size
 
+    async def prepare_directory(self,task,payload,path):
+        batch=payload.get('archive_batch')
+        if not batch:
+            await _io(lambda:path.parent.mkdir(parents=True,exist_ok=True))
+            return
+        identities=sorted({(i['chat'],i['id'],i.get('media_id','')) for i in payload['items']})
+        if batch.get('task')!=task['id'] or batch.get('scope')!=digest(identities) or batch.get('logical_count')!=len(identities) or len(identities)<=1 or path.parent.name!=batch.get('folder'):
+            raise PermissionError('Native batch allocation/scope mismatch')
+        key='archive-batch-claim:'+task['id']
+        prior=json.loads(self.store.get_meta(key,'null'))
+        def claim():
+            self.archive.path(*path.parent.relative_to(self.archive.root).parts)
+            path.parent.parent.mkdir(parents=True,exist_ok=True)
+            self.archive.path(*path.parent.relative_to(self.archive.root).parts)
+            if prior is None:
+                # Exclusive creation: never adopt a foreign preexisting directory.
+                path.parent.mkdir(mode=0o700)
+                fd=os.open(path.parent.parent,os.O_RDONLY|os.O_DIRECTORY)
+                try:os.fsync(fd)
+                finally:os.close(fd)
+            info=path.parent.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o022:raise ValueError('Unsafe batch directory')
+            record={'task':task['id'],'path':str(path.parent),'identity':[info.st_dev,info.st_ino],'uid':info.st_uid,'mode':info.st_mode,'scope':batch['scope']}
+            if prior is not None and record!=prior:raise ValueError('Batch directory claim changed')
+            return record
+        record=await _io(claim)
+        if prior is None:self.store.meta(key,encode(record))
+
     async def primary_destination(self, snapshot, selected):
         primary=await _io(self.archive.file,snapshot,selected)
         if self.archive.named:
             meta=selected['archive_meta']
             binding=[meta.get('folder_chat',selected['chat']),meta.get('folder_topic_id',meta.get('topic_id'))]
-            relative=primary.parent.relative_to(self.archive.root)
+            relative=self.archive.naming_directory(primary,selected)
             name='archive_folder:'+digest(str(relative))
             prior=self.store.get_meta(name,'')
             if prior and json.loads(prior)!=binding:
                 suffix=' - '+digest(binding)[:12]
                 label=truncate_filename(str(relative),230-len(suffix))+suffix
-                primary=await _io(self.archive.path,label,primary.name)
+                parts=[label,primary.parent.name,primary.name] if meta.get('folder_month') is True else [label,primary.name]
+                primary=await _io(self.archive.path,*parts)
                 name='archive_folder:'+digest(label)
                 prior=self.store.get_meta(name,'')
                 if prior and json.loads(prior)!=binding:raise ValueError('Named folder identity collision')
@@ -609,9 +653,10 @@ class Engine:
                 return await self.alias_file(identity,selected,key,used)
         return None
 
-    async def repair_destination(self,task,payload,selected,require_existing=False):
+    async def repair_destination(self,task,payload,selected,require_existing=False,observed=None):
         repair=payload.get('missing_repair')
         if not repair:return None
+        def stamp(st):return (st.st_dev,st.st_ino,st.st_size,st.st_mtime_ns,st.st_ctime_ns,st.st_uid,st.st_mode)
         from .inbound import OWNER
         if task['owner']!=OWNER or task['chat']!=OWNER:raise PermissionError('Missing repair owner private chat required')
         original=self.store.task(repair['origin'],task['owner'],task['chat'])
@@ -623,6 +668,11 @@ class Engine:
             selection_ok=all(selected.get(k)==original_item.get(k) for k in ('chat','id','media_id','kind','album','size','section'))
             if not self.archive.named or self.store.get_meta('bot_principal','')!=str(self.bot_id):raise PermissionError('Explicit resubmission principal/layout mismatch')
         if original['state']!='done' or digest(original['payload'])!=repair['revision'] or source.get('source_kind')=='bot-inbound' or source.get('missing_repair') or payload['action']!='download' or payload.get('target') is not None or not selection_ok or payload['snapshot']!=source['snapshot']:raise PermissionError('Missing repair original/task binding mismatch')
+        if explicit and repair.get('full_scope') is True:
+            identity=lambda i:(i['chat'],i['id'],i.get('media_id',''))
+            expected={identity(i) for i in source['items']}
+            if len(payload['items'])!=len(expected) or {identity(i) for i in payload['items']}!=expected or len(repair['entries'])!=len(expected) or {e['key'] for e in repair['entries']}!={digest(list(i)) for i in expected}:
+                raise PermissionError('Full-scope original identity coverage mismatch')
         key=digest([selected['chat'],selected['id'],selected.get('media_id','')])
         matches=[entry for entry in repair['entries'] if entry['key']==key]
         if len(matches)!=1:raise ValueError('Missing repair selection binding mismatch')
@@ -632,6 +682,24 @@ class Engine:
         if explicit:allowed_paths.add(str(self.archive.root/entry['relative']))
         if cached is None or cached['path'] not in allowed_paths or cached['size']!=entry['size'] or entry['size']<=0 or (selected.get('size') is not None and selected['size']!=entry['size']):raise ValueError('Missing repair cache binding changed')
         record=json.loads(self.store.get_meta('repair-publication:'+task['id']+':'+key,'null'))
+        if explicit and repair.get('full_scope') is True and entry.get('existing') and not record and cached['path']==str(self.archive.root/old_relative):
+            # Existing files are pinned by an observed exact proof, not adopted by
+            # matching size. If they disappear, fall through to native publication
+            # at the canonical destination; foreign replacements fail closed.
+            def reuse_existing():
+                from tg_forwarder.canonical_media import fingerprint,secure_path
+                try:
+                    path=secure_path(self.archive.root,old_relative,existing=True)
+                    before=path.lstat();proof=fingerprint(path);info=path.lstat()
+                except FileNotFoundError:return None
+                signature=lambda st:(st.st_dev,st.st_ino,st.st_size,st.st_mtime_ns,st.st_ctime_ns,st.st_uid,st.st_mode)
+                if signature(before)!=signature(info):raise ValueError('Existing full-scope file changed during verification')
+                actual={'identity':[info.st_dev,info.st_ino],'mtime_ns':info.st_mtime_ns,'uid':info.st_uid,'mode':info.st_mode,'proof':proof}
+                if actual!=entry['existing']:raise ValueError('Existing full-scope file identity/attributes/bytes changed')
+                if observed is not None:observed['stat']=stamp(info)
+                return path
+            existing=await _io(reuse_existing)
+            if existing is not None:return existing
         def validate():
             path=self.archive.path(*Path(entry['relative']).parts)
             if explicit:
@@ -643,7 +711,9 @@ class Engine:
                     else:raise ValueError('Previously missing source path is now occupied')
             try:path.lstat()
             except FileNotFoundError:
-                if require_existing:raise ValueError('Verified repair publication is missing') from None
+                if require_existing:
+                    error=RepairMissing if explicit and repair.get('full_scope') is True else ValueError
+                    raise error('Verified repair publication is missing') from None
                 return path
             from tg_forwarder.canonical_media import fingerprint
             binding={'task':task['id'],'origin':repair['origin'],'revision':repair['revision'],'key':key,'path':str(path),'size':entry['size']}
@@ -655,10 +725,15 @@ class Engine:
             if [info.st_dev,info.st_ino]!=record.get('identity'):raise ValueError('Repair publication inode changed')
             if fingerprint(path)!=record.get('proof'):
                 raise ValueError('Repair publication bytes changed; no source fallback')
+            after=path.lstat()
+            if stamp(info)!=stamp(after):raise ValueError('Repair publication attributes changed while verifying')
+            if observed is not None:observed['stat']=stamp(after)
             return path
         path=await _io(validate)
+        if record and payload.get('archive_batch') and path.parent.name==payload['archive_batch']['folder']:
+            await self.prepare_directory(task,payload,path)
         if explicit:
-            meta=selected['archive_meta'];name='archive_folder:'+digest(str(path.parent.relative_to(self.archive.root)))
+            meta=selected['archive_meta'];name='archive_folder:'+digest(str(self.archive.naming_directory(path,selected)))
             binding=[meta.get('folder_chat',selected['chat']),meta.get('folder_topic_id',meta.get('topic_id'))]
             prior=self.store.get_meta(name,'')
             if prior and json.loads(prior)!=binding:raise ValueError('Resubmission folder identity collision')
@@ -691,6 +766,11 @@ class Engine:
                 await self.publish(i,repair_path)
                 await self.repair_destination(task,payload,i,require_existing=True)
                 return repair_path,size
+            if repair_path is not None:
+                # An originally available legacy path may disappear during the
+                # first existence await. Reproject to its canonical missing
+                # destination before acquiring any new bytes.
+                repair_path=await self.repair_destination(task,payload,i)
             identity=self.photo_alias_identity(task,payload,i) if inbound else None
             stale_alias=None
             observed_alias=self.store.get_meta('flat_photo_alias:'+digest(identity),'') if identity is not None else None
@@ -717,6 +797,8 @@ class Engine:
                     found=await self.reusable_photo_path(dict(cached),i,used) if inbound else await _io(lookup)
                     if found:
                         path,size=found
+                        if payload.get('archive_batch') and path.parent.name==payload['archive_batch']['folder']:
+                            await self.prepare_directory(task,payload,path)
                         await self.video_proof(i,path,size)
                         if used+size>self.config.max_bytes:raise ValueError("媒體大小超過上限")
                         if identity is not None:
@@ -782,7 +864,7 @@ class Engine:
                 path = await self.flat_destination(payload['snapshot'],naming,key)
             else:
                 path = await _io(self.archive.file,payload["snapshot"], naming)
-            await _io(lambda:path.parent.mkdir(parents=True,exist_ok=True))
+            await self.prepare_directory(task,payload,path)
             # Recheck components after mkdir; flat roots may be public-writable, so
             # publication/cleanup additionally bind to this task-owned temporary inode.
             await _io(lambda:self.archive.path(*path.relative_to(self.archive.root).parts))
@@ -921,7 +1003,7 @@ class Engine:
             raise ValueError("媒體大小超過上限")
         await _io(self.archive.space,size)
         path = await self.flat_destination(payload['snapshot'],selected,key) if self.archive.flat else await _io(self.archive.file,payload["snapshot"], selected)
-        await _io(lambda:path.parent.mkdir(parents=True,exist_ok=True))
+        await self.prepare_directory(task,payload,path)
         await _io(lambda:self.archive.path(*path.relative_to(self.archive.root).parts))
         staging=await _io(lambda:tempfile.TemporaryDirectory(prefix=".shared-",dir=path.parent))
         try:
@@ -1043,7 +1125,23 @@ class Engine:
         inbound = payload.get("source_kind") == "bot-inbound"
         self.transfers.pop(task['id'],None)
         run={'attempt':task['attempt'],'fresh':0,'reused':0}
+        outcomes={}
+        scope_pending=None
+        def record_outcome(selected,outcome):
+            key=digest([selected['chat'],selected['id'],selected.get('media_id','')])
+            if (payload.get('missing_repair') or {}).get('full_scope') is True:
+                if outcomes.get(key)!='fresh':outcomes[key]=outcome
+                run['fresh']=sum(v=='fresh' for v in outcomes.values())
+                run['reused']=sum(v=='reused' for v in outcomes.values())
+            else:run[outcome]+=1
+            self.store.meta('task-last-run:'+task['id'],encode(run))
         self.store.meta('task-last-run:'+task['id'],encode(run))
+        async def obtain(selected,used):
+            for retry in range(3):
+                try:return await self.download(task,payload,selected,used)
+                except RepairMissing:
+                    if (payload.get('missing_repair') or {}).get('full_scope') is not True or retry==2:raise
+                    self.check(task)
         manifest = {"task": task["id"], "snapshot": payload["snapshot"], "action": payload["action"],
                     "target": payload.get("target"), "selection": payload["items"], "items": [], "state": "running"}
         try:
@@ -1066,10 +1164,9 @@ class Engine:
                     if payload["action"] == "cached_photos":
                         path,size = await self.cached_file_async(i,used)
                     else:
-                        path, size = await self.download(task, payload, i, used)
+                        path, size = await obtain(i,used)
                     outcome='reused' if payload['action']=='cached_photos' else self.download_outcomes.get(task['id'],'fresh')
-                    run[outcome]+=1
-                    self.store.meta('task-last-run:'+task['id'],encode(run))
+                    record_outcome(i,outcome)
                     used += size
                     files.append(path)
                     entry={**i,"path":str(path.relative_to(self.archive.root)),"download":"done","bytes":size}
@@ -1088,7 +1185,66 @@ class Engine:
                             entry["forward"] = "done"
                             entry["destination_ids"] = ids
                 await _io(self.archive.manifest,payload["snapshot"], task["id"], manifest)
-            if payload.get('missing_repair'):
+            if (payload.get('missing_repair') or {}).get('full_scope') is True:
+                # A moving/deleted folder can invalidate files reused earlier in
+                # this run. Cover the ORIGINAL scope before DONE, not just the
+                # planning-time missing subset. Recovery stays download-only and
+                # uses the same pinned identity/receipt/no-clobber path checks.
+                for sweep in range(3):
+                    missing=[];validated=[]
+                    async with self.download_lock:
+                        for selected in payload['items']:
+                            self.check(task)
+                            path=await self.repair_destination(task,payload,selected)
+                            if not await _io(path.exists):missing.append(selected)
+                            else:
+                                try:
+                                    observed={}
+                                    path=await self.repair_destination(task,payload,selected,require_existing=True,observed=observed)
+                                    validated.append((selected,path,observed['stat']))
+                                except RepairMissing:missing.append(selected)
+                        # Catch disappearance of an earlier checked file while
+                        # the later files were being hashed. Expected identities
+                        # come from pinned evidence/own receipts, never size-only
+                        # adoption of a same-name replacement.
+                        for selected,path,expected in validated:
+                            key=digest([selected['chat'],selected['id'],selected.get('media_id','')])
+                            cached=self.store.db.execute('SELECT path,size FROM cache WHERE key=?',(key,)).fetchone()
+                            if cached is None or cached['path']!=str(path) or cached['size']!=expected[2]:raise ValueError('Full-scope cache changed before completion')
+                        def final_presence():
+                            from tg_forwarder.canonical_media import secure_path
+                            absent=[]
+                            for selected,path,expected in validated:
+                                try:
+                                    checked=secure_path(self.archive.root,path.relative_to(self.archive.root),existing=True);info=checked.lstat()
+                                except FileNotFoundError:
+                                    absent.append(selected);continue
+                                actual=(info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns,info.st_ctime_ns,info.st_uid,info.st_mode)
+                                if actual!=expected:raise ValueError('Full-scope completion verified file attributes changed; not missing recovery')
+                            return absent
+                        missing.extend(await _io(final_presence))
+                        scope_pending={(i['chat'],i['id']) for i in missing}
+                        verified=len(payload['items'])-len(missing)
+                        self.store.set_task(task['id'],progress=verified)
+                        manifest['coverage']={'origin':payload['missing_repair']['origin'],'total':len(payload['items']),'verified':verified}
+                        if not missing:
+                            self.check(task)
+                            self.store.set_task(task['id'],state='done',error='')
+                            break
+                    if sweep==2:raise ValueError('Full original scope still missing after bounded recovery; not DONE')
+                    for selected in missing:
+                        path,size=await obtain(selected,max(0,used-(selected.get('size') or 0)))
+                        record_outcome(selected,self.download_outcomes.get(task['id'],'fresh'))
+                        identity=(selected['chat'],selected['id'],selected.get('media_id',''))
+                        entry=next(e for e in manifest['items'] if (e['chat'],e['id'],e.get('media_id',''))==identity)
+                        entry.update(path=str(path.relative_to(self.archive.root)),bytes=size)
+                        scope_pending.discard((selected['chat'],selected['id']))
+                        verified+=1
+                        self.store.set_task(task['id'],progress=verified)
+                        manifest['coverage']['verified']=verified
+                        await _io(self.archive.manifest,payload['snapshot'],task['id'],manifest)
+                        await self.notice(task)
+            elif payload.get('missing_repair'):
                 # Manifest/progress notices may yield after download() returns.
                 async with self.download_lock:
                     for selected in payload['items']:
@@ -1123,6 +1279,8 @@ class Engine:
             manifest["state"], manifest["error"] = row["state"], row["error"]
             done = {(i["chat"], i["id"]) for i in manifest["items"]}
             manifest["unfinished"] = [{"chat": i["chat"], "id": i["id"], "error": row["error"]} for i in payload["items"] if (i["chat"],i["id"]) not in done]
+            if scope_pending is not None:
+                manifest['unfinished']=[{'chat':i['chat'],'id':i['id'],'error':row['error']} for i in payload['items'] if (i['chat'],i['id']) in scope_pending]
             if payload["action"] != "download":
                 manifest["forward_operations"] = [{"chat": i["chat"], "id": i["id"], "state": self.store.operation(self.operation_key(payload, i))[0] or "pending"} for i in payload["items"]]
             try:

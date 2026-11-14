@@ -143,7 +143,7 @@ async def run(inspect_url=None, health=False):
             from tg_forwarder.shared_media import configured_bridge
             bridge = await configured_bridge()
             gate = RateGate(store, bridge)
-            resolver = Resolver(client, config.scan_limit, gate,named_folders=config.archive_named)
+            resolver = Resolver(client, config.scan_limit, gate,named_folders=config.archive_named,archive_timezone=config.archive_timezone)
             if inspect_url:
                 snap = await resolver.resolve(parse_url(inspect_url))
                 print(json.dumps(summary(snap), ensure_ascii=False))

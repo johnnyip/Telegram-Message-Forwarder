@@ -21,11 +21,20 @@ def due_ts_for_media(delay_seconds: int) -> float:
 async def kafka_send(topic: str, payload: dict, producer, json_bytes, log, *, retries: int = KAFKA_SEND_RETRIES, retry_delay: float = KAFKA_SEND_RETRY_DELAY_SECONDS):
     """Send a Kafka message with bounded retry on transient broker errors (P6)."""
     timer = StepTimer()
+    from ..spool_lifecycle import owned,publish_intent,manager
+    from ..shared_media import _io
+    if owned(payload):
+        await publish_intent(payload,payload['spool_targets'])
     data = json_bytes(payload)
     last_exc: Exception = RuntimeError("kafka_send: no attempts made")
     for attempt in range(1, retries + 1):
         try:
             await producer.send_and_wait(topic, data)
+            if owned(payload):
+                try:await _io(manager().reference_state,payload,'queued')
+                except Exception as exc:
+                    # Broker acknowledged: bookkeeping failure must not re-publish.
+                    log({'type':'spool_publication_pending','error':type(exc).__name__})
             log({
                 "ts": tstamp(),
                 "type": "perf",
@@ -119,6 +128,7 @@ async def publish_media_job(msg, info: dict, routes: List[Dict[str, Any]], sourc
         "route_names": route_names(routes),
         "info": info,
         "snapshot": snapshot,
+        "spool_targets": [[r['name'],t] for r in routes for t in r['targets']],
         "due_at": due_ts_for_media(media_delay_seconds),
         "created_at": tstamp(),
     }
@@ -200,6 +210,7 @@ async def publish_album_job(msgs: List[Any], info: dict, routes: List[Dict[str, 
         "route_names": route_names(routes),
         "info": info,
         "snapshots": snapshots,
+        "spool_targets": [[r['name'],t] for r in routes for t in r['targets']],
         "due_at": due_ts_for_media(media_delay_seconds),
         "created_at": tstamp(),
     }

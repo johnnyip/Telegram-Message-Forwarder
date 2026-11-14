@@ -59,6 +59,21 @@ def filename(selected):
     return truncate_filename(validate_title(generated)+extension)
 
 
+def message_month(selected, tz='UTC'):
+    """Original Telegram message instant, never capture/download/forward time.
+
+    Upstream formats message.date using %Y_%m in its process-local zone. The
+    Telethon adapter uses the existing explicit operator archive timezone; it
+    must not reinterpret a naive/missing instant using the current clock.
+    """
+    raw=(selected.get('archive_meta') or {}).get('datetime')
+    if not isinstance(raw,str) or not raw:raise ValueError('Original message timestamp required')
+    try:date=datetime.fromisoformat(raw)
+    except ValueError:raise ValueError('Invalid original message timestamp') from None
+    if date.tzinfo is None or date.utcoffset() is None:raise ValueError('Aware original message timestamp required')
+    return date.astimezone(ZoneInfo(tz)).strftime('%Y_%m')
+
+
 def relative(selected, tz='UTC'):
     meta = selected['archive_meta']
     date = datetime.fromisoformat(meta['datetime']) if meta.get('datetime') else None

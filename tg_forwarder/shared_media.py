@@ -246,7 +246,7 @@ class SharedMedia:
             if p.parent == root and p.name.startswith(".incoming-") and p.is_file() and not p.is_symlink():
                 p.unlink()
 
-    async def materialize(self, identity, destination):
+    async def materialize(self, identity, destination, *, owned_stream=None):
         source = await self.cached(identity)
         if source is None:
             return None
@@ -259,8 +259,14 @@ class SharedMedia:
             nonlocal created
             with os.fdopen(os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)), "rb") as src:
                 fcntl.flock(src,fcntl.LOCK_SH)
-                with os.fdopen(os.open(destination,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),"wb") as dst:
-                    created = True
+                if owned_stream is None:
+                    fd=os.open(destination,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+                    created=True
+                else:
+                    expected=os.fstat(owned_stream.fileno());actual=os.lstat(destination)
+                    if (expected.st_dev,expected.st_ino)!=(actual.st_dev,actual.st_ino) or not stat.S_ISREG(actual.st_mode):raise SharedUnavailable('Owned materialization inode changed')
+                    fd=os.dup(owned_stream.fileno());os.lseek(fd,0,os.SEEK_SET);os.ftruncate(fd,0)
+                with os.fdopen(fd,"wb") as dst:
                     before=os.fstat(src.fileno())
                     shutil.copyfileobj(src,dst,1024*1024)
                     dst.flush();os.fsync(dst.fileno())

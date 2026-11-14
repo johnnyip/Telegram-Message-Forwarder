@@ -355,7 +355,7 @@ class LegacyTransientWorkflowTests(unittest.IsolatedAsyncioTestCase):
         msg=fixtures.FakeClient().main[0]
         msg.photo=NS(id=80000+msg.id);msg.document=None;msg.text=msg.message;msg.file.mime_type='image/jpeg'
         async def download(path):
-            Path(path).write_bytes(b'data');return str(path)
+            path.write(b'data') if hasattr(path,'write') else Path(path).write_bytes(b'data');return path
         msg.download_media=AsyncMock(side_effect=download)
         return msg
 

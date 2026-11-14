@@ -50,7 +50,7 @@ class MainArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(i['archive_meta']['title']=='评论区' for i in snap['discussion']))
         task=await self.download(snap);original=dict(task)
         paths=[Path(r[0]) for r in self.store.db.execute('SELECT path FROM cache')]
-        self.assertEqual(len(paths),53);self.assertTrue(all(p.parent==self.config.root/'反差婊投稿曝光' and p.read_bytes()==b'data' for p in paths))
+        self.assertEqual(len(paths),53);self.assertTrue(all(p.parent.parent==self.config.root/'反差婊投稿曝光' and p.read_bytes()==b'data' for p in paths))
         self.assertFalse((self.config.root/'评论区').exists())
         before=sum(m.download_media.await_count for m in self.client.main+self.client.replies)
         await self.submit(await self.resolve());self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM tasks').fetchone()[0],1)
@@ -62,7 +62,7 @@ class MainArchiveTests(unittest.IsolatedAsyncioTestCase):
         pending=self.store.claim();self.assertEqual(pending['id'],head);await self.engine.execute(pending)
         done=self.store.task(head,inbound.OWNER,inbound.OWNER);self.assertEqual(done['state'],'done',done['error'])
         self.assertEqual(json.loads(self.store.get_meta('task-last-run:'+head))['fresh'],53)
-        self.assertTrue(all(Path(r[0]).parent==self.config.root/'反差婊投稿曝光' and Path(r[0]).exists() for r in self.store.db.execute('SELECT path FROM cache')))
+        self.assertTrue(all(Path(r[0]).parent.parent==self.config.root/'反差婊投稿曝光' and Path(r[0]).exists() for r in self.store.db.execute('SELECT path FROM cache')))
         self.assertEqual(self.store.task(task['id'],inbound.OWNER,inbound.OWNER),original)
         self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM operations').fetchone()[0],0)
         await self.controller.render_locations(inbound.OWNER,inbound.OWNER,78001,original,{'revision':digest(original['payload']),'bot':inbound.BOT})
@@ -73,7 +73,7 @@ class MainArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.source();snap=await self.resolve(self.client.replies[0].id)
         self.assertEqual(snap['selected'][0]['chat'],source.GROUP)
         self.assertEqual(snap['selected'][0]['archive_meta']['folder_chat'],source.CHANNEL)
-        self.assertEqual(self.engine.archive.file(snap,snap['selected'][0]).parent.name,'反差婊投稿曝光')
+        self.assertEqual(self.engine.archive.file(snap,snap['selected'][0]).parent.parent.name,'反差婊投稿曝光')
 
     async def test_duplicate_message_ids_original_names_deterministic_distinct_nooverwrite(self):
         self.source()
@@ -101,7 +101,7 @@ class MainArchiveTests(unittest.IsolatedAsyncioTestCase):
         with patch('tg_forwarder.control.source.utils.get_peer_id',side_effect=lambda e:e.key):
             snap=await self.controller.resolver.resolve(SourceRef(source.GROUP,seed.id))
         self.assertEqual(snap['main'][0]['archive_meta']['folder_chat'],source.GROUP)
-        self.assertEqual(self.engine.archive.file(snap,snap['main'][0]).parent.name,'评论区')
+        self.assertEqual(self.engine.archive.file(snap,snap['main'][0]).parent.parent.name,'评论区')
 
     async def test_old_completed_split_cache_left_alone_no_download_or_forward(self):
         self.source();snap=await self.resolve()
@@ -109,7 +109,7 @@ class MainArchiveTests(unittest.IsolatedAsyncioTestCase):
         old=copy.deepcopy(snap)
         for i in old['main']+old['discussion']:
             meta=i['archive_meta']
-            for k in ('folder_chat','folder_title','folder_topic_id','folder_topic_title','folder_collision'):meta.pop(k,None)
+            for k in ('folder_chat','folder_title','folder_topic_id','folder_topic_title','folder_collision','folder_month','folder_batch'):meta.pop(k,None)
             path=self.engine.archive.file(old,i);path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b'data');path.chmod(0o600)
             key=digest([i['chat'],i['id'],i.get('media_id','')])
             self.store.db.execute('INSERT INTO cache VALUES(?,?,?)',(key,str(path),4))

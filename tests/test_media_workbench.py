@@ -1194,7 +1194,7 @@ class ControlSharedBridgeTests(Base):
         from tg_forwarder.processing import snapshot
         msg=self.client.main[0]
         async def legacy_download(path):
-            Path(path).write_bytes(b'data'); return path
+            path.write(b'data') if hasattr(path,'write') else Path(path).write_bytes(b'data'); return path
         msg.download_media.side_effect=legacy_download
         async def api(fn,**kw): return await fn()
         with patch.object(snapshot,'configured_bridge',AsyncMock(return_value=self.bridge)):

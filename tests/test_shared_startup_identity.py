@@ -22,6 +22,9 @@ def startup_code():
 
 class StartupIdentityTests(unittest.IsolatedAsyncioTestCase):
     def context(self, mode, principal=77, error=None):
+        from tg_forwarder import spool_lifecycle
+        for name,mock in (("configure",Mock()),("gc_loop",AsyncMock())):
+            guard=patch.object(spool_lifecycle,name,mock);guard.start();self.addCleanup(guard.stop)
         class Client:
             get_me=AsyncMock(return_value=NS(id=principal,bot=False),side_effect=error)
             run_until_disconnected=AsyncMock()

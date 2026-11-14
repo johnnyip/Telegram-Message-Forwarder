@@ -42,8 +42,9 @@ class LiveProgressTests(unittest.IsolatedAsyncioTestCase):
         self.client.channel.title='來源頻道';self.client.group.title='留言群'
         row=await self.original(1,video=True);payload=json.loads(row['payload'])
         paths=[Path(r[0]) for r in self.store.db.execute('SELECT path FROM cache')]
-        self.assertEqual({p.parent.name for p in paths},{'來源頻道'})
-        self.assertTrue(all(p.parent.parent==self.config.root for p in paths))
+        self.assertEqual(len({p.parent for p in paths}),1)
+        self.assertTrue(all(p.parent.parent.name=='來源頻道' for p in paths))
+        self.assertTrue(all(p.parent.parent.parent==self.config.root for p in paths))
         self.assertEqual({p.name for p in paths},{filename(i) for i in payload['items']})
         raw=inbound.raw_update(origin='channel');raw['message']['forward_origin']['chat'].update(id=CHANNEL,title='來源頻道')
         received=payload_for(Update.de_json(raw,None),self.config.allowed,inbound.BOT)

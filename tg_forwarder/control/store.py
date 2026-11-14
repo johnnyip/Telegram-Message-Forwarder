@@ -15,6 +15,43 @@ def digest(value):
     return hashlib.sha256(encode(value).encode()).hexdigest()
 
 
+def archive_batch(payload,task,created):
+    """Native new-task allocation; logical scope, never missing/progress count."""
+    import copy
+    from datetime import datetime
+    from pathlib import Path
+    from zoneinfo import ZoneInfo
+    from tg_forwarder.canonical_media import filename
+    items=payload.get('items',[])
+    identities=sorted({(i['chat'],i['id'],i.get('media_id','')) for i in items})
+    if len(identities)<=1 or not items or not all((i.get('archive_meta') or {}).get('folder_month') is True for i in items):return payload
+    result=copy.deepcopy(payload)
+    name=datetime.fromtimestamp(created,ZoneInfo('Asia/Hong_Kong')).strftime('%Y%m%d_%H%M%S')+'-'+task[:8]
+    result['archive_batch']={'task':task,'folder':name,'logical_count':len(identities),'scope':digest(identities)}
+    names={}
+    for i in result['items']:
+        i['archive_meta']['folder_batch']=name
+        i['archive_meta'].pop('folder_collision',None)
+        names.setdefault(filename(i),[]).append(i)
+    for values in names.values():
+        if len({(i['chat'],i['id'],i.get('media_id','')) for i in values})>1:
+            for i in values:i['archive_meta']['folder_collision']=True
+    # Repair pins were projected as title/month/name before task allocation.
+    # Replace only that native final directory, not arbitrary callback paths.
+    repair=result.get('missing_repair') or {}
+    if repair.get('full_scope') is True:
+        bykey={digest([i['chat'],i['id'],i.get('media_id','')]):i for i in result['items']}
+        for entry in repair['entries']:
+            rel=Path(entry['relative'])
+            if rel.is_absolute() or len(rel.parts)!=3 or any(p in ('.','..') for p in rel.parts):raise ValueError('Expected native single-month repair projection')
+            i=bykey[entry['key']];base=filename(i)
+            if i['archive_meta'].get('folder_collision'):
+                from tg_forwarder.canonical_media import truncate_filename
+                suffix=' - '+entry['key'][:16];part=Path(truncate_filename(base,230-len(suffix)));base=part.stem+suffix+part.suffix
+            entry['relative']=str(rel.parent.parent/name/base)
+    return result
+
+
 class Store:
     def __init__(self, path):
         guard_state(path)
@@ -101,7 +138,10 @@ class Store:
     def insert_task(self, owner, chat, reply, payload):
         """Caller holds BEGIN IMMEDIATE; permits task+watch cursor atomic commit."""
         key=self.task_key(owner,chat,payload)
+        existing=self.db.execute("SELECT * FROM tasks WHERE key=?",(key,)).fetchone()
+        if existing is not None:return dict(existing)
         task = secrets.token_hex(8)
+        payload=archive_batch(payload,task,time.time())
         self.db.execute("INSERT OR IGNORE INTO tasks(id,owner,chat,reply,key,payload,state) VALUES(?,?,?,?,?,?,?)",
                         (task, owner, chat, reply, key, encode(payload), "queued"))
         return dict(self.db.execute("SELECT * FROM tasks WHERE key=?", (key,)).fetchone())

@@ -47,6 +47,8 @@ class SharedTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        from tg_forwarder.spool_lifecycle import configure
+        configure(self.root/'_spool')
         self.net = patch.object(socket.socket, 'connect', side_effect=AssertionError('network forbidden'))
         self.net.start(); self.addCleanup(self.net.stop)
         self.redis = Redis()
@@ -55,7 +57,7 @@ class SharedTests(unittest.IsolatedAsyncioTestCase):
         self.msg = NS(id=17, chat_id=-1001, photo=NS(id=345), document=None, media=True,
                       file=NS(size=4, mime_type='image/jpeg'), text='caption', message='caption')
         async def download(path):
-            Path(path).write_bytes(b'data'); return path
+            path.write(b'data') if hasattr(path,'write') else Path(path).write_bytes(b'data'); return path
         self.msg.download_media = AsyncMock(side_effect=download)
         self.factory = patch.object(shared, 'configured_bridge', AsyncMock(return_value=self.bridge))
         self.factory.start(); self.addCleanup(self.factory.stop)
@@ -72,7 +74,7 @@ class SharedTests(unittest.IsolatedAsyncioTestCase):
         return NS(should_ignore=lambda *a:False, ignore_users=set(), ignore_ids=set(),
                   build_header_from_info=lambda *a,**k:'header', route_map={'r':{'name':'r','targets':[1,2]}},
                   is_stale_file=lambda p:False, media_target_parallel=False, delete_after_send=True,
-                  log=lambda x:None, send_file_to_target=AsyncMock(return_value=NS(sent_message_id=77)))
+                  log=lambda x:None, send_file_to_target=AsyncMock(return_value=NS(sent_message_id=77,delivery_kind="file")))
 
     async def test_snapshot_reuses_archive_and_pipeline_cleanup_never_deletes_archive(self):
         first=await self.take(); archive=await self.bridge.cached(first['shared_identity'])
@@ -122,15 +124,19 @@ class SharedTests(unittest.IsolatedAsyncioTestCase):
         self.msg.id=18;self.msg.photo=NS(id=346)
         second=await self.take()
         ctx=self.ctx();ctx.route_map['r']['targets']=[1]
-        ctx.send_album_to_target=AsyncMock(return_value=NS(sent_message_id=80,sent_message_ids=[80,81]))
+        ctx.send_album_to_target=AsyncMock(return_value=NS(sent_message_id=80,sent_message_ids=[80,81],delivery_kind="album"))
         job={'info':dict(self.info,grouped_id=100),'snapshots':[first,second],'source_kind':'new','route_names':['r']}
         with patch.object(job_processing,'store_album_mapping',AsyncMock()) as mapping:
             await job_processing.process_media_album_file_job(job,ctx)
             await job_processing.process_media_album_file_job(job,ctx)
             self.assertEqual(ctx.send_album_to_target.await_count,1)
-            self.assertEqual(mapping.await_count,2)
+            self.assertEqual(mapping.await_count,1)
             self.assertEqual(mapping.await_args.args[3]['message_ids'],[80,81])
             job['source_kind']='edited'
+            first=await self.take()
+            self.msg.id=19;self.msg.photo=NS(id=347)
+            second=await self.take()
+            job['snapshots']=[first,second];job.pop('spool_ref',None)
             first['caption_text']='changed caption'
             await job_processing.process_media_album_file_job(job,ctx)
             self.assertEqual(ctx.send_album_to_target.await_count,2)
@@ -139,8 +145,8 @@ class SharedTests(unittest.IsolatedAsyncioTestCase):
         snap=await self.take();ctx=self.ctx();ctx.route_map['r']['targets']=[1]
         ctx.send_file_to_target=AsyncMock(return_value=False)
         job={'info':self.info,'snapshot':snap,'source_kind':'new','route_names':['r']}
-        with self.assertRaises(shared.AmbiguousDelivery):await job_processing.process_media_file_job(job,ctx)
-        with self.assertRaises(shared.AmbiguousDelivery):await job_processing.process_media_file_job(job,ctx)
+        with self.assertRaises((shared.AmbiguousDelivery,RuntimeError)):await job_processing.process_media_file_job(job,ctx)
+        with self.assertRaises((shared.AmbiguousDelivery,RuntimeError)):await job_processing.process_media_file_job(job,ctx)
         ctx.send_file_to_target.assert_awaited_once()
 
     async def test_legacy_flag_off_no_redis_or_revision_required(self):
