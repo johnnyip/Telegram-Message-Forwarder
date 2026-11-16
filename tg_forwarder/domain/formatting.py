@@ -38,8 +38,11 @@ def build_chat_message_url(info: dict) -> Optional[str]:
     if not msg_id:
         return None
 
+    if info.get("chat_type") == "private" or (isinstance(chat_id, int) and chat_id > 0):
+        return None
+
     if chat_username:
-        return f"https://t.me/{chat_username}/{msg_id}"
+        return f"https://t.me/{str(chat_username).lstrip(chr(64))}/{msg_id}"
 
     if isinstance(chat_id, int):
         s = str(chat_id)
@@ -47,6 +50,21 @@ def build_chat_message_url(info: dict) -> Optional[str]:
             return f"https://t.me/c/{s[4:]}/{msg_id}"
 
     return None
+
+
+def format_discussion_links(info: dict) -> str:
+    origin = info.get("discussion_source")
+    if not isinstance(origin, dict):
+        return ""
+    source = origin.get("chat_id")
+    post = origin.get("post_id")
+    comment = info.get("msg_id")
+    if type(post) is not int or post <= 0 or type(comment) is not int or comment <= 0:
+        return ""
+    url = build_chat_message_url({"chat_id": source, "chat_username": origin.get("chat_username"), "msg_id": post})
+    if not url:
+        return ""
+    return f"[原帖 #{post}]({url}) · [留言 #{comment}]({url}?comment={comment})"
 
 
 def format_copyable_identity_lines(info: dict) -> str:
@@ -86,6 +104,9 @@ def build_header_from_info(info: dict, is_edit=False) -> str:
         group_line = f"[{escape_md_link_text(chat_title)}]"
 
     identity_lines = format_copyable_identity_lines(info)
+    discussion_links = format_discussion_links(info)
+    if discussion_links:
+        group_line += '\n' + discussion_links
 
     if is_edit:
         if identity_lines:

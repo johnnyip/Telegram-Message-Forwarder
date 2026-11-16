@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -16,11 +17,9 @@ from .verbose_flags import maybe_verbose_log
 # Per-(target_chat_id, sender_id) lock to prevent duplicate topic creation races.
 _TOPIC_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
 
-# In-process cache of whether a target chat has forum/topics enabled.
-# A chat's forum status is effectively immutable during a process lifetime
-# (toggling requires supergroup admin action), so we cache it permanently to
-# avoid calling bot.get_chat() on every forwarded message.
+# Refresh negative forum observations so enabling topics does not require restart.
 _FORUM_CHAT_CACHE: dict[int, bool] = {}
+_FORUM_CHAT_CACHE_AT: dict[int, float] = {}
 FORUM_TOPIC_DELIVERY_MODE = (os.getenv("FORUM_TOPIC_DELIVERY_MODE", "mirror").strip().lower() or "mirror")
 if FORUM_TOPIC_DELIVERY_MODE not in {"mirror", "topic_only"}:
     FORUM_TOPIC_DELIVERY_MODE = "mirror"
@@ -86,7 +85,7 @@ def _should_create_topic(info: dict) -> bool:
     if isinstance(snapshots, list) and snapshots:
         return True
     media_type = job_media_type_from_info(info)
-    return media_type in {"photo", "video"}
+    return media_type in {"photo", "video", "animation", "document", "audio", "voice", "video_note", "sticker"}
 
 
 def _hinted_thread_id(target: Any, info: dict) -> Optional[int]:
@@ -110,9 +109,10 @@ async def resolve_topic_thread_id(bot, target: Any, info: dict, *, log) -> Optio
 
     try:
         # Use the cached is_forum result to avoid an API call on every message.
-        if target_chat_id not in _FORUM_CHAT_CACHE:
+        if target_chat_id not in _FORUM_CHAT_CACHE or (not _FORUM_CHAT_CACHE[target_chat_id] and time.monotonic()-_FORUM_CHAT_CACHE_AT.get(target_chat_id,0)>=60):
             chat = await bot.get_chat(target_chat_id)
             _FORUM_CHAT_CACHE[target_chat_id] = bool(getattr(chat, "is_forum", False))
+            _FORUM_CHAT_CACHE_AT[target_chat_id] = time.monotonic()
         if not _FORUM_CHAT_CACHE[target_chat_id]:
             return None
     except Exception as exc:
@@ -197,7 +197,11 @@ async def _append_topic_link(text: str, target: Any, thread_id: Optional[int], t
     if thread_id:
         topic_url = build_topic_message_url(target, thread_id, topic_message_id)
         if topic_url:
-            return f"{text}\n[Topic]({topic_url})"
+            lines = text.splitlines()
+            if lines and lines[-1].startswith("[Topic](https://t.me/c/") and lines[-1].endswith(")"):
+                lines.pop()
+            lines.append(f"[Topic]({topic_url})")
+            return chr(10).join(lines)
     return text
 
 
@@ -281,6 +285,7 @@ async def send_file_via_bot(bot, target: Any, fpath: Path, caption: str, info: d
 
     thread_id = await resolve_topic_thread_id(bot, target, info, log=log)
     topic_only = _topic_only_enabled(thread_id)
+    caption = await _append_topic_link(caption, target, thread_id)
     maybe_verbose_log(log, {"ts": tstamp(), "type": "info", "op": "send_file_attempt", **extra, "target": target, "media_kind": media_kind, "caption_preview": caption[:200], "file_size": file_size, "upload_max_bytes": upload_max_bytes, "message_thread_id": thread_id, "topic_only": topic_only})
 
     try:
@@ -348,6 +353,7 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
     has_large_video = any(media_type == "video" for media_type in (media_types or [])) and total_size > album_max_total_bytes
     thread_id = await resolve_topic_thread_id(bot, target, info, log=log)
     topic_only = _topic_only_enabled(thread_id)
+    caption = await _append_topic_link(caption, target, thread_id)
     maybe_verbose_log(log, {"ts": tstamp(), "type": "info", "op": "send_album_attempt", **extra, "target": target, "media_types": media_types, "caption_preview": caption[:200], "total_size": total_size, "album_max_total_bytes": album_max_total_bytes, "message_thread_id": thread_id, "topic_only": topic_only})
     preserve_local_copy = False
     try:
