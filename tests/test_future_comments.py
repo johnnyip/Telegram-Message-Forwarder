@@ -153,6 +153,31 @@ class FutureTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(load_routes(json.dumps([{'sources':[SOURCE],'targets':[2]}]))[0][FLAG])
         with self.assertRaises(RuntimeError):load_routes(json.dumps([{'sources':['@channel'],'targets':[2],FLAG:True}]))
 
+    async def test_download_mode_protected_peers_root_message_uses_snapshot_kafka(self):
+        self.routes[0]['download_future_comment_photos']=True
+        self.client.channel.noforwards=True;self.client.group.noforwards=True
+        self.client.root.noforwards=True;self.client.original.noforwards=True
+        await self.enable();self.add(2,protected=True)
+        await self.worker.tick()
+        self.media.assert_awaited_once()
+        args=self.media.await_args.args
+        self.assertTrue(args[1]['chat_noforwards'])
+        self.assertEqual(args[3],'discussion')
+        self.assertTrue((await self.state())['pending']['acked'])
+        await self.worker.tick();self.media.assert_awaited_once()
+
+    async def test_download_mode_read_access_error_still_preserves_cursor(self):
+        self.routes[0]['download_future_comment_photos']=True
+        await self.enable();self.add(2,protected=True);self.client.fail_history=True
+        await self.worker.tick();self.media.assert_not_awaited()
+        self.assertEqual((await self.state())['cursor'],1)
+
+    async def test_download_mode_change_fences_previous_generation(self):
+        await self.enable();prior=(await self.state())['signature']
+        self.add(2);self.routes[0]['download_future_comment_photos']=True
+        await self.worker.tick();self.media.assert_not_awaited()
+        self.assertNotEqual((await self.state())['signature'],prior)
+
     async def test_baseline_old_post_new_comment_and_future_post(self):
         self.add(10);await self.enable();self.media.assert_not_awaited()
         self.add(11);await self.worker.tick();self.assertEqual(self.media.await_count,1)

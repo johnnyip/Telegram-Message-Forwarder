@@ -58,7 +58,7 @@ def selections(routes):
 
 
 def signature(routes):
-    return digest(sorted((r['name'], sorted(r['sources'], key=str), sorted(r['targets'], key=str)) for r in routes))
+    return digest(sorted((r['name'], sorted(r['sources'], key=str), sorted(r['targets'], key=str), bool(r.get('download_future_comment_photos',False))) for r in routes))
 
 
 async def permitted(info, route):
@@ -209,7 +209,7 @@ class FutureComments:
             raise ValueError('Duplicate history IDs')
         return values
 
-    async def parent(self, msg, channel, group, resolver):
+    async def parent(self, msg, channel, group, resolver, *, download=False):
         reply = getattr(msg, 'reply_to', None)
         mid = getattr(reply, 'reply_to_top_id', None) or getattr(reply, 'reply_to_msg_id', None)
         visited = {msg.id}
@@ -240,7 +240,7 @@ class FutureComments:
                 original = await self.call(self.client.get_messages, channel, ids=post)
                 if not original:
                     raise ValueError('Original channel post unavailable')
-                if getattr(root,'noforwards',False) or getattr(original,'noforwards',False):
+                if not download and (getattr(root,'noforwards',False) or getattr(original,'noforwards',False)):
                     return None
                 return {'chat_id':utils.get_peer_id(channel), 'post_id':min(
                     (getattr(getattr(m,'fwd_from',None),'channel_post',post) or post for m in verified), default=post),
@@ -312,7 +312,7 @@ class FutureComments:
                     await self.save(redis,key,lease,token,state)
                     return  # retire exact named record next tick; crash-resumable
             raise RuntimeError('Future unresolved evidence bound; explicit maintenance required')
-        if getattr(channel,'noforwards',False) or getattr(group,'noforwards',False):
+        if not all(r.get('download_future_comment_photos',False) for r in routes) and (getattr(channel,'noforwards',False) or getattr(group,'noforwards',False)):
             raise PermissionError('Protected parent/discussion; cursor preserved')
         bridge = await self.bridge_factory()
         resolver = Resolver(self.client,limit=201,gate=bridge)
@@ -368,12 +368,13 @@ class FutureComments:
                 return
 
     async def publish(self, redis, key, lease, token, state, source, routes, channel, group, resolver, batch, advance):
+        download = bool(routes) and all(r.get('download_future_comment_photos',False) for r in routes)
         photos = []
         origin = None
         for msg in batch:
-            if not getattr(msg,'photo',None) or getattr(msg,'noforwards',False) or self.should_skip(msg):
+            if not getattr(msg,'photo',None) or (getattr(msg,'noforwards',False) and not download) or self.should_skip(msg):
                 continue
-            parent = await self.parent(msg,channel,group,resolver)
+            parent = await self.parent(msg,channel,group,resolver,download=download)
             if parent is None:
                 continue  # text, unrelated group messages and forwarded root copies are never jobs
             if origin is not None and origin != parent:
@@ -395,6 +396,7 @@ class FutureComments:
             if await redis.get(lease) != token:
                 raise RuntimeError('Future comment lease lost before publication')
             info = dict(photos[0][1])
+            if download:info['chat_noforwards'] = True  # Force snapshot -> Kafka, never direct forward.
             info['discussion_source'] = origin
             info['future_comments'] = {'source':source,'generation':state['generation'],'signature':state['signature'], 'expected':identities}
             usable = [m for m,_ in photos]

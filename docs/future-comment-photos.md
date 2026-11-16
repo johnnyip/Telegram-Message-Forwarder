@@ -192,3 +192,12 @@ and correlate source IDs -> Kafka job -> intended destination. No live forwardin
 source reads, joins, new messages or permission changes were performed by this
 implementation task. Storage/core rollout and the owner's pending archive write
 approval are separate and unchanged.
+
+## Explicit download-and-upload mode
+Set route boolean download_future_comment_photos=true together with
+forward_future_comment_photos=true for the operator-authorized named source.
+This retains verified ancestry, bounded history, owned local snapshots, durable
+Kafka outbox and sender topic uploads. Native forwarding is forced off.
+Read/download API errors remain authoritative and preserve the cursor. Other
+routes retain their default. Changing mode fences old queued generations and
+activates at the current tail without historical replay.
