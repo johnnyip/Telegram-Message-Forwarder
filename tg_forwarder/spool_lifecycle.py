@@ -82,12 +82,29 @@ class Spool:
         except FileExistsError:pass
         info=path.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_uid not in ({os.getuid()} | trusted_file_owner_uids()) or info.st_nlink!=1 or info.st_mode&0o077:raise ValueError('Unsafe spool DB')
-        c=sqlite3.connect(path,timeout=5);c.row_factory=sqlite3.Row
+        # Serialize NAS writers before SQLite's short busy timer. Preserve
+        # DELETE journaling, FULL durability and immutable delivery receipts.
+        lock=os.open(state/'db.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+        c=None
         try:
+            info=os.fstat(lock)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or info.st_uid not in ({os.getuid()} | trusted_file_owner_uids()) or info.st_mode&0o077:
+                raise ValueError('Unsafe spool transaction lock')
+            deadline=time.monotonic()+120
+            while True:
+                try:
+                    fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic()>=deadline:raise TimeoutError('Spool transaction contention; retained')
+                    time.sleep(0.025)
+            c=sqlite3.connect(path,timeout=30);c.row_factory=sqlite3.Row
             c.execute('PRAGMA synchronous=FULL');c.execute('PRAGMA journal_mode=DELETE')
             c.executescript('CREATE TABLE IF NOT EXISTS files(token TEXT PRIMARY KEY,data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS refs(token TEXT,ref TEXT,data TEXT NOT NULL,PRIMARY KEY(token,ref)); CREATE TABLE IF NOT EXISTS targets(ref TEXT,target TEXT,data TEXT NOT NULL,PRIMARY KEY(ref,target));')
             c.execute('BEGIN IMMEDIATE');yield c;c.commit()
-        finally:c.close()
+        finally:
+            if c is not None:c.close()
+            os.close(lock)
 
     def row(self,c,token):
         r=c.execute('SELECT data FROM files WHERE token=?',(token,)).fetchone()
