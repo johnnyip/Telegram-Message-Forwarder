@@ -70,7 +70,16 @@ from ..domain.timefmt import DISPLAY_TZ
 
 # Serialize the whole fetch/append/store transaction, not merely the API call.
 # The deployed topology has one listener; sender mappings remain atomic per target.
-_history_lock = asyncio.Lock()
+from weakref import WeakValueDictionary
+_history_locks = WeakValueDictionary()
+
+def history_lock(info, album):
+    key = (info.get('chat_id'), 'album' if album else 'msg', info.get('grouped_id') if album else info.get('msg_id'))
+    lock = _history_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _history_locks[key] = lock
+    return lock
 
 
 def _units(value):
@@ -118,7 +127,7 @@ async def _append_history(bot, info, source_text, log, *, album=False, caption=F
     fetch = (lambda: get_album_mapping(info['chat_id'], grouped_id)) if album else (lambda: get_message_mapping(info['chat_id'], info['msg_id']))
     store = store_album_mapping if album else store_message_mapping
     source_id = grouped_id if album else info['msg_id']
-    async with _history_lock:
+    async with history_lock(info, album):
         mapping = await _get_mapping_with_retry(fetch, {'ts': tstamp(), 'type': 'warn', 'op': 'append_edit_missing_mapping', 'chat_id': info.get('chat_id'), 'msg_id': info.get('msg_id')}, log)
         targets = mapping.get('targets', {})
         if not targets:

@@ -385,6 +385,9 @@ async def snapshot_album_messages(msgs: List[Any], info: dict, source_kind: str)
 # Kafka producer side
 # ============================================================
 
+_NONFORUM_TARGETS = {}
+
+
 async def _enrich_topic_hints(info: dict, routes: List[Dict[str, Any]]) -> dict:
     if client is None:
         return info
@@ -395,6 +398,8 @@ async def _enrich_topic_hints(info: dict, routes: List[Dict[str, Any]]) -> dict:
     for route in routes:
         for target in route.get("targets", []):
             target_chat_id = int(target)
+            if _NONFORUM_TARGETS.get(target_chat_id, 0) > now_ts():
+                continue
             if str(target_chat_id) in hints:
                 continue
             try:
@@ -415,6 +420,10 @@ async def _enrich_topic_hints(info: dict, routes: List[Dict[str, Any]]) -> dict:
                         "title": getattr(discovered, "title", None),
                     })
             except Exception as exc:
+                if exc.__class__.__name__ == 'ChannelForumMissingError':
+                    _NONFORUM_TARGETS[target_chat_id] = now_ts() + 900
+                    log({'ts': tstamp(), 'type': 'info', 'op': 'topic_discovery_nonforum_cached', 'target': target_chat_id, 'ttl': 900})
+                    continue
                 log({"ts": tstamp(), "type": "warn", "op": "prefetch_topic_discovery", "target": target_chat_id, "sender_id": int(sender_id), "err": exc.__class__.__name__, "msg": str(exc)})
     if not hints:
         return info
@@ -1449,32 +1458,14 @@ async def on_message_edited(event: events.MessageEdited.Event):
         if not should_process_edit_update(info, msg, ROUTES, SKIP_MESSAGE_TYPES, IGNORE_USERS, IGNORE_IDS):
             return
 
-        redis = await get_redis()
-        if redis is None:
-            log({
-                "ts": tstamp(),
-                "type": "warn",
-                "op": "edit_mapping_redis_unavailable",
-                "chat_id": info.get("chat_id"),
-                "msg_id": info.get("msg_id"),
-            })
-            return
+        from tg_forwarder.delivery.pending_edits import enqueue, route_signature
+        kind = 'text' if getattr(msg, 'media', None) is None else ('album' if getattr(msg, 'grouped_id', None) is not None else 'caption')
+        text = msg.text or msg.message or ('[empty]' if kind=='text' else '')
+        if kind != 'text':text=text.strip()
+        from tg_forwarder.shared_media import _io
+        event_id = await _io(enqueue, info, text, kind, route_signature(ROUTES,info['chat_id'],SKIP_MESSAGE_TYPES,IGNORE_USERS,IGNORE_IDS))
+        log({'ts':tstamp(),'type':'info','op':'edit_queued','event':event_id,'chat_id':info['chat_id'],'msg_id':info['msg_id']})
 
-        if getattr(msg, "media", None) is None:
-            edited = await edit_forwarded_text(bot, info, msg.text or msg.message or "[empty]", log, semaphore=edit_bot_semaphore, original_fetcher=fetch_message_by_id)
-            if not edited:
-                log({"ts": tstamp(), "type": "warn", "op": "edited_text_no_mapping_or_failed", "chat_id": info.get("chat_id"), "msg_id": info.get("msg_id")})
-            return
-
-        if getattr(msg, "grouped_id", None) is not None:
-            edited = await edit_forwarded_album_caption(bot, info, (msg.text or msg.message or "").strip(), log, semaphore=edit_bot_semaphore, original_fetcher=fetch_message_by_id)
-            if not edited:
-                log({"ts": tstamp(), "type": "warn", "op": "edited_album_no_mapping_or_failed", "chat_id": info.get("chat_id"), "grouped_id": info.get("grouped_id")})
-            return
-
-        edited = await edit_forwarded_media_caption(bot, info, (msg.text or msg.message or "").strip(), log, semaphore=edit_bot_semaphore, original_fetcher=fetch_message_by_id)
-        if not edited:
-            log({"ts": tstamp(), "type": "warn", "op": "edited_media_no_mapping_or_failed", "chat_id": info.get("chat_id"), "msg_id": info.get("msg_id")})
     except Exception as e:
         log({
             "ts": tstamp(),
@@ -1826,7 +1817,13 @@ async def main():
                     if shared_mode:
                         register_telethon_handlers()
                     touch_health("listen:running")
-                    await client.run_until_disconnected()
+                    from tg_forwarder.delivery.pending_edits import replay_loop
+                    edit_worker = asyncio.create_task(replay_loop(bot, log, ROUTES, fetch_message_by_id, SKIP_MESSAGE_TYPES, IGNORE_USERS, IGNORE_IDS))
+                    try:
+                        await client.run_until_disconnected()
+                    finally:
+                        edit_worker.cancel()
+                        await asyncio.gather(edit_worker, return_exceptions=True)
                 finally:
                     LOGGER.warning("client disconnected")
 

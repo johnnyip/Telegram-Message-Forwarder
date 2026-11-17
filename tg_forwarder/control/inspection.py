@@ -35,7 +35,7 @@ def remove_owned_socket(path, identity=None):
     path.unlink()
 
 
-async def serve(config, resolver):
+async def serve(config, resolver, health_provider=None):
     path = socket_path(config)
     # Caller already owns the exclusive state lock; no other state-owner can be live.
     remove_owned_socket(path)
@@ -46,7 +46,8 @@ async def serve(config, resolver):
             request = json.loads(line)
             if isinstance(request,dict) and set(request) == {"health"} and request["health"] is True:
                 validate_filesystems(config)
-                writer.write(b'{"status":"ok"}\n')
+                result=health_provider() if health_provider else {'status':'ok'}
+                writer.write((json.dumps(result)+'\n').encode())
                 await writer.drain()
                 return
             if not isinstance(request,dict) or set(request) != {"inspect"}:
@@ -93,7 +94,7 @@ async def health_running(config):
         writer.write(b'{"health":true}\n')
         await writer.drain()
         result = json.loads(await asyncio.wait_for(reader.readline(),5))
-        if result != {"status":"ok"}:
+        if result.get("status") != "ok":
             raise RuntimeError("Control health check failed")
         return result
     finally:

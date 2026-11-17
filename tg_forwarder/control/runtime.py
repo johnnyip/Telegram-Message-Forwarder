@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+import random
 from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Bot, Update
@@ -23,6 +24,15 @@ from .delivery import BotDelivery
 from .inspection import summary, serve, inspect_running, health_running
 
 LOG = logging.getLogger(__name__)
+_HEALTH = {'started':time.time(),'poll_success':None,'poll_errors':0,'poll_error_class':None,'inbox_tick':None}
+
+def health_snapshot(store):
+    now=time.time()
+    age=now-(_HEALTH['poll_success'] or _HEALTH['started'])
+    result={'status':'ok','ready':_HEALTH['poll_success'] is not None and age<180,'poll_success_age_seconds':round(age,1),'poll_errors':_HEALTH['poll_errors'],'poll_error_class':_HEALTH['poll_error_class'],'inbox_age_seconds':round(now-(_HEALTH['inbox_tick'] or _HEALTH['started']),1)}
+    result['tasks']={r[0]:r[1] for r in store.db.execute('SELECT state,COUNT(*) FROM tasks GROUP BY state')}
+    result['updates']={r[0]:r[1] for r in store.db.execute('SELECT state,COUNT(*) FROM updates GROUP BY state')}
+    return result
 
 
 class StartupError(RuntimeError):
@@ -64,6 +74,7 @@ def client_from_env():
 
 async def inbox_loop(controller, store):
     while True:
+        _HEALTH['inbox_tick']=time.time()
         row = store.db.execute("SELECT id,payload,attempt FROM updates WHERE state='pending' AND due<=? ORDER BY id LIMIT 1", (time.time(),)).fetchone()
         if row:
             store.db.execute("UPDATE updates SET state='processing',attempt=attempt+1 WHERE id=?", (row["id"],))
@@ -96,22 +107,30 @@ def ingest_authorized(update, store, allowed):
 
 
 async def polling(bot, store, allowed):
+    failures=0
     while True:
         try:
             updates = await bot.get_updates(offset=int(store.get_meta("offset")), timeout=30,
                                             allowed_updates=["message", "callback_query"])
+            failures=0
+            recovering=_HEALTH['poll_errors']>0
+            _HEALTH.update(poll_success=time.time(),poll_errors=0,poll_error_class=None)
+            if recovering:LOG.warning('control_poll_recovered')
             for update in updates:
                 ingest_authorized(update, store, allowed)
         except Conflict:
-            raise RuntimeError("Another poller/webhook owns this bot; stop old downloader before starting control") from None
+            raise StartupError("CONTROL_BOT_POLL_CONFLICT: another poller/webhook owns this bot") from None
         except RetryAfter as exc:
             delay = exc.retry_after.total_seconds() if hasattr(exc.retry_after, "total_seconds") else exc.retry_after
             await asyncio.sleep(float(delay))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            LOG.warning("control polling delayed class=%s", type(exc).__name__)
-            await asyncio.sleep(5)
+            failures+=1
+            delay=min(60,2**min(failures,6))+random.uniform(0,1)
+            _HEALTH.update(poll_errors=failures,poll_error_class=type(exc).__name__)
+            LOG.warning('control_poll_delayed class=%s consecutive=%s backoff_seconds=%.1f',type(exc).__name__,failures,delay)
+            await asyncio.sleep(delay)
 
 
 async def run(inspect_url=None, health=False):
@@ -133,13 +152,13 @@ async def run(inspect_url=None, health=False):
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise RuntimeError("Control state already owned by another process") from None
+            raise StartupError("CONTROL_STATE_LOCKED: control state already owned") from None
         store = Store(config.db)
         client = client_from_env()
         try:
             await client.connect()
             if not await client.is_user_authorized():
-                raise RuntimeError("Downloader user session not authorized; no interactive login attempted")
+                raise StartupError("CONTROL_USER_UNAUTHORIZED: no interactive login attempted")
             from tg_forwarder.shared_media import configured_bridge
             bridge = await configured_bridge()
             gate = RateGate(store, bridge)
@@ -170,8 +189,9 @@ async def run(inspect_url=None, health=False):
                         await controller.render_task(task["owner"], task["chat"], task["reply"] or None, task)
                 engine.notify = notify
                 store.recover()
+                LOG.warning("control_started workers=%s",config.concurrency)
                 tasks = [asyncio.create_task(polling(bot, store, config.allowed)), asyncio.create_task(inbox_loop(controller, store)),
-                         asyncio.create_task(controller.watch_loop()), asyncio.create_task(controller.preview_loop()), asyncio.create_task(serve(config, resolver))]
+                         asyncio.create_task(controller.watch_loop()), asyncio.create_task(controller.preview_loop()), asyncio.create_task(serve(config, resolver, lambda:health_snapshot(store)))]
                 tasks += [asyncio.create_task(engine.worker()) for _ in range(config.concurrency)]
                 try:
                     await asyncio.gather(*tasks)
@@ -185,6 +205,8 @@ async def run(inspect_url=None, health=False):
 
 
 def cli():
+    from ..runtime.logging_setup import setup_logging
+    setup_logging()
     parser = argparse.ArgumentParser(description="Telegram media workbench")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--health", action="store_true", help="Local socket health; no Telegram calls or second auth client")
@@ -195,6 +217,7 @@ def cli():
     except KeyboardInterrupt:
         pass
     except Exception as exc:
+        LOG.error("control_stopped class=%s",type(exc).__name__,exc_info=True)
         print("Control stopped: "+(str(exc) if isinstance(exc, (StartupError, FilesystemError)) else type(exc).__name__+" (check configuration/access; credentials not logged)"), flush=True)
         raise SystemExit(1) from None
 

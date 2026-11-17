@@ -415,7 +415,7 @@ class Spool:
                 os.close(lease)
         return count,bytes_
 
-    def scan(self,*,limit=64,max_bytes=256*1024*1024,seconds=2,now=None):
+    def scan(self,*,limit=64,max_bytes=1024*1024*1024,seconds=2,now=None):
         now=time.time() if now is None else now;started=time.monotonic();deleted=0;bytes_=0;errors=0
         lock=os.open(self.guard()/'gc.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
         try:
@@ -424,16 +424,22 @@ class Spool:
             with self.db() as c:
                 self.reconcile(c,now,min(limit,64))
                 abandoned,bytes_=self.abandoned(c,now,min(limit,16),max_bytes,started,seconds)
-                rows=[json.loads(r[0]) for r in c.execute('SELECT data FROM files WHERE json_extract(data,\'$.state\')=\'cleanup_pending\' AND json_extract(data,\'$.due\')<=? ORDER BY rowid LIMIT ?',(now,max(0,min(limit,64)-abandoned)))]
+                rows=[json.loads(r[0]) for r in c.execute('SELECT data FROM files WHERE json_extract(data,\'$.state\')=\'cleanup_pending\' AND json_extract(data,\'$.due\')<=? ORDER BY json_extract(data,\'$.due\'),rowid LIMIT ?',(now,max(0,min(limit,64)-abandoned)))]
             for old in rows:
-                if time.monotonic()-started>=seconds or bytes_+old['proof'][2]>max_bytes:break
+                if time.monotonic()-started>=seconds:break
+                if bytes_+old['proof'][2]>max_bytes:
+                    with self.db() as c:
+                        row=self.row(c,old['token']);row['due']=now+60;self.put(c,row)
+                    continue
                 if old.get('due',now+1)>now:continue
                 try:
                     with self.db() as c:
                         row=self.row(c,old['token'])
                         if row['state']!='cleanup_pending' or not row['shared_safe']:continue
                         refs=[json.loads(v[0]) for v in c.execute('SELECT data FROM refs WHERE token=?',(row['token'],))]
-                        if not refs or any(r['state']!='terminal' for r in refs):continue
+                        if not refs or any(r['state']!='terminal' for r in refs):
+                            row['due']=now+60;self.put(c,row)
+                            continue
                         bytes_+=self.claim_remove(row,row['path'])
                         row['state']='deleted';row['deleted_at']=now;self.put(c,row);deleted+=1
                 except (OSError,ValueError,sqlite3.Error) as exc:
@@ -446,7 +452,9 @@ class Spool:
                     except (OSError,ValueError,sqlite3.Error):pass
             with self.db() as c:
                 states={r[0]:{'files':r[1],'bytes':r[2]} for r in c.execute("SELECT json_extract(data,'$.state'),COUNT(*),SUM(json_extract(data,'$.proof[2]')) FROM files GROUP BY json_extract(data,'$.state')")}
-            return {'known_states':states,'unknown_walk':False,'owner':True,'deleted':deleted,'bytes':bytes_,'errors':errors,'abandoned':abandoned,'scanned':len(rows),'complete':len(rows)<min(limit,64),'at':now}
+            with self.db() as c:
+                due_count = c.execute("SELECT COUNT(*) FROM files WHERE json_extract(data,'$.state')='cleanup_pending' AND json_extract(data,'$.due')<=?", (now,)).fetchone()[0]
+            return {'due_count':due_count,'known_states':states,'unknown_walk':False,'owner':True,'deleted':deleted,'bytes':bytes_,'errors':errors,'abandoned':abandoned,'scanned':len(rows),'complete':len(rows)<min(limit,64),'at':now}
         finally:os.close(lock)
 
 
@@ -479,11 +487,17 @@ async def finish(job,paths):
 async def completed(job):
     return owned(job) and await _io(manager().complete,job)
 
-async def gc_loop(log,interval=3600):
+async def gc_loop(log,interval=60):
     while True:
-        try:log({'type':'spool_gc',**await _io(manager().scan)})
-        except (OSError,ValueError,sqlite3.Error) as exc:log({'type':'spool_gc_error','error':type(exc).__name__})
-        await asyncio.sleep(interval)
+        try:
+            result = await _io(manager().scan)
+            log({'type':'spool_gc', **result})
+            # Retry bounded batches promptly; never weaken ownership/reference checks.
+            delay = 2 if result.get('owner') and not result.get('complete', True) and result.get('deleted', 0) else interval
+        except (OSError,ValueError,sqlite3.Error) as exc:
+            delay = interval
+            log({'type':'spool_gc_error','error':type(exc).__name__})
+        await asyncio.sleep(delay)
 
 
 async def classify(job,state):

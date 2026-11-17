@@ -15,14 +15,15 @@ def now_ts() -> float:
 
 
 def log(obj: dict, log_dir: Path):
-    line = json.dumps(obj, ensure_ascii=False, default=str)
+    from ..runtime.logging_setup import redact
+    line = redact(json.dumps(obj, ensure_ascii=False, default=str))
     print(line)
     try:
         today_file = log_dir / f"{datetime.now().strftime('%Y-%m-%d')}.log"
         with today_file.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     except Exception as e:
-        print(f"[LOG_ERR] {e}")
+        print("[LOG_ERR] " + type(e).__name__)
 
 
 def safe_str(value) -> str:

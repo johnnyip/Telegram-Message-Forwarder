@@ -31,6 +31,7 @@ class StartupIdentityTests(unittest.IsolatedAsyncioTestCase):
             async def __aenter__(self):return self
             async def __aexit__(self,*args):return False
         env={'os':os,'asyncio':asyncio,'APP_MODE':mode,'client':Client(),
+             'ROUTES':[], 'SKIP_MESSAGE_TYPES':set(), 'IGNORE_USERS':set(), 'IGNORE_IDS':set(), 'fetch_message_by_id':AsyncMock(),
              'bot':NS(get_me=AsyncMock(return_value=NS(id=principal),side_effect=error)),
              'DOWNLOAD_DIR':NS(mkdir=Mock()),'LOG_DIR':NS(mkdir=Mock()),'SPOOL_DIR':NS(mkdir=Mock()),'RETAIN_DIR':NS(mkdir=Mock()),
              'cleanup_logs':Mock(),'cleanup_retained_files':Mock(),'print_route_summary':Mock(),'touch_health':Mock(),
