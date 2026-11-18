@@ -420,6 +420,9 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
         for idx, single in enumerate(files):
             single_type = media_types[idx] if media_types and idx < len(media_types) else None
             single_caption = caption if idx == 0 else ""
+            single_info = dict(info)
+            identities = info.get('_delivery_identities')
+            single_info['_delivery_identities'] = identities[idx:idx+1] if identities else None
             # Determine whether the file is too large *before* calling _call_with_retry.
             # Passing `None` (not a coroutine) to _call_with_retry causes `await None`
             # which raises TypeError and swallows the notice-text path entirely.
@@ -441,14 +444,14 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
                     )
                     notice = append_original_time(notice, info.get("msg_date"))
                     async with bot_send_semaphore:
-                        sent = await _call_with_retry(lambda n=notice: bot_send_text(bot, target, n, message_thread_id=None))
+                        sent = await _send_copy(lambda n=notice: bot_send_text(bot, target, n, message_thread_id=None), info=single_info, target=target, thread=None, caption=notice)
                     log({"ts": tstamp(), "type": "out", "op": "send_album_single_skip_notice", "status": "ok", "file": single, "target": target, "media_type": single_type, "preserve_local_copy": True, "sent_message_id": getattr(sent, "message_id", None), **extra})
                     preserve_local_copy = True
                 else:
                     async with bot_send_semaphore:
                         if thread_id:
                             try:
-                                topic_single_sent = await _call_with_retry(
+                                topic_single_sent = await _send_copy(
                                     lambda sp=single, sc=single_caption, st=single_type: bot_send_file(
                                         bot,
                                         target,
@@ -456,15 +459,17 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
                                         sc,
                                         media_type=st,
                                         message_thread_id=thread_id,
-                                        log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "fallback_single": True, "topic_copy": True, "file": sp, "media_type": st}),
-                                    )
+                                        log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "fallback_single": True, "topic_copy": True, "file": single, "media_type": single_type}),
+                                    ), info=single_info, target=target, thread=thread_id, caption=single_caption
                                 )
                                 if topic_only:
                                     sent = topic_single_sent
                             except Exception as topic_exc:
+                                if not definite_rejection(topic_exc):
+                                    raise
                                 log({"ts": tstamp(), "type": "warn", "op": "send_album_single_fallback_topic_copy", "err": topic_exc.__class__.__name__, "msg": str(topic_exc), **extra, "target": target, "message_thread_id": thread_id, "file": single, "note": "degrading_to_general_only"})
                         if sent is None:
-                            sent = await _call_with_retry(
+                            sent = await _send_copy(
                                 lambda sp=single, sc=single_caption, st=single_type: bot_send_file(
                                     bot,
                                     target,
@@ -472,16 +477,18 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
                                     sc,
                                     media_type=st,
                                     message_thread_id=None,
-                                    log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "fallback_single": True, "file": sp, "media_type": st}),
-                                )
+                                    log_fn=lambda payload: log({"ts": tstamp(), "type": "debug", **extra, **payload, "fallback_single": True, "file": single, "media_type": single_type}),
+                                ), info=single_info, target=target, thread=None, caption=single_caption
                             )
                     log({"ts": tstamp(), "type": "out", "op": "send_album_single_fallback", "status": "ok", "file": single, "target": target, "media_type": single_type, "sent_message_id": getattr(sent, "message_id", None), **extra})
-                if getattr(sent, "message_id", None):
-                    fallback_message_ids.append(getattr(sent, "message_id", None))
+                if not getattr(sent, "message_id", None):
+                    raise RuntimeError("Missing album single receipt; reconcile before resend")
+                fallback_message_ids.append(sent.message_id)
                 ok_count += 1
             except Exception as inner:
                 log({"ts": tstamp(), "type": "err", "op": "send_album_single_fallback", "err": inner.__class__.__name__, "msg": str(inner), "file": single, "target": target, "media_type": single_type, "caption_preview": single_caption[:200], **extra})
-        return SendOutcome(ok_count > 0, preserve_local_copy=preserve_local_copy, sent_message_id=(fallback_message_ids[0] if fallback_message_ids else None), sent_message_ids=fallback_message_ids or None, delivery_kind="album_single_fallback", message_thread_id=thread_id)
+                raise  # partial success is not a complete album receipt
+        return SendOutcome(ok_count == len(files), preserve_local_copy=preserve_local_copy, sent_message_id=(fallback_message_ids[0] if fallback_message_ids else None), sent_message_ids=fallback_message_ids or None, delivery_kind="album_single_fallback", message_thread_id=thread_id)
 
 
 __all__ = [

@@ -110,3 +110,18 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(NetworkError):
                 await runtime.send_file_via_bot(object(),4,self.path,'c',self.info,{'name':'r'},'new',bot_send_semaphore=asyncio.Semaphore(1),log=self.logs.append)
         send.assert_awaited_once()
+
+
+    async def test_album_fallback_partial_success_raises_not_complete(self):
+        send=AsyncMock(side_effect=[NS(message_id=42),NetworkError('Gateway Timeout')])
+        with patch.object(runtime,'resolve_topic_thread_id',AsyncMock(return_value=None)),patch.object(runtime,'_append_topic_link',AsyncMock(return_value='c')),patch.object(runtime,'_send_copy',send):
+            with self.assertRaises(NetworkError):
+                await runtime.send_album_via_bot(object(),4,[str(self.path)]*2,'c',dict(self.info,_album_snapshots=[{'media_type':'video'}]*2),{'name':'r'},'new',bot_send_semaphore=asyncio.Semaphore(1),album_max_total_bytes=1,upload_max_bytes=1_000_000,log=self.logs.append)
+        self.assertEqual(send.await_count,2)
+
+    async def test_album_fallback_topic_timeout_never_sends_general(self):
+        send=AsyncMock(side_effect=NetworkError('Gateway Timeout'))
+        with patch.object(runtime,'resolve_topic_thread_id',AsyncMock(return_value=8)),patch.object(runtime,'_append_topic_link',AsyncMock(return_value='c')),patch.object(runtime,'_send_copy',send):
+            with self.assertRaises(NetworkError):
+                await runtime.send_album_via_bot(object(),4,[str(self.path)]*2,'c',dict(self.info,_album_snapshots=[{'media_type':'video'}]*2),{'name':'r'},'new',bot_send_semaphore=asyncio.Semaphore(1),album_max_total_bytes=1,upload_max_bytes=1_000_000,log=self.logs.append)
+        send.assert_awaited_once()
