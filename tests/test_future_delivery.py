@@ -71,6 +71,28 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         extract('media_consumer_loop',env)
         return env
 
+    async def test_ordinary_media_failure_has_source_coordinates_and_retention(self):
+        job=dict(job_type='media_file',info={'chat_id':12,'msg_id':34},route_names=['existing'])
+        normal=Consumer([job],'media');env=self.environment(normal)
+        env['dispatch_media_job']=AsyncMock(side_effect=RuntimeError('transport failed'))
+        with patch('tg_forwarder.spool_lifecycle.classify',AsyncMock()) as classify:
+            await env['media_consumer_loop']()
+        classify.assert_awaited_once_with(job,'send_failed_recoverable')
+        row=next(r for r in self.logs if r.get('op')=='media_delivery_unconfirmed')
+        self.assertEqual((row['chat_id'],row['msg_id'],row['partition'],row['offset']),(12,34,0,0))
+        self.assertEqual(row['lane'],'media');self.assertFalse(normal.marks)
+        normal.stop.assert_awaited_once()
+
+    async def test_text_failure_stays_text_local_and_does_not_reference_media_lane(self):
+        normal=Consumer([dict(job_type='text',info={'chat_id':12,'msg_id':34})],'text')
+        env=self.environment(None)
+        env.update(text_consumer=normal,process_text_job_mod=AsyncMock(side_effect=RuntimeError('rejected')))
+        extract('text_consumer_loop',env)
+        await env['text_consumer_loop']()
+        self.assertTrue(any(r.get('op')=='text_consumer_loop' for r in self.logs))
+        self.assertFalse(any(r.get('op')=='media_delivery_unconfirmed' for r in self.logs))
+        normal.stop.assert_awaited_once()
+
     async def test_bad_future_does_not_stop_ordinary_and_commit_sets_independent(self):
         job=await self.job();Path(job['snapshots'][0]['path']).unlink()
         future=Consumer([job],self.topic);normal=Consumer([dict(ordinary=True,info={})],'media')

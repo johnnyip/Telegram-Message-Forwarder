@@ -786,14 +786,6 @@ async def text_consumer_loop():
                 # SEND_JOURNAL_MAX_FAILURES attempts the message is treated as a
                 # poison pill: we commit the offset to unblock the partition and
                 # log at critical level so operators can investigate.
-                if job is not None:
-                    await spool_classify(job, 'send_failed_recoverable')
-                    log({"ts":tstamp(),"type":"critical","op":"media_delivery_unconfirmed",
-                         "fingerprint":fingerprint,"chat_id":job.get('info',{}).get('chat_id'),
-                         "msg_id":job.get('info',{}).get('msg_id'),"routes":job.get('route_names'),
-                         "err":type(e).__name__,"msg":str(e),"lane":lane,
-                         "topic":record.topic,"partition":record.partition,"offset":record.offset,
-                         "action":"retained_for_reconciliation_no_blind_resend"})
                 if fingerprint:
                     failures = journal_record_failure(fingerprint, {
                         "job_type": job.get("job_type") if isinstance(job, dict) else None,
@@ -993,6 +985,20 @@ async def media_consumer_loop(consumer=None, lane="media"):
                     await block({'reason':e.__class__.__name__, 'topic':record.topic, 'partition':record.partition,
                                  'offset':record.offset, 'fingerprint':fingerprint})
                     raise RuntimeError("Future comment delivery requires retry/reconciliation") from None
+                if isinstance(job, dict):
+                    try:
+                        from tg_forwarder.spool_lifecycle import classify as spool_classify
+                        await spool_classify(job, 'send_failed_recoverable')
+                    except Exception as classify_exc:
+                        log({'ts':tstamp(),'type':'critical','op':'media_failure_retention_error',
+                             'err':type(classify_exc).__name__,'original_error':type(e).__name__})
+                    info = job.get('info') if isinstance(job.get('info'),dict) else {}
+                    log({"ts":tstamp(),"type":"critical","op":"media_delivery_unconfirmed",
+                         "fingerprint":fingerprint,"chat_id":info.get('chat_id'),
+                         "msg_id":info.get('msg_id'),"routes":job.get('route_names'),
+                         "err":type(e).__name__,"msg":str(e),"lane":lane,
+                         "topic":record.topic,"partition":record.partition,"offset":record.offset,
+                         "action":"retained_for_reconciliation_no_blind_resend"})
                 if fingerprint:
                     failures = journal_record_failure(fingerprint, {
                         "job_type": job.get("job_type") if isinstance(job, dict) else None,
