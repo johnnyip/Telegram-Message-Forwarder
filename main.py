@@ -786,6 +786,14 @@ async def text_consumer_loop():
                 # SEND_JOURNAL_MAX_FAILURES attempts the message is treated as a
                 # poison pill: we commit the offset to unblock the partition and
                 # log at critical level so operators can investigate.
+                if job is not None:
+                    await spool_classify(job, 'send_failed_recoverable')
+                    log({"ts":tstamp(),"type":"critical","op":"media_delivery_unconfirmed",
+                         "fingerprint":fingerprint,"chat_id":job.get('info',{}).get('chat_id'),
+                         "msg_id":job.get('info',{}).get('msg_id'),"routes":job.get('route_names'),
+                         "err":type(e).__name__,"msg":str(e),"lane":lane,
+                         "topic":record.topic,"partition":record.partition,"offset":record.offset,
+                         "action":"retained_for_reconciliation_no_blind_resend"})
                 if fingerprint:
                     failures = journal_record_failure(fingerprint, {
                         "job_type": job.get("job_type") if isinstance(job, dict) else None,
@@ -1364,7 +1372,7 @@ async def handle_incoming_message(msg, source_kind: str):
         })
         return
 
-    if msg.media is None:
+    if media_type(msg) == "text":
         # P7: Dedup text events so Telethon reconnect re-deliveries do not
         # publish a second Kafka job for the same message.
         _text_dedup_key = f"text:{info.get('chat_id')}:{info.get('msg_id')}:{source_kind}"
@@ -1382,6 +1390,12 @@ async def handle_incoming_message(msg, source_kind: str):
         dedup_mark(_text_dedup_key)
         schedule_discussion_snapshot([msg], routes, source_kind)
         return
+
+    if not (getattr(msg, "photo", None) or getattr(msg, "document", None)):
+        log({"ts": tstamp(), "type": "warn", "op": "unsupported_nonfile_media",
+             "chat_id": info["chat_id"], "msg_id": info["msg_id"],
+             "media_class": type(msg.media).__name__, "source_kind": source_kind})
+        return  # polls/contacts/expired files cannot be uploaded as documents
 
     if getattr(msg, "grouped_id", None) is not None:
         added = add_to_album_buffer(msg, source_kind)
@@ -1404,12 +1418,19 @@ async def handle_incoming_message(msg, source_kind: str):
     _dedup_key = dedup_key_for_message(info, source_kind)
 
     async def _publish_and_mark():
-        if APP_MODE == "listen" and should_direct_forward_large_media(info, msg):
-            await direct_forward_large_media(msg, info, routes, source_kind)
-        else:
-            await publish_media_job(msg, info, routes, source_kind)
-        dedup_mark(_dedup_key)
-        schedule_discussion_snapshot([msg], routes, source_kind)
+        try:
+            if APP_MODE == "listen" and should_direct_forward_large_media(info, msg):
+                await direct_forward_large_media(msg, info, routes, source_kind)
+            else:
+                await publish_media_job(msg, info, routes, source_kind)
+            dedup_mark(_dedup_key)
+            schedule_discussion_snapshot([msg], routes, source_kind)
+        except Exception as exc:
+            log({"ts": tstamp(), "type": "err", "op": "media_publish_failed",
+                 "chat_id": info["chat_id"], "msg_id": info["msg_id"],
+                 "source_kind": source_kind, "media_class": type(msg.media).__name__,
+                 "err": type(exc).__name__, "msg": str(exc), "dedup_marked": False})
+            raise
 
     spawn_bg(_publish_and_mark())
 

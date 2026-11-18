@@ -139,6 +139,7 @@ async def process_media_file_job(job: dict, ctx: JobProcessingContext) -> List[s
 
     snapshot = job["snapshot"]
     info["_media_type"] = snapshot.get("media_type")
+    info["_delivery_identities"] = [snapshot.get("shared_identity")]
     fpath = Path(snapshot["path"])
     if not fpath.exists():
         # P2: raise so the consumer does NOT commit the offset and can retry on
@@ -201,6 +202,7 @@ async def process_media_album_file_job(job: dict, ctx: JobProcessingContext) -> 
     snapshots = job["snapshots"]
     files = [snapshot["path"] for snapshot in snapshots if Path(snapshot["path"]).exists()]
     info["_album_snapshots"] = snapshots
+    info["_delivery_identities"] = [s.get("shared_identity") for s in snapshots]
     if owned(job) and len(files)!=len(snapshots):raise RuntimeError('Owned album incomplete; retained for recovery')
     if not files:
         ctx.log({"ts": tstamp(), "type": "err", "op": "media_album_files_missing", "chat_id": info["chat_id"], "grouped_id": info.get("grouped_id")})

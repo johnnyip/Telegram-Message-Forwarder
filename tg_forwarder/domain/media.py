@@ -6,7 +6,11 @@ from ..core.utils import sanitize_filename_part
 
 
 def media_type(m):
-    if getattr(m, "media", None) is None:
+    media = getattr(m, "media", None)
+    if media is None:
+        return "text"
+    # Link previews without an actual immutable file are text, not downloads.
+    if type(media).__name__ in {"MessageMediaWebPage", "MessageMediaEmpty"} and not (getattr(m, "photo", None) or getattr(m, "document", None)):
         return "text"
     return (
         "photo" if getattr(m, "photo", None) else

@@ -231,7 +231,7 @@ class FutureTests(unittest.IsolatedAsyncioTestCase):
         await self.enable();self.add(2);self.media.side_effect=ConnectionError('Kafka ack lost')
         await self.worker.tick();state=await self.state();self.assertEqual(state['cursor'],1)
         self.assertEqual(state['pending']['ids'],[2])
-        self.media.side_effect=self.default_media;self.worker=FutureComments(**self.kw);await self.worker.tick()
+        self.now+=2;self.media.side_effect=self.default_media;self.worker=FutureComments(**self.kw);await self.worker.tick()
         self.assertEqual(self.media.await_count,2);self.assertEqual((await self.state())['cursor'],2)
         self.assertEqual(self.media.await_args_list[0].args[1],self.media.await_args_list[1].args[1])
 
@@ -357,6 +357,7 @@ class FutureTests(unittest.IsolatedAsyncioTestCase):
         await self.worker.tick();state=await self.state()
         self.assertIn('job',state['pending']);self.assertEqual(state['cursor'],1)
         replay=AsyncMock();self.kw['replay_job']=replay
+        self.now+=2
         self.worker=FutureComments(**self.kw)
         await self.worker.tick();self.assertEqual((await self.state())['cursor'],2)
         replay.assert_awaited_once_with('existing-media-future-comments',state['pending']['job']['data'])
@@ -442,3 +443,25 @@ class FutureTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await self.state())['active'])
         self.redis.data.pop(lease);await self.worker.tick()
         self.assertTrue(self.worker.disabled_complete);self.assertFalse((await self.state())['active'])
+
+
+    async def test_source_failure_diagnostics_backoff_and_recovery_preserve_cursor(self):
+        await self.worker.tick()
+        before=json.loads(await self.redis.get(PREFIX+str(SOURCE)))['cursor']
+        self.client.fail_history=True
+        await self.worker.tick()
+        state=json.loads(await self.redis.get(PREFIX+str(SOURCE)))
+        self.assertEqual(state['cursor'],before)
+        self.assertEqual(state['error'],'PermissionError')
+        self.assertIn('not joined',state['error_message'])
+        self.assertEqual(state['error_stage'],'read_discussion_history')
+        self.assertEqual(state['retry_at'],self.now+1)
+        calls=len(self.client.calls)
+        await self.worker.tick()
+        self.assertEqual(len(self.client.calls),calls)
+        self.now+=2;self.client.fail_history=False
+        await self.worker.tick()
+        state=json.loads(await self.redis.get(PREFIX+str(SOURCE)))
+        self.assertEqual(state['failure_count'],0)
+        self.assertEqual(state['retry_at'],0)
+        self.assertTrue(any(e.get('op')=='future_comments_recovered' for e in self.logs))

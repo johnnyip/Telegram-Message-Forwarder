@@ -8,6 +8,7 @@ import asyncio
 from contextvars import ContextVar
 import json
 import time
+from ..runtime.logging_setup import redact
 import uuid
 from telethon import functions, types, utils
 from ..shared_media import digest, message_identity, configured_bridge
@@ -104,6 +105,7 @@ class FutureComments:
         self.groups = set()
         self.lock = asyncio.Lock()
         self.disabled_complete = False
+        self.stage = "idle"
         selections(routes)  # fail configuration validation before any source reads
 
     def offer(self, message):
@@ -123,7 +125,8 @@ class FutureComments:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.log({'type':'err', 'op':'future_comments_tick', 'error':type(exc).__name__})
+                self.log({'type':'err', 'op':'future_comments_tick', 'error':type(exc).__name__,
+                          'message':redact(str(exc))[:400], 'stage':self.stage})
             self.wakeup.clear()
             try:
                 await asyncio.wait_for(self.wakeup.wait(), self.interval)
@@ -161,25 +164,40 @@ class FutureComments:
                     raw = await redis.get(key)
                     state = json.loads(raw) if raw else {'generation':0, 'active':False}
                     routes = selected.get(source, [])
+                    if (state.get('retry_at', 0)>self.clock() and state.get('active')
+                            and state.get('signature')==signature(routes)):
+                        continue  # durable bounded backoff, never blocks a policy disable
                     if source not in known:
                         # Registry precedes state publication: a crash cannot orphan active state.
                         registered = await redis.eval("local raw=redis.call('GET',KEYS[1]); local list=raw and cjson.decode(raw) or {}; for _,v in ipairs(list) do if v==tonumber(ARGV[1]) then return cjson.encode(list) end end; if #list>=32 then return redis.error_reply('registry bound') end; table.insert(list,tonumber(ARGV[1])); local value=cjson.encode(list); redis.call('SET',KEYS[1],value); return value",1,REGISTRY,str(source))
                         known = json.loads(registered)
                     try:
+                        self.stage = "channel"
                         await self.channel(redis, key, lease, token, source, routes, state)
+                        if state.get('failure_count'):
+                            self.log({'type':'info','op':'future_comments_recovered','source':source,
+                                      'previous_error':state.get('error'),'failures':state['failure_count']})
+                            state.update(error='',error_message='',failure_count=0,retry_at=0,last_success_at=self.clock())
+                            await self.save(redis,key,lease,token,state)
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
-                        state['error'] = type(exc).__name__
-                        await self.save(redis, key, lease, token, state)
+                        failures = min(int(state.get('failure_count',0))+1, 16)
+                        delay = min(300, self.interval * 2**min(failures-1,5))
+                        state.update(error=type(exc).__name__, error_message=redact(str(exc))[:400],
+                                     error_stage=self.stage, failure_count=failures,
+                                     last_error_at=self.clock(), retry_at=self.clock()+delay)
                         self.log({'type':'err', 'op':'future_comments_source', 'source':source,
-                                  'error':type(exc).__name__})
+                                  'error':type(exc).__name__, 'message':state['error_message'],
+                                  'stage':self.stage,'retry_in_seconds':delay,
+                                  'cursor':state.get('cursor'),'pending':bool(state.get('pending'))})
+                        await self.save(redis, key, lease, token, state)
                 finally:
                     await redis.eval("if redis.call('GET',KEYS[1]) == ARGV[1] then return redis.call('DEL',KEYS[1]) else return 0 end",1,lease,token)
             self.disabled_complete = not selected and not busy
 
     async def save(self, redis, key, lease, token, state):
-        saved = await redis.eval("if redis.call('GET',KEYS[1]) == ARGV[1] then redis.call('SET',KEYS[2],ARGV[2]); return 1 else return 0 end",
+        saved = await redis.eval("if redis.call('GET',KEYS[1]) == ARGV[1] then redis.call('SET',KEYS[2],ARGV[2]); redis.call('EXPIRE',KEYS[1],120); return 1 else return 0 end",
                                  2, lease, key, token, json.dumps(state, sort_keys=True))
         if not saved:
             raise RuntimeError('Future comment lease lost')
@@ -279,6 +297,7 @@ class FutureComments:
                 state.update(active=False,generation=state['generation']+1,pending=None,tail=None)
                 await self.save(redis,key,lease,token,state)
             return
+        self.stage = 'resolve_linked_discussion'
         channel, group = await self.linked(source)
         group_id = utils.get_peer_id(group)
         sig = signature(routes)
@@ -338,6 +357,7 @@ class FutureComments:
             await self.publish(redis,key,lease,token,state,source,routes,channel,group,resolver,messages,pending['advance'])
             if state.get('pending'):
                 return
+        self.stage = 'read_discussion_history'
         messages = await self.history(group,state['cursor'])
         # The extra item is a boundary probe, not permission to skip excess backlog.
         boundary = messages[self.page_size] if len(messages)>self.page_size else None
@@ -368,6 +388,7 @@ class FutureComments:
                 return
 
     async def publish(self, redis, key, lease, token, state, source, routes, channel, group, resolver, batch, advance):
+        self.stage = 'prepare_comment_selection'
         download = bool(routes) and all(r.get('download_future_comment_photos',False) for r in routes)
         photos = []
         origin = None
@@ -421,6 +442,7 @@ class FutureComments:
                 if signature(selections(self.routes).get(source,[])) != state['signature']:
                     raise ValueError('Future comment disabled while staging publication')
                 return data
+            self.stage = 'publish_comment_outbox'
             prepared = state['pending'].get('job')
             if prepared is not None:
                 if self.replay_job is None:

@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
+from telegram.error import BadRequest
+
 from telegram import (
     Bot,
     InputMediaAnimation,
@@ -13,6 +15,30 @@ from telegram import (
 )
 
 BOT_SEND_AS_DOCUMENT = os.getenv("BOT_SEND_AS_DOCUMENT", "false").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def fit_caption(caption, log_fn=None):
+    """Conservative raw UTF-16 bound, even before Telegram entity parsing.
+
+    Preserve source/header and footer/topic navigation. The complete original
+    remains in the durable job/edit mapping; never send an extra uncertain text.
+    Truncated Markdown is sent plain to avoid dangling entity syntax.
+    """
+    caption = caption or ""
+    units = lambda text: len(text.encode("utf-16-le")) // 2
+    if units(caption) <= 1024:
+        return caption, False
+    def take(text, budget, tail=False):
+        result=[]; used=0
+        for char in (reversed(text) if tail else text):
+            size=units(char)
+            if used+size>budget:break
+            result.append(char);used+=size
+        return "".join(reversed(result) if tail else result)
+    marker=chr(10)+"… [caption shortened; original retained]"+chr(10)
+    result=take(caption, 760)+marker+take(caption, 1024-760-units(marker), True)
+    if log_fn:log_fn({"op":"caption_bounded","original_utf16_units":units(caption),"sent_utf16_units":units(result)})
+    return result, True
 
 
 def guess_media_kind(path: str, declared_type: Optional[str] = None) -> str:
@@ -38,11 +64,14 @@ def guess_media_kind(path: str, declared_type: Optional[str] = None) -> str:
 async def bot_send_text(bot: Bot, target, text: str, message_thread_id: Optional[int] = None):
     try:
         return await bot.send_message(chat_id=target, text=text, parse_mode="Markdown", message_thread_id=message_thread_id)
-    except Exception:
+    except BadRequest as exc:
+        if not any(word in str(exc).lower() for word in ("parse", "entity")):
+            raise
         return await bot.send_message(chat_id=target, text=text, message_thread_id=message_thread_id)
 
 
 async def bot_send_file(bot: Bot, target, file_path: str, caption: str = "", media_type: Optional[str] = None, message_thread_id: Optional[int] = None, log_fn=None):
+    caption, shortened = fit_caption(caption, log_fn)
     media_kind = guess_media_kind(file_path, media_type)
     p = Path(file_path)
     if log_fn:
@@ -93,7 +122,7 @@ async def bot_send_file(bot: Bot, target, file_path: str, caption: str = "", med
                 })
             return result
 
-        for kind, parse_mode in ((media_kind, "Markdown"), (media_kind, None), ("document", None)):
+        for kind, parse_mode in ((media_kind, None if shortened else "Markdown"), (media_kind, None), ("document", None)):
             try:
                 fh.seek(0)
                 return await _send(kind, parse_mode)
@@ -109,6 +138,12 @@ async def bot_send_file(bot: Bot, target, file_path: str, caption: str = "", med
                         "err": e.__class__.__name__,
                         "msg": str(e),
                     })
+                # Only a definite API rejection permits changing representation.
+                # Timeout/5xx may already have created a message: never resend.
+                if not isinstance(e, BadRequest):
+                    raise
+                if not any(word in str(e).lower() for word in ("parse", "entity", "wrong file", "file type", "media_invalid", "photo_invalid", "image_process")):
+                    raise
                 continue
     if last_error:
         raise last_error
@@ -116,6 +151,7 @@ async def bot_send_file(bot: Bot, target, file_path: str, caption: str = "", med
 
 
 async def bot_send_album(bot: Bot, target, file_paths: List[str], caption: str = "", media_types: Optional[List[str]] = None, message_thread_id: Optional[int] = None, log_fn=None):
+    caption, shortened = fit_caption(caption, log_fn)
     media = []
     handles = []
     try:
@@ -135,7 +171,7 @@ async def bot_send_album(bot: Bot, target, file_paths: List[str], caption: str =
             mt = media_types[idx] if media_types and idx < len(media_types) else None
             kind = guess_media_kind(path, mt)
             item_caption = caption if idx == 0 else None
-            parse_mode = "Markdown" if item_caption else None
+            parse_mode = "Markdown" if item_caption and not shortened else None
             if log_fn:
                 log_fn({
                     "op": "bot_send_album_item",
@@ -172,7 +208,7 @@ async def bot_send_album(bot: Bot, target, file_paths: List[str], caption: str =
             err_name = e.__class__.__name__
             err_msg = str(e)
             allow_plain_retry = bool(caption) and (
-                err_name == "BadRequest" and any(token in err_msg.lower() for token in ("parse", "entity", "caption"))
+                err_name == "BadRequest" and any(token in err_msg.lower() for token in ("parse", "entity"))
             )
             if not allow_plain_retry:
                 raise

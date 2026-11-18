@@ -105,7 +105,7 @@ class PipelineContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.producer.send_and_wait.await_count, 2)
 
     async def test_bot_retry_after_int_timedelta_and_network_error(self):
-        for error, delay in [(RetryAfter(2), 3), (RetryAfter(timedelta(seconds=2)), 3), (NetworkError("offline"), 3)]:
+        for error, delay in [(RetryAfter(2), 3), (RetryAfter(timedelta(seconds=2)), 3)]:
             with self.subTest(error=type(error).__name__), patch.dict(os.environ, {"PTB_TIMEDELTA": "true"}):
                 send = AsyncMock(side_effect=[error, "ok"])
                 with patch.object(bot_runtime.asyncio, "sleep", new_callable=AsyncMock) as sleep:
@@ -125,7 +125,7 @@ class PipelineContractTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot_runtime.asyncio, "sleep", new_callable=AsyncMock):
             with self.assertRaises(NetworkError):
                 await bot_runtime._call_with_retry(send)
-        self.assertEqual(send.await_count, 2)
+        self.assertEqual(send.await_count, 1)
 
     async def test_dedup_and_persistent_journal_ttl_and_failed_retry(self):
         with patch.object(dedup_cache, "DEDUP_CACHE", {}), patch.object(dedup_cache, "_now", return_value=100) as clock:
