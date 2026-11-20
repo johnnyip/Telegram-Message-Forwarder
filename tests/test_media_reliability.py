@@ -125,3 +125,24 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(NetworkError):
                 await runtime.send_album_via_bot(object(),4,[str(self.path)]*2,'c',dict(self.info,_album_snapshots=[{'media_type':'video'}]*2),{'name':'r'},'new',bot_send_semaphore=asyncio.Semaphore(1),album_max_total_bytes=1,upload_max_bytes=1_000_000,log=self.logs.append)
         send.assert_awaited_once()
+
+
+    async def test_complete_fallback_produces_spool_acceptable_per_copy_receipts(self):
+        from tg_forwarder.spool_lifecycle import Spool,code
+        for mode,thread,expected_topic,expected_general in [('topic_only',8,[42,43],None),('mirror',8,[42,44],[43,45]),('mirror',None,None,[42,43])]:
+            with self.subTest(mode=mode,thread=thread):
+                send=AsyncMock(side_effect=[RuntimeError('album_too_large_for_media_group')]+[NS(message_id=i) for i in range(42,50)])
+                with patch.object(runtime,'FORUM_TOPIC_DELIVERY_MODE',mode),patch.object(runtime,'resolve_topic_thread_id',AsyncMock(return_value=thread)),patch.object(runtime,'_append_topic_link',AsyncMock(return_value='c')),patch.object(runtime,'_send_copy',send):
+                    result=await runtime.send_album_via_bot(object(),4,[str(self.path)]*2,'c',dict(self.info,_album_snapshots=[{'media_type':'photo'}]*2),{'name':'r'},'new',bot_send_semaphore=asyncio.Semaphore(1),album_max_total_bytes=1,upload_max_bytes=1000000,log=self.logs.append)
+                self.assertEqual(result.delivery_kind,'album');self.assertEqual(result.topic_message_ids,expected_topic);self.assertEqual(result.general_message_ids,expected_general)
+                self.assertEqual(result.sent_message_ids,expected_general or expected_topic)
+                m=Spool(self.tmp.name);job={'snapshots':[{},{}],'spool_ref':'proof'}
+                with m.db() as c:c.execute('INSERT OR REPLACE INTO targets VALUES(?,?,?)',('proof',code(['r',4]),code({'state':'inflight'})))
+                self.assertTrue(m.target_result(job,'r',4,result))
+
+    async def test_fallback_topic_retry_after_never_degrades_to_general(self):
+        send=AsyncMock(side_effect=[RuntimeError('album_too_large_for_media_group'),RetryAfter(300)])
+        with patch.object(runtime,'resolve_topic_thread_id',AsyncMock(return_value=8)),patch.object(runtime,'_append_topic_link',AsyncMock(return_value='c')),patch.object(runtime,'_send_copy',send):
+            with self.assertRaises(RetryAfter):
+                await runtime.send_album_via_bot(object(),4,[str(self.path)]*2,'c',dict(self.info,_album_snapshots=[{'media_type':'photo'}]*2),{'name':'r'},'new',bot_send_semaphore=asyncio.Semaphore(1),album_max_total_bytes=1,upload_max_bytes=1000000,log=self.logs.append)
+        self.assertEqual(send.await_count,2)

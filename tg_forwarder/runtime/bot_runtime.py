@@ -421,6 +421,8 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
         log({"ts": tstamp(), "type": "warn", "op": "send_album_fallback_to_single", "err": err_name, "msg": err_msg, **extra, "caption_preview": caption[:200], "media_types": media_types})
         ok_count = 0
         fallback_message_ids: list[int] = []
+        fallback_topic_ids: list[int] = []
+        fallback_general_ids: list[int] = []
         for idx, single in enumerate(files):
             single_type = media_types[idx] if media_types and idx < len(media_types) else None
             single_caption = caption if idx == 0 else ""
@@ -438,6 +440,7 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
             )
             try:
                 sent = None
+                topic_single_sent = None
                 if file_too_large:
                     hdr = build_header_from_info(info, is_edit=(source_kind == "edited"))
                     notice = (
@@ -469,7 +472,7 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
                                 if topic_only:
                                     sent = topic_single_sent
                             except Exception as topic_exc:
-                                if not definite_rejection(topic_exc):
+                                if getattr(topic_exc,'retry_after',None) is not None or not definite_rejection(topic_exc):
                                     raise
                                 log({"ts": tstamp(), "type": "warn", "op": "send_album_single_fallback_topic_copy", "err": topic_exc.__class__.__name__, "msg": str(topic_exc), **extra, "target": target, "message_thread_id": thread_id, "file": single, "note": "degrading_to_general_only"})
                         if sent is None:
@@ -488,11 +491,15 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
                 if not getattr(sent, "message_id", None):
                     raise RuntimeError("Missing album single receipt; reconcile before resend")
                 fallback_message_ids.append(sent.message_id)
+                if topic_single_sent is not None:
+                    fallback_topic_ids.append(topic_single_sent.message_id)
+                if sent is not topic_single_sent:
+                    fallback_general_ids.append(sent.message_id)
                 ok_count += 1
             except Exception as inner:
                 log({"ts": tstamp(), "type": "err", "op": "send_album_single_fallback", "err": inner.__class__.__name__, "msg": str(inner), "file": single, "target": target, "media_type": single_type, "caption_preview": single_caption[:200], **extra})
                 raise  # partial success is not a complete album receipt
-        return SendOutcome(ok_count == len(files), preserve_local_copy=preserve_local_copy, sent_message_id=(fallback_message_ids[0] if fallback_message_ids else None), sent_message_ids=fallback_message_ids or None, delivery_kind="album_single_fallback", message_thread_id=thread_id)
+        return SendOutcome(ok_count == len(files), preserve_local_copy=preserve_local_copy, sent_message_id=(fallback_message_ids[0] if fallback_message_ids else None), sent_message_ids=fallback_message_ids or None, delivery_kind="album" if not preserve_local_copy else "album_single_fallback", message_thread_id=thread_id, topic_message_id=(fallback_topic_ids[0] if fallback_topic_ids else None), general_message_id=(fallback_general_ids[0] if fallback_general_ids else None), topic_message_ids=fallback_topic_ids or None, general_message_ids=fallback_general_ids or None)
 
 
 __all__ = [
