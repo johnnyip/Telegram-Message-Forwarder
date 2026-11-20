@@ -457,6 +457,8 @@ async def legacy_send(send, snapshots, target, caption, info, source_kind):
 def definite_rejection(exc):
     from telegram.error import RetryAfter, BadRequest, Forbidden
     from telethon.errors import FloodWaitError, BadRequestError, ForbiddenError
+    if isinstance(exc, BadRequest) and any(word in str(exc).lower() for word in ('internal server error','gateway timeout','timed out','timeout during')):
+        return False
     return isinstance(exc, (RetryAfter, BadRequest, Forbidden, FloodWaitError, BadRequestError, ForbiddenError))
 
 

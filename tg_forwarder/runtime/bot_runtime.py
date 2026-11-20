@@ -1,6 +1,7 @@
 import asyncio
 import os
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -15,6 +16,8 @@ from ..domain.formatting import build_header_from_info, build_topic_message_url
 from ..domain.timefmt import append_original_time, append_edited_suffix
 from ..core.utils import tstamp
 from .verbose_flags import maybe_verbose_log
+
+DEFER_MEDIA_RETRIES = ContextVar("defer_media_retries", default=False)
 
 # Per-(target_chat_id, sender_id) lock to prevent duplicate topic creation races.
 _TOPIC_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
@@ -63,6 +66,7 @@ async def _call_with_retry(send: Callable[[], Any]) -> Any:
     except Exception as exc:
         retry_after = getattr(exc, "retry_after", None)
         if retry_after is not None:
+            if DEFER_MEDIA_RETRIES.get():raise
             seconds = retry_after.total_seconds() if isinstance(retry_after, timedelta) else float(retry_after)
             if seconds < 0 or seconds > 60:
                 raise  # do not hold the global send lane for minutes/hours
@@ -310,7 +314,7 @@ async def send_file_via_bot(bot, target: Any, fpath: Path, caption: str, info: d
                     if topic_sent and getattr(topic_sent, "message_id", None):
                         caption = await _append_topic_link(caption, target, thread_id, getattr(topic_sent, "message_id", None))
                 except Exception as topic_exc:
-                    if not definite_rejection(topic_exc):
+                    if getattr(topic_exc,'retry_after',None) is not None or not definite_rejection(topic_exc):
                         raise
                     log({"ts": tstamp(), "type": "warn", "op": "send_file_topic_copy", "err": topic_exc.__class__.__name__, "msg": str(topic_exc), **extra, "target": target, "message_thread_id": thread_id, "note": "degrading_to_general_only"})
                     topic_sent = None
@@ -381,7 +385,7 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
                     if topic_first_id:
                         caption = await _append_topic_link(caption, target, thread_id, topic_first_id)
                 except Exception as topic_exc:
-                    if not definite_rejection(topic_exc):
+                    if getattr(topic_exc,'retry_after',None) is not None or not definite_rejection(topic_exc):
                         raise
                     log({"ts": tstamp(), "type": "warn", "op": "send_album_topic_copy", "err": topic_exc.__class__.__name__, "msg": str(topic_exc), **extra, "target": target, "message_thread_id": thread_id, "note": "degrading_to_general_only"})
                     topic_sent = None
@@ -408,7 +412,7 @@ async def send_album_via_bot(bot, target: Any, files: list[str], caption: str, i
         allow_single_fallback = (
             err_name == "RuntimeError" and "album_too_large_for_media_group" in err_msg
         ) or (
-            err_name == "BadRequest" and any(token in err_msg.lower() for token in ("group", "media", "caption", "entity", "parse"))
+            err_name == "BadRequest" and definite_rejection(exc) and any(token in err_msg.lower() for token in ("group", "media", "caption", "entity", "parse"))
         )
         log({"ts": tstamp(), "type": "warn", "op": "send_album_group_failed", "err": err_name, "msg": err_msg, "allow_single_fallback": allow_single_fallback, **extra, "caption_preview": caption[:200], "media_types": media_types})
         if not allow_single_fallback or topic_sent is not None:

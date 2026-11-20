@@ -71,8 +71,11 @@ def _purge(data: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
 
 
 def journal_get(key: str) -> Optional[Dict[str, Any]]:
-    data = _purge(_load())
-    if data:
+    loaded = _load()
+    data = _purge(loaded)
+    # Reading a live receipt must not rewrite the full JSON journal every job.
+    # Persist only an actual expiry change; spool/child receipts stay authoritative.
+    if data != loaded:
         _save(data)
     return data.get(key)
 

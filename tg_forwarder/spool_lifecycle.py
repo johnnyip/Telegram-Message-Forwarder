@@ -57,7 +57,7 @@ class ClaimUncertain(ValueError):pass
 
 class Spool:
     def __init__(self,root):
-        self.root=Path(root).absolute();self.leases={}
+        self.root=Path(root).absolute();self.leases={};self._schema_identity=None;self.db_metrics={"transactions":0,"wait_ms":0,"hold_ms":0,"max_wait_ms":0,"max_hold_ms":0}
 
     def guard(self):
         for p in (self.root,*self.root.parents):
@@ -85,7 +85,7 @@ class Spool:
         # Serialize NAS writers before SQLite's short busy timer. Preserve
         # DELETE journaling, FULL durability and immutable delivery receipts.
         lock=os.open(state/'db.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
-        c=None
+        c=None;started=time.monotonic();acquired=None
         try:
             info=os.fstat(lock)
             if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or info.st_uid not in ({os.getuid()} | trusted_file_owner_uids()) or info.st_mode&0o077:
@@ -98,13 +98,84 @@ class Spool:
                 except BlockingIOError:
                     if time.monotonic()>=deadline:raise TimeoutError('Spool transaction contention; retained')
                     time.sleep(0.025)
+            acquired=time.monotonic()
             c=sqlite3.connect(path,timeout=30);c.row_factory=sqlite3.Row
             c.execute('PRAGMA synchronous=FULL');c.execute('PRAGMA journal_mode=DELETE')
-            c.executescript('CREATE TABLE IF NOT EXISTS files(token TEXT PRIMARY KEY,data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS refs(token TEXT,ref TEXT,data TEXT NOT NULL,PRIMARY KEY(token,ref)); CREATE TABLE IF NOT EXISTS targets(ref TEXT,target TEXT,data TEXT NOT NULL,PRIMARY KEY(ref,target));')
+            identity=(path.stat().st_dev,path.stat().st_ino)
+            if self._schema_identity!=identity:
+                c.executescript("""
+                    CREATE TABLE IF NOT EXISTS files(token TEXT PRIMARY KEY,data TEXT NOT NULL);
+                    CREATE TABLE IF NOT EXISTS refs(token TEXT,ref TEXT,data TEXT NOT NULL,PRIMARY KEY(token,ref));
+                    CREATE TABLE IF NOT EXISTS targets(ref TEXT,target TEXT,data TEXT NOT NULL,PRIMARY KEY(ref,target));
+                    CREATE TABLE IF NOT EXISTS consumer_handoffs(topic TEXT,partition_id INTEGER,offset_id INTEGER,payload TEXT NOT NULL,payload_hash TEXT NOT NULL,reason TEXT NOT NULL,created REAL NOT NULL,PRIMARY KEY(topic,partition_id,offset_id));
+                    CREATE TABLE IF NOT EXISTS retry_queue(topic TEXT,partition_id INTEGER,offset_id INTEGER,payload TEXT NOT NULL,payload_hash TEXT NOT NULL,due REAL NOT NULL,attempts INTEGER NOT NULL,state TEXT NOT NULL,PRIMARY KEY(topic,partition_id,offset_id));
+                    CREATE INDEX IF NOT EXISTS spool_files_state_created ON files(json_extract(data,'$.state'),json_extract(data,'$.created'));
+                    CREATE INDEX IF NOT EXISTS spool_files_state_due ON files(json_extract(data,'$.state'),json_extract(data,'$.due'));
+                    CREATE INDEX IF NOT EXISTS spool_targets_ref_state ON targets(ref,json_extract(data,'$.state'));
+                    CREATE INDEX IF NOT EXISTS spool_refs_ref ON refs(ref);
+                """)
+                self._schema_identity=identity
             c.execute('BEGIN IMMEDIATE');yield c;c.commit()
         finally:
             if c is not None:c.close()
             os.close(lock)
+            if acquired is not None:
+                wait=(acquired-started)*1000;hold=(time.monotonic()-acquired)*1000
+                self.db_metrics['transactions']+=1
+                self.db_metrics['wait_ms']+=wait;self.db_metrics['hold_ms']+=hold
+                self.db_metrics['max_wait_ms']=max(self.db_metrics['max_wait_ms'],wait)
+                self.db_metrics['max_hold_ms']=max(self.db_metrics['max_hold_ms'],hold)
+
+    def handoff(self,record,reason):
+        # Durable quarantine is a completed Kafka intake, NOT delivery success.
+        # Exact payload and immutable spool refs survive offset acknowledgement.
+        raw=record.value.decode('utf-8');digest=hashlib.sha256(record.value).hexdigest()
+        with self.db() as c:
+            prior=c.execute('SELECT payload_hash FROM consumer_handoffs WHERE topic=? AND partition_id=? AND offset_id=?',(record.topic,record.partition,record.offset)).fetchone()
+            if prior and prior[0]!=digest:raise ValueError('Kafka handoff payload changed; retain offset')
+            c.execute('INSERT OR IGNORE INTO consumer_handoffs VALUES(?,?,?,?,?,?,?)',(record.topic,record.partition,record.offset,raw,digest,str(reason)[:500],time.time()))
+        return True
+
+    def retry_handoff(self,record,seconds):
+        if seconds<0 or seconds>86400:return False
+        digest=hashlib.sha256(record.value).hexdigest();raw=record.value.decode('utf-8')
+        with self.db() as c:
+            prior=c.execute('SELECT payload_hash,attempts,state FROM retry_queue WHERE topic=? AND partition_id=? AND offset_id=?',(record.topic,record.partition,record.offset)).fetchone()
+            if prior and prior[0]!=digest:raise ValueError('Retry payload changed; retained')
+            if prior and (prior[1]>=3 or prior[2] not in ('pending','inflight')):return False
+            if prior is None and c.execute("SELECT COUNT(*) FROM retry_queue WHERE state IN ('pending','inflight')").fetchone()[0]>=512:return False
+            attempts=prior[1] if prior else 0
+            c.execute('INSERT OR REPLACE INTO retry_queue VALUES(?,?,?,?,?,?,?,?)',(record.topic,record.partition,record.offset,raw,digest,time.time()+seconds+1,attempts,'pending'))
+        return True
+
+    def retry_records(self):
+        with self.db() as c:
+            rows=c.execute("SELECT * FROM retry_queue WHERE state IN ('pending','inflight')").fetchall()
+        return [SimpleNamespace(topic=r['topic'],partition=r['partition_id'],offset=r['offset_id'],value=r['payload'].encode()) for r in rows]
+
+    def claim_retry(self):
+        with self.db() as c:
+            row=c.execute("SELECT * FROM retry_queue WHERE state='pending' AND due<=? ORDER BY due LIMIT 1",(time.time(),)).fetchone()
+            if not row:return None
+            c.execute("UPDATE retry_queue SET state='inflight',attempts=attempts+1 WHERE topic=? AND partition_id=? AND offset_id=?",(row['topic'],row['partition_id'],row['offset_id']))
+            return SimpleNamespace(topic=row['topic'],partition=row['partition_id'],offset=row['offset_id'],value=row['payload'].encode())
+
+    def finish_retry(self,record,confirmed):
+        with self.db() as c:
+            # A handler may already have rescheduled a definitely rejected send.
+            c.execute("UPDATE retry_queue SET state=? WHERE topic=? AND partition_id=? AND offset_id=? AND state='inflight'",('resolved' if confirmed else 'reconcile',record.topic,record.partition,record.offset))
+
+    def retry_target(self,job,route,target):
+        with self.db() as c:
+            prior=c.execute('SELECT data FROM targets WHERE ref=? AND target=?',(job['spool_ref'],code([route,target]))).fetchone()
+            if not prior or json.loads(prior[0])['state']!='inflight':raise ValueError('Definite rejection has no owned target claim')
+            c.execute('UPDATE targets SET data=? WHERE ref=? AND target=?',(code({'state':'retryable_rejected','at':time.time()}),job['spool_ref'],code([route,target])))
+
+    def handoff_summary(self):
+        with self.db() as c:
+            rows=c.execute('SELECT topic,COUNT(*),MIN(created) FROM consumer_handoffs GROUP BY topic').fetchall()
+            retries={r[0]:r[1] for r in c.execute('SELECT state,COUNT(*) FROM retry_queue GROUP BY state')}
+        return {'retry_states':retries,'pending_reconciliation':sum(r[1] for r in rows),'by_topic':{r[0]:r[1] for r in rows},'oldest_seconds':max((time.time()-r[2] for r in rows),default=0)}
 
     def row(self,c,token):
         r=c.execute('SELECT data FROM files WHERE token=?',(token,)).fetchone()
@@ -353,6 +424,9 @@ class Spool:
             if r:
                 prior=json.loads(r[0])
                 if prior['state']=='complete':return prior['receipt']
+                if prior['state']=='retryable_rejected':
+                    c.execute('UPDATE targets SET data=? WHERE ref=? AND target=?',(code({'state':'inflight','created':time.time()}),ref,target))
+                    return None
                 raise RuntimeError('Uncertain/failed spool transport retained; reconcile before resend')
             c.execute('INSERT INTO targets VALUES(?,?,?)',(ref,target,code({'state':'inflight','created':time.time()})))
         return None
@@ -391,28 +465,36 @@ class Spool:
                     self.put(c,row)
         return True
 
-    def abandoned(self,c,now,limit,max_bytes,started,seconds):
-        rows=c.execute("SELECT data FROM files WHERE json_extract(data,'$.state') IN ('acquiring','acquired') AND json_extract(data,'$.created')<? LIMIT ?",(now-72*3600,limit)).fetchall()
+    def abandoned(self,now,limit,max_bytes,started,seconds):
+        # Lease + durable state prevent acquisition/publication from adopting a
+        # cleanup candidate while filesystem work runs outside the DB writer lock.
+        with self.db() as c:
+            rows=c.execute("SELECT data FROM files WHERE json_extract(data,'$.state') IN ('acquiring','acquired','abandoned_claimed') AND json_extract(data,'$.created')<? LIMIT ?",(now-72*3600,limit)).fetchall()
         count=0;bytes_=0
         for item in rows:
             if time.monotonic()-started>=seconds:break
-            row=json.loads(item[0])
-            if c.execute('SELECT 1 FROM refs WHERE token=?',(row['token'],)).fetchone():continue
-            lease=os.open(self.guard()/(row['token']+'.lease'),os.O_RDWR|os.O_NOFOLLOW)
-            opened=[]
+            old=json.loads(item[0]);lease=os.open(self.guard()/(old['token']+'.lease'),os.O_RDWR|os.O_NOFOLLOW)
             try:
                 try:fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
                 except BlockingIOError:continue
-                if bytes_+row['proof'][2]>max_bytes:continue
-                size=0
-                relative=row['path'] if row['state']=='acquired' else row['part']
-                size=self.claim_remove(row,relative,strict=row['state']=='acquired',max_bytes=max_bytes-bytes_)
-                row.update(state='deleted',deleted_at=now,reason='dead-lease-unpublished');self.put(c,row);count+=1;bytes_+=size
+                with self.db() as c:
+                    row=self.row(c,old['token'])
+                    if row['state'] not in ('acquiring','acquired','abandoned_claimed'):continue
+                    if c.execute('SELECT 1 FROM refs WHERE token=?',(row['token'],)).fetchone():continue
+                    if bytes_+row['proof'][2]>max_bytes:continue
+                    origin=row.get('cleanup_from_state',row['state'])
+                    row.update(state='abandoned_claimed',cleanup_from_state=origin);self.put(c,row)
+                relative=row['path'] if origin=='acquired' else row['part']
+                size=self.claim_remove(row,relative,strict=origin=='acquired',max_bytes=max_bytes-bytes_)
+                with self.db() as c:
+                    current=self.row(c,row['token'])
+                    if current['state']!='abandoned_claimed':raise ValueError('Abandoned claim changed; retained')
+                    current.update(state='deleted',deleted_at=now,reason='dead-lease-unpublished');self.put(c,current)
+                count+=1;bytes_+=size
             except (OSError,ValueError) as exc:
-                row.update(state='cleanup_uncertain',cleanup_error=type(exc).__name__,cleanup_reason=str(exc));self.put(c,row)
-            finally:
-                for parent,_ in opened:os.close(parent)
-                os.close(lease)
+                with self.db() as c:
+                    row=self.row(c,old['token']);row.update(state='cleanup_uncertain',cleanup_error=type(exc).__name__,cleanup_reason=str(exc));self.put(c,row)
+            finally:os.close(lease)
         return count,bytes_
 
     def scan(self,*,limit=64,max_bytes=1024*1024*1024,seconds=2,now=None):
@@ -423,8 +505,9 @@ class Spool:
             except BlockingIOError:return {'owner':False,'deleted':0,'bytes':0}
             with self.db() as c:
                 self.reconcile(c,now,min(limit,64))
-                abandoned,bytes_=self.abandoned(c,now,min(limit,16),max_bytes,started,seconds)
-                rows=[json.loads(r[0]) for r in c.execute('SELECT data FROM files WHERE json_extract(data,\'$.state\')=\'cleanup_pending\' AND json_extract(data,\'$.due\')<=? ORDER BY json_extract(data,\'$.due\'),rowid LIMIT ?',(now,max(0,min(limit,64)-abandoned)))]
+            abandoned,bytes_=self.abandoned(now,min(limit,16),max_bytes,started,seconds)
+            with self.db() as c:
+                rows=[json.loads(r[0]) for r in c.execute('SELECT data FROM files WHERE json_extract(data,\'$.state\') IN (\'cleanup_pending\',\'cleanup_claimed\') AND json_extract(data,\'$.due\')<=? ORDER BY json_extract(data,\'$.due\'),rowid LIMIT ?',(now,max(0,min(limit,64)-abandoned)))]
             for old in rows:
                 if time.monotonic()-started>=seconds:break
                 if bytes_+old['proof'][2]>max_bytes:
@@ -435,13 +518,20 @@ class Spool:
                 try:
                     with self.db() as c:
                         row=self.row(c,old['token'])
-                        if row['state']!='cleanup_pending' or not row['shared_safe']:continue
+                        if row['state'] not in ('cleanup_pending','cleanup_claimed') or not row['shared_safe']:continue
                         refs=[json.loads(v[0]) for v in c.execute('SELECT data FROM refs WHERE token=?',(row['token'],))]
                         if not refs or any(r['state']!='terminal' for r in refs):
                             row['due']=now+60;self.put(c,row)
                             continue
-                        bytes_+=self.claim_remove(row,row['path'])
-                        row['state']='deleted';row['deleted_at']=now;self.put(c,row);deleted+=1
+                        row['state']='cleanup_claimed';self.put(c,row)
+                    # bind() rejects any new reference for cleanup_claimed files;
+                    # the independent fsynced quarantine intent survives crashes.
+                    removed=self.claim_remove(row,row['path'])
+                    with self.db() as c:
+                        current=self.row(c,row['token'])
+                        if current['state']!='cleanup_claimed':raise ValueError('Cleanup claim changed; retained')
+                        current['state']='deleted';current['deleted_at']=now;self.put(c,current)
+                    bytes_+=removed;deleted+=1
                 except (OSError,ValueError,sqlite3.Error) as exc:
                     errors+=1
                     try:
@@ -454,7 +544,7 @@ class Spool:
                 states={r[0]:{'files':r[1],'bytes':r[2]} for r in c.execute("SELECT json_extract(data,'$.state'),COUNT(*),SUM(json_extract(data,'$.proof[2]')) FROM files GROUP BY json_extract(data,'$.state')")}
             with self.db() as c:
                 due_count = c.execute("SELECT COUNT(*) FROM files WHERE json_extract(data,'$.state')='cleanup_pending' AND json_extract(data,'$.due')<=?", (now,)).fetchone()[0]
-            return {'due_count':due_count,'known_states':states,'unknown_walk':False,'owner':True,'deleted':deleted,'bytes':bytes_,'errors':errors,'abandoned':abandoned,'scanned':len(rows),'complete':len(rows)<min(limit,64),'at':now}
+            return {'due_count':due_count,'known_states':states,'unknown_walk':False,'owner':True,'deleted':deleted,'bytes':bytes_,'errors':errors,'abandoned':abandoned,'scanned':len(rows),'complete':len(rows)<min(limit,64),'at':now,'db_metrics':dict(self.db_metrics)}
         finally:os.close(lock)
 
 
@@ -476,7 +566,11 @@ async def target_send(job,route,target,send):
     if not owned(job):return await send()
     m=manager();prior=await _io(m.begin_target,job,route,target)
     if prior:return SimpleNamespace(**prior)
-    result=await send()
+    try:result=await send()
+    except Exception as exc:
+        from telegram.error import RetryAfter
+        if isinstance(exc,RetryAfter):await _io(m.retry_target,job,route,target)
+        raise
     if not await _io(m.target_result,job,route,target,result):raise RuntimeError('Incomplete spool target receipt; recoverable file retained')
     return result
 
@@ -494,7 +588,7 @@ async def gc_loop(log,interval=60):
             log({'type':'spool_gc', **result})
             # Retry bounded batches promptly; never weaken ownership/reference checks.
             delay = 2 if result.get('owner') and not result.get('complete', True) and result.get('deleted', 0) else interval
-        except (OSError,ValueError,sqlite3.Error) as exc:
+        except (OSError,ValueError,sqlite3.Error,TimeoutError) as exc:
             delay = interval
             log({'type':'spool_gc_error','error':type(exc).__name__})
         await asyncio.sleep(delay)
@@ -502,3 +596,15 @@ async def gc_loop(log,interval=60):
 
 async def classify(job,state):
     if owned(job) and job.get('spool_ref'):await _io(manager().reference_state,job,state)
+
+
+async def durable_failure_handoff(record,reason):
+    return await _io(manager().handoff,record,reason)
+
+
+async def definite_retry_handoff(record,exc):
+    from telegram.error import RetryAfter
+    from datetime import timedelta
+    if not isinstance(exc,RetryAfter):return False
+    delay=exc.retry_after.total_seconds() if isinstance(exc.retry_after,timedelta) else float(exc.retry_after)
+    return await _io(manager().retry_handoff,record,delay)

@@ -38,7 +38,7 @@ class StartupIdentityTests(unittest.IsolatedAsyncioTestCase):
              'startup_banner':lambda:'startup','print':Mock(),'LOGGER':NS(info=Mock(),warning=Mock()),'log':Mock(),
              'register_telethon_handlers':Mock(),'startup_kafka_producer':AsyncMock(),'startup_kafka_consumers':AsyncMock(),
              'TELEGRAM_BOT_TOKEN':'fake-never-used','BOT_STARTUP_SMOKE_TEST':False,'DATE_SEPARATOR_ENABLED':False,
-             'text_consumer_loop':AsyncMock(),'media_consumer_loop':AsyncMock(),'TelegramError':TelegramError}
+             'text_consumer_loop':AsyncMock(),'media_consumer_loop':AsyncMock(),'parallel_media_consumer_loop':AsyncMock(),'TelegramError':TelegramError}
         exec(startup_code(),env)
         return env
 

@@ -1,0 +1,30 @@
+# Bounded media throughput and durable reconciliation
+
+## Execution and ordering
+Ordinary media now uses three bounded workers (MEDIA_WORKERS, 1..16), read-ahead capacity 96 (MEDIA_QUEUE_CAPACITY, capped at512). Upload transport remains capped by the existing BOT_SEND_CONCURRENCY=3; no group or route is added or removed. The existing future-comments consumer remains independent.
+
+Sources are round-robin within the bounded read-ahead window. A hot source cannot claim every available worker when another source is present in that window. This is not a claim of global Kafka fairness beyond the fetched window. Jobs sharing a target and sender keep FIFO (the topic mapping key); targets without immutable selection use a conservative sender-wide key. General destinations merge different senders in fair completion order, not a global chronological ordering across source groups. Same-sender jobs remain ordered. Existing topic-only/mirror policy is preserved.
+
+Media >=20MiB and native-forward jobs use at most one slow slot; the other two are available to ordinary files. Future-due jobs remain queued rather than sleeping inside a worker. A long album still occupies its own slot, never an unbounded number of tasks.
+
+## Offset ownership
+All fetched records register in partition order. A commit advances only over a contiguous prefix of successfully processed records. Processing is complete after either confirmed delivery or a fsynced durable handoff; a handoff is NOT delivery success. Completion during an awaited commit cannot erase a newer high-water mark. Rebalances cancel unstarted work, join started work before committing, and forget revoked state. If getmany spans a generation change the reader rewinds to broker-confirmed offsets rather than discarding records and committing past them. Failures to persist handoff leave an unacknowledged gap; read-ahead then pauses at the bounded capacity.
+
+## Definite retry versus unknown delivery
+Telegram RetryAfter is a definite rejection. The ordinary lane defers it immediately into the private spool receipts.sqlite3 retry_queue, with a due time, immutable payload hash, at most3 retry attempts, and at most512 pending/inflight entries. A separate single retry worker obeys that deadline; pending retry flows fence later jobs with the same target/sender. Known rejected spool target claims transition to retryable_rejected, never uncertain claims. Successful per-copy receipts survive retries. A retry claimed inflight when a process dies is NOT automatically replayed; operator reconciliation is required.
+
+Timeout, connection errors, incomplete receipts and internal-server-error responses are uncertain. They are never automatically resent. Exact Kafka payload/hash/source coordinates are fsynced to consumer_handoffs; existing owned spool references and shared claims remain retained. Only after that durable handoff may intake acknowledge the record. Historical unknown claims and offsets are not reset or replayed by this release. A full retry budget becomes retained reconciliation, not silent loss. Tables stay private alongside the existing ledger; never publish payload/captions.
+
+## Spool I/O
+DELETE journal mode, synchronous FULL, private ownership checks and permanent receipts remain unchanged. Schema/index creation is once per database inode per process, not each transaction. Indexes cover lifecycle state/due/created and reference/target-state lookups. GC claims a file durably (cleanup_claimed or abandoned_claimed) while holding the DB lock, then releases the writer lock before quarantine rename/fsync/unlink. Claim state rejects new adoption, and the existing private fsynced quarantine intent supports crash recovery. GC lease/GC lock prevent competing cleanup. There is no directory walk, arbitrary age-based deletion or relaxed inode guard. journal_get no longer rewrites an unchanged entire JSON journal.
+
+## Operational evidence
+Every30s: media_scheduler queue/inflight/capacity/source depths, oldest queued age, completion and unconfirmed counts, per-minute rates and service p95; media_kafka_backlog broker-committed lag per partition; media_reconciliation_queue unknown totals and retry states. Per-job media_scheduler_job gives source, size lane, queue wait, service and age. Existing send_file/send_album logs retain real destination/thread/message IDs for per-topic analysis. spool_gc adds DB transaction count, total/max wait and hold milliseconds. Do not confuse listener update lag with sender queue age, or durable handoff with Telegram delivery.
+
+Acceptance requires actual deployed artifact/config identity, real source->snapshot->Kafka->consumer->positive destination IDs and a measured backlog/oldest-age trend. Native/mock tests are supplemental, not live throughput evidence. Keep following the same deployment until observation finishes.
+
+## Large files
+The configured cloud Bot API remains50MB. Official Local Bot API supports uploads up to2000MB, but it needs a separately operated server, correct api-id/api-hash, shared filesystem/network access and a coordinated bot endpoint/logout cutover (including the control/update reader). No server or bot session is switched merely by raising a limit. The current NAS inventory has no local Bot API service; this release evaluates and documents that path but does not invent a larger cloud limit. Verify representative large-media behavior before certifying large-file support.
+
+## Release and rollback
+Release through the existing Jenkins job and immutable receipt, then pin only the shared forwarder image in canonical homelab-config and use Portainer Git redeploy. Preserve all routes, sessions, downloads, Redis identities, offsets and unrelated services. New claimed cleanup states require this release to recover them: do not roll back to an older cleanup implementation while cleanup_claimed/abandoned_claimed rows remain. Retry/consumer_handoff tables are additive and must not be deleted on rollback. Stop/quiesce new sender work and reconcile inflight retries before any operational rollback; never reset claims as recovery.

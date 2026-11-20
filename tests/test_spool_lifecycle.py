@@ -225,7 +225,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             return original_stat(name,*args,**kw)
         with patch.object(os,'stat',side_effect=crash):
             with self.assertRaises(RuntimeError):self.m.scan()
-        self.assertFalse(path.exists());self.assertEqual(self.row(job)['state'],'cleanup_pending')
+        self.assertFalse(path.exists());self.assertEqual(self.row(job)['state'],'cleanup_claimed')
         replacement=path;replacement.write_bytes(b'NEW-FOREIGN')
         self.m.scan();self.assertEqual(replacement.read_bytes(),b'NEW-FOREIGN')
         self.assertEqual(self.row(job)['state'],'deleted');self.assertTrue(self.m.complete(job))

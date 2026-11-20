@@ -827,6 +827,87 @@ async def text_consumer_loop():
         await text_consumer.stop()
 
 
+async def process_parallel_media_record(record, commit_batcher):
+    lane = 'media'
+    cleanup_paths: List[str] = []
+    job = None
+    fingerprint = None
+    try:
+        job = json.loads(record.value.decode('utf-8'))
+        from tg_forwarder.spool_lifecycle import classify as spool_classify
+        maybe_debug_log(log, {'ts': tstamp(), 'type': 'debug', 'op': 'media_consumer_job_received', 'job_type': job.get('job_type'), 'source_kind': job.get('source_kind'), 'chat_id': job.get('info', {}).get('chat_id') if isinstance(job.get('info'), dict) else None, 'msg_id': job.get('info', {}).get('msg_id') if isinstance(job.get('info'), dict) else None, 'grouped_id': job.get('info', {}).get('grouped_id') if isinstance(job.get('info'), dict) else None, 'due_at': job.get('due_at'), 'created_at': job.get('created_at')})
+        await sleep_until_due(job)
+        if job.get('info', {}).get('future_comments') and (not await future_comment_job_permitted(job)):
+            commit_batcher.mark_processed(record)
+            return True
+        from tg_forwarder.spool_lifecycle import completed as spool_completed, finish as spool_finish
+        if await spool_completed(job):
+            commit_batcher.mark_processed(record)
+            try:
+                await spool_finish(job, [v['path'] for v in job.get('snapshots') or [job.get('snapshot', {})] if v.get('path')] if DELETE_AFTER_SEND else [])
+            except Exception as exc:
+                log({'type': 'spool_cleanup_pending', 'error': type(exc).__name__})
+            return True
+        fingerprint = job_fingerprint(job)
+        existing = journal_get(fingerprint)
+        if existing and existing.get('status') in {'processing', 'done'}:
+            log({'ts': tstamp(), 'type': 'info', 'op': 'skip_media_job_from_journal', 'fingerprint': fingerprint, 'job_type': job.get('job_type'), 'chat_id': job.get('info', {}).get('chat_id') if isinstance(job.get('info'), dict) else None, 'msg_id': job.get('info', {}).get('msg_id') if isinstance(job.get('info'), dict) else None, 'grouped_id': job.get('info', {}).get('grouped_id') if isinstance(job.get('info'), dict) else None, 'journal_status': existing.get('status')})
+            await spool_classify(job, 'journal_' + existing.get('status', 'unknown') + '_unproven_retained')
+            raise RuntimeError('Journal has no complete durable receipts; reconcile before acknowledging')
+        claimed = journal_claim(fingerprint, {'job_type': job.get('job_type'), 'chat_id': job.get('info', {}).get('chat_id') if isinstance(job.get('info'), dict) else None, 'msg_id': job.get('info', {}).get('msg_id') if isinstance(job.get('info'), dict) else None, 'grouped_id': job.get('info', {}).get('grouped_id') if isinstance(job.get('info'), dict) else None, 'source_kind': job.get('source_kind')})
+        if not claimed:
+            log({'ts': tstamp(), 'type': 'info', 'op': 'skip_media_job_claim_failed', 'fingerprint': fingerprint, 'job_type': job.get('job_type'), 'chat_id': job.get('info', {}).get('chat_id') if isinstance(job.get('info'), dict) else None, 'msg_id': job.get('info', {}).get('msg_id') if isinstance(job.get('info'), dict) else None, 'grouped_id': job.get('info', {}).get('grouped_id') if isinstance(job.get('info'), dict) else None})
+            await spool_classify(job, 'claim_uncertain_retained')
+            raise RuntimeError('Claim uncertain; offset retained')
+        cleanup_paths = await dispatch_media_job(job, build_job_processing_ctx())
+        from tg_forwarder.spool_lifecycle import owned as spool_owned
+        if spool_owned(job) and (not await spool_completed(job)):
+            raise RuntimeError('Incomplete durable target receipts; quarantine for reconciliation')
+        journal_mark(fingerprint, {'status': 'done', 'job_type': job.get('job_type'), 'chat_id': job.get('info', {}).get('chat_id') if isinstance(job.get('info'), dict) else None, 'msg_id': job.get('info', {}).get('msg_id') if isinstance(job.get('info'), dict) else None, 'grouped_id': job.get('info', {}).get('grouped_id') if isinstance(job.get('info'), dict) else None, 'source_kind': job.get('source_kind'), 'outcome': 'cleanup_pending' if cleanup_paths else 'retained_or_forwarded'})
+        maybe_debug_log(log, {'ts': tstamp(), 'type': 'debug', 'op': 'media_consumer_job_processed', 'job_type': job.get('job_type') if isinstance(job, dict) else None, 'chat_id': job.get('info', {}).get('chat_id') if isinstance(job, dict) and isinstance(job.get('info'), dict) else None, 'msg_id': job.get('info', {}).get('msg_id') if isinstance(job, dict) and isinstance(job.get('info'), dict) else None, 'grouped_id': job.get('info', {}).get('grouped_id') if isinstance(job, dict) and isinstance(job.get('info'), dict) else None, 'cleanup_count': len(cleanup_paths)})
+        try:
+            await spool_finish(job, cleanup_paths)
+        except Exception as exc:
+            log({'type': 'spool_cleanup_pending', 'error': type(exc).__name__})
+    except Exception as e:
+        from tg_forwarder.spool_lifecycle import definite_retry_handoff
+        if await definite_retry_handoff(record, e):
+            if fingerprint:
+                journal_record_failure(fingerprint, {'job_type': job.get('job_type'), 'err': 'RetryAfter'})
+            commit_batcher.mark_processed(record)
+            log({'type': 'warn', 'op': 'media_retry_deferred', 'chat_id': (job.get('info') or {}).get('chat_id'), 'msg_id': (job.get('info') or {}).get('msg_id'), 'partition': record.partition, 'offset': record.offset})
+            return False
+        if isinstance(job, dict):
+            try:
+                from tg_forwarder.spool_lifecycle import classify as spool_classify
+                await spool_classify(job, 'send_failed_recoverable')
+            except Exception as classify_exc:
+                log({'ts': tstamp(), 'type': 'critical', 'op': 'media_failure_retention_error', 'err': type(classify_exc).__name__, 'original_error': type(e).__name__})
+            info = job.get('info') if isinstance(job.get('info'), dict) else {}
+            log({'ts': tstamp(), 'type': 'critical', 'op': 'media_delivery_unconfirmed', 'fingerprint': fingerprint, 'chat_id': info.get('chat_id'), 'msg_id': info.get('msg_id'), 'routes': job.get('route_names'), 'err': type(e).__name__, 'msg': str(e), 'lane': lane, 'topic': record.topic, 'partition': record.partition, 'offset': record.offset, 'action': 'retained_for_reconciliation_no_blind_resend'})
+        if fingerprint:
+            failures = journal_record_failure(fingerprint, {'job_type': job.get('job_type') if isinstance(job, dict) else None, 'err': e.__class__.__name__})
+        log({'ts': tstamp(), 'type': 'err', 'op': 'media_consumer_loop', 'err': e.__class__.__name__, 'msg': str(e), 'job_type': job.get('job_type') if isinstance(job, dict) else None})
+    else:
+        commit_batcher.mark_processed(record)
+        return True
+    from tg_forwarder.spool_lifecycle import durable_failure_handoff
+    await durable_failure_handoff(record, 'delivery_unconfirmed')
+    commit_batcher.mark_processed(record)
+    return False
+
+async def parallel_media_consumer_loop():
+    from tg_forwarder.processing.media_runner import MediaRunner
+    workers = max(1, min(16, int(os.getenv("MEDIA_WORKERS", "3"))))
+    capacity = max(workers, min(512, int(os.getenv("MEDIA_QUEUE_CAPACITY", "96"))))
+    runner = MediaRunner(media_consumer, KAFKA_MEDIA_TOPIC, process_parallel_media_record,
+                         workers=workers, capacity=capacity,
+                         slow_workers=max(1, int(os.getenv("MEDIA_SLOW_WORKERS", "1"))),
+                         log=log, name="media", route_map=ROUTE_MAP, every=KAFKA_CONSUMER_COMMIT_EVERY,
+                         interval=KAFKA_CONSUMER_COMMIT_INTERVAL_SECONDS)
+    await runner.run()
+
+
 async def media_consumer_loop(consumer=None, lane="media"):
     consumer = media_consumer if consumer is None else consumer
     assert consumer is not None
@@ -1721,6 +1802,9 @@ def print_route_summary():
         "kafka_consumer_commit_interval_seconds": KAFKA_CONSUMER_COMMIT_INTERVAL_SECONDS,
         "text_delay_seconds": DELAY_SECONDS,
         "media_delay_seconds": MEDIA_DELAY_SECONDS,
+        "media_workers": max(1,min(16,int(os.getenv("MEDIA_WORKERS","3")))),
+        "media_queue_capacity": max(3,min(512,int(os.getenv("MEDIA_QUEUE_CAPACITY","96")))),
+        "media_slow_workers": max(1,int(os.getenv("MEDIA_SLOW_WORKERS","1"))),
         "delete_after_send": DELETE_AFTER_SEND,
         "ignore_users": sorted(list(IGNORE_USERS)),
         "ignore_ids": sorted(list(IGNORE_IDS)),
@@ -1896,7 +1980,7 @@ async def main():
             consumer_tasks = [
                 asyncio.create_task(spool_gc_loop(log)),
                 asyncio.create_task(text_consumer_loop()),
-                asyncio.create_task(media_consumer_loop()),
+                asyncio.create_task(parallel_media_consumer_loop()),
             ]
             if DATE_SEPARATOR_ENABLED:
                 consumer_tasks.append(asyncio.create_task(daily_date_separator_loop(bot)))
