@@ -64,7 +64,7 @@ class Controller:
             parts = text.split()
             command = parts[0].split("@")[0] if parts else ""
             if command in ("/start", "/help"):
-                await self.bot.send_message(chat_id=chat, text="私人對話轉發／上傳相片會自動下載；或貼原帖／留言 t.me 連結。\n/tasks 任務；/watches 監察；/health 授權檢查。")
+                await self.bot.send_message(chat_id=chat, text="私人對話轉發／上傳相片會自動下載；可轉發 Saved locally spool 通知收檔；或貼原帖／留言 t.me 連結。\n/tasks 任務；/watches 監察；/health 授權檢查。")
                 return
             if command == "/health":
                 await self.bot.send_message(chat_id=chat, text="控制台正常；你的數字 ID 已獲授權。獨立下載佇列；未執行下載／轉發。")
@@ -84,6 +84,21 @@ class Controller:
             if getattr(message,'media_group_id',None):
                 from .inbound import record_unsupported
                 if record_unsupported(self.store,self.config,update,self.engine.bot_id):return
+            from tg_forwarder.spool_import import relative_path
+            relative = relative_path(text or getattr(message,'caption',None) or '')
+            if relative is not None:
+                if message.chat.type != 'private' or chat != owner:
+                    raise ValueError('Spool 收檔只接受已授權私人對話')
+                prior = self.store.db.execute('SELECT id FROM spool_imports WHERE id=?',(update.update_id,)).fetchone()
+                if prior:return
+                placeholder_key='spool-import-preview:'+str(update.update_id)
+                preview=self.store.get_meta(placeholder_key,'')
+                if not preview:
+                    sent=await self.bot.send_message(chat_id=chat,text='正在從 spool 收檔…',reply_to_message_id=reply)
+                    preview=sent.message_id;self.store.meta(placeholder_key,preview)
+                self.store.db.execute('INSERT OR IGNORE INTO spool_imports(id,owner,chat,reply,relative) VALUES(?,?,?,?,?)',
+                                      (update.update_id,owner,chat,int(preview),relative))
+                return
             ref = from_message(message)
             media_group = getattr(message, "media_group_id", None)
             group_key = "input-album:"+str(owner)+":"+str(chat)+":"+str(media_group) if media_group else None
@@ -114,6 +129,33 @@ class Controller:
                 await self.edit(message.chat.id, message.message_id, str(exc), rows)
             else:
                 await self.bot.send_message(chat_id=message.chat.id, text=str(exc))
+
+    async def spool_import_tick(self):
+        row=self.store.db.execute("SELECT * FROM spool_imports WHERE state='pending' AND due<=? ORDER BY id LIMIT 1",(time.time(),)).fetchone()
+        if row is None:return
+        if row['owner'] not in self.config.allowed:
+            self.store.db.execute("UPDATE spool_imports SET state='denied' WHERE id=?",(row['id'],));return
+        from tg_forwarder.spool_import import ImportQueue
+        bridge=self.engine.bridge
+        if bridge is None:
+            result={'state':'error','message':'Shared Redis 未啟用；spool 保留'}
+        else:
+            queue=ImportQueue(bridge)
+            try:
+                ident=await queue.submit(row['owner'],row['relative'],row['id'])
+                result=await queue.result(ident)
+            except ValueError as exc:
+                result={'state':'error','message':str(exc)}
+            if result is None:
+                self.store.db.execute('UPDATE spool_imports SET due=? WHERE id=?',(time.time()+2,row['id']))
+                return
+        if result['state']=='error':
+            text='未收檔；spool 保留。'+result.get('message','請檢查 spool worker')
+        else:
+            text='已收檔：'+result['name']+'\n'+str(result['size'])+' bytes'
+            text+='\nspool 已清除。' if result['spool_removed'] else '\n仍有待確認轉發引用，spool 暫時保留，未強制刪除。'
+        await self.edit(row['chat'],row['reply'],text)
+        self.store.db.execute("UPDATE spool_imports SET state='done' WHERE id=?",(row['id'],))
 
     async def preview_notice(self, row, text):
         """Notification failure never escapes a preview worker or kills other queues."""
@@ -161,6 +203,7 @@ class Controller:
             try:
                 await self.preview_tick()
                 await self.inbound_notice_tick()
+                await self.spool_import_tick()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

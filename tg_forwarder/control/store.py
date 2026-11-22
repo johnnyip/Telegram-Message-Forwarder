@@ -60,6 +60,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.executescript("""
+        CREATE TABLE IF NOT EXISTS spool_imports(id INTEGER PRIMARY KEY,owner INTEGER,chat INTEGER,reply INTEGER,relative TEXT,state TEXT DEFAULT 'pending',due REAL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS inbound_notices(key TEXT PRIMARY KEY,owner INTEGER,chat INTEGER,bot INTEGER,payload TEXT,due REAL,state TEXT,reply INTEGER DEFAULT 0,generation INTEGER DEFAULT 0);
         CREATE INDEX IF NOT EXISTS inbound_notices_due ON inbound_notices(state,due);
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);

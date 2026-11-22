@@ -1984,6 +1984,9 @@ async def main():
             ]
             if DATE_SEPARATOR_ENABLED:
                 consumer_tasks.append(asyncio.create_task(daily_date_separator_loop(bot)))
+            if os.getenv('SPOOL_IMPORT_ARCHIVE_ROOT'):
+                from tg_forwarder.spool_import import worker_loop as spool_import_loop
+                consumer_tasks.append(asyncio.create_task(spool_import_loop(log)))
             await asyncio.gather(*consumer_tasks)
 
         elif APP_MODE == "reconcile":
