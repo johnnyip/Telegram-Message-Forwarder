@@ -101,7 +101,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):await q.submit(1,'new/1/'+'a'*32+'_a.mp4')
     async def test_unauthorized_request_does_not_touch_files(self):
         ident,value=request(2,'new/1/'+'a'*32+'_a.mp4')
-        redis=NS(zrange=AsyncMock(return_value=[ident]),get=AsyncMock(return_value=json.dumps(value)),set=AsyncMock(),expire=AsyncMock(),zrem=AsyncMock())
+        redis=NS(get=AsyncMock(side_effect=[json.dumps([ident]),json.dumps(value)]),set=AsyncMock(),expire=AsyncMock(),eval=AsyncMock())
         q=ImportQueue(NS(redis=redis,prefix='test:'))
         with patch('tg_forwarder.spool_import.archive_file') as move:
             await q.tick('/spool','/archive',{1});move.assert_not_called()

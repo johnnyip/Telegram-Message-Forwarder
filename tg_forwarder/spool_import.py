@@ -177,8 +177,10 @@ class ImportQueue:
             raise ValueError('Spool 收檔 worker 未就緒；未搬走檔案')
         ident,payload=request(owner,relative,nonce)
         # Atomic bounded intake; completed results are never silently replayed.
-        accepted=await self.redis.eval("if redis.call('EXISTS',KEYS[2])==1 then return 0 end; if redis.call('ZCARD',KEYS[1])>=128 and redis.call('ZSCORE',KEYS[1],ARGV[1])==false then return -1 end; redis.call('SET',KEYS[3],ARGV[2], 'NX'); redis.call('ZADD',KEYS[1], 'NX', ARGV[3], ARGV[1]); return 1",
-            3,self.prefix+'queue',self.prefix+'result:'+ident,self.prefix+'request:'+ident,ident,code(payload),time.time())
+        # Existing tgfwd_app ACL intentionally permits GET/SET/EVAL, not sorted
+        # sets. Keep a bounded JSON FIFO under one key rather than widening ACL.
+        accepted=await self.redis.eval("if redis.call('EXISTS',KEYS[2])==1 then return 0 end; local q=cjson.decode(redis.call('GET',KEYS[1]) or '[]'); for _,v in ipairs(q) do if v==ARGV[1] then return 0 end end; if #q>=128 then return -1 end; redis.call('SET',KEYS[3],ARGV[2], 'NX'); table.insert(q,ARGV[1]); redis.call('SET',KEYS[1],cjson.encode(q)); return 1",
+            3,self.prefix+'queue',self.prefix+'result:'+ident,self.prefix+'request:'+ident,ident,code(payload))
         if accepted == -1:raise ValueError('Spool 收檔佇列已滿；請稍後再試')
         return ident
 
@@ -187,9 +189,11 @@ class ImportQueue:
         return json.loads(raw) if raw else None
 
     async def tick(self, spool_root, archive_root, allowed):
-        ids=await self.redis.zrange(self.prefix+'queue',0,0)
+        ids=json.loads(await self.redis.get(self.prefix+'queue') or '[]')
+        if not isinstance(ids,list) or len(ids)>128:raise ValueError('Invalid bounded import FIFO')
         if not ids:return False
         ident=ids[0]
+        if not isinstance(ident,str) or not re.fullmatch(r'[a-f0-9]{64}',ident):raise ValueError('Invalid import identity')
         raw=await self.redis.get(self.prefix+'request:'+ident)
         try:
             value=json.loads(raw);expected,_=request(value['owner'],value['relative'],value.get('nonce'))
@@ -200,7 +204,7 @@ class ImportQueue:
             result={'state':'error','error':type(exc).__name__,'message':str(exc)[:240]}
         await self.redis.set(self.prefix+'result:'+ident,code(result),ex=30*86400)
         await self.redis.expire(self.prefix+'request:'+ident,30*86400)
-        await self.redis.zrem(self.prefix+'queue',ident)
+        await self.redis.eval("local q=cjson.decode(redis.call('GET',KEYS[1]) or '[]'); local next={}; for _,v in ipairs(q) do if v~=ARGV[1] then table.insert(next,v) end end; if #next==0 then redis.call('DEL',KEYS[1]) else redis.call('SET',KEYS[1],cjson.encode(next)) end; return 1",1,self.prefix+'queue',ident)
         return True
 
 

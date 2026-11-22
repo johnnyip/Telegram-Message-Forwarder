@@ -54,3 +54,6 @@ control regressions, then the full offline suite. Deployment verification must
 read actual image revisions, NAS archive mount, matching Redis namespace, worker
 heartbeat and unchanged owner/targets, followed by a real authorized bot update.
 Native fixtures are not real owner updates or production delivery receipts.
+
+The Redis wire queue is a bounded JSON FIFO updated by EVAL with GET/SET/DEL;
+it deliberately needs no new Redis ACL commands or broader key permissions.
