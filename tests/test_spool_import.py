@@ -137,3 +137,16 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         await self.controller.handle(self.update());await self.controller.handle(self.update())
         self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM spool_imports').fetchone()[0],1)
         self.bot.send_message.assert_awaited_once()
+
+    async def test_rate_limit_honors_retry_after(self):
+        import time
+        from telegram.error import RetryAfter
+        from unittest.mock import Mock
+        await self.controller.handle(self.update())
+        self.controller.engine.gate=NS(delay=Mock())
+        self.bot.edit_message_text.side_effect=RetryAfter(20)
+        await self.controller.spool_import_tick()
+        row=self.store.db.execute('SELECT state,due FROM spool_imports').fetchone()
+        self.assertEqual(row['state'],'pending');self.assertGreater(row['due'],time.time()+18)
+        await self.controller.spool_import_tick()
+        self.assertEqual(self.bot.edit_message_text.await_count,1)

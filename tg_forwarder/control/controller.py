@@ -133,6 +133,8 @@ class Controller:
     async def spool_import_tick(self):
         row=self.store.db.execute("SELECT * FROM spool_imports WHERE state='pending' AND due<=? ORDER BY id LIMIT 1",(time.time(),)).fetchone()
         if row is None:return
+        # Back off all transport failures before performing Redis/Telegram I/O.
+        self.store.db.execute('UPDATE spool_imports SET due=? WHERE id=?',(time.time()+5,row['id']))
         if row['owner'] not in self.config.allowed:
             self.store.db.execute("UPDATE spool_imports SET state='denied' WHERE id=?",(row['id'],));return
         from tg_forwarder.spool_import import ImportQueue
@@ -154,7 +156,17 @@ class Controller:
         else:
             text='已收檔：'+result['name']+'\n'+str(result['size'])+' bytes'
             text+='\nspool 已清除。' if result['spool_removed'] else '\n仍有待確認轉發引用，spool 暫時保留，未強制刪除。'
-        await self.edit(row['chat'],row['reply'],text)
+        try:
+            await self.edit(row['chat'],row['reply'],text)
+        except RetryAfter as exc:
+            seconds=exc.retry_after.total_seconds() if hasattr(exc.retry_after,'total_seconds') else float(exc.retry_after)
+            self.store.db.execute('UPDATE spool_imports SET due=? WHERE id=?',(time.time()+seconds,row['id']))
+            self.engine.gate.delay(seconds)
+            return
+        except (BadRequest,Forbidden) as exc:
+            state='done' if isinstance(exc,BadRequest) and 'not modified' in str(exc).lower() else 'failed'
+            self.store.db.execute('UPDATE spool_imports SET state=? WHERE id=?',(state,row['id']))
+            return
         self.store.db.execute("UPDATE spool_imports SET state='done' WHERE id=?",(row['id'],))
 
     async def preview_notice(self, row, text):
